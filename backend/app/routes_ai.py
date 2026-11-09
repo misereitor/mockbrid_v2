@@ -14,8 +14,16 @@ from app.models import User, AIProvider
 from app.routes_auth import get_current_user
 from app.agent.state import AgentState
 from app.agent.graph import MockbirdAgentGraph
+from app.crypto import encrypt_secret, decrypt_secret
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
+
+
+def _get_provider_api_key(prov: Optional[AIProvider]) -> str:
+    """Recupera e descriptografa com segurança a chave de API do provedor."""
+    if not prov or not prov.encrypted_api_key:
+        return ""
+    return decrypt_secret(prov.encrypted_api_key)
 
 
 def resolve_docker_base_url(url: str) -> str:
@@ -108,6 +116,7 @@ async def save_provider(
         clean_custom_models.insert(0, payload.default_model.strip())
 
     api_key_str = (payload.api_key or "").strip()
+    encrypted_key = encrypt_secret(api_key_str) if api_key_str else ""
 
     if not prov:
         prov = AIProvider(
@@ -116,12 +125,12 @@ async def save_provider(
             default_model=payload.default_model.strip(),
             base_url=(payload.base_url or "").strip(),
             custom_models=clean_custom_models,
-            encrypted_api_key=api_key_str
+            encrypted_api_key=encrypted_key
         )
         db.add(prov)
     else:
         if api_key_str:
-            prov.encrypted_api_key = api_key_str
+            prov.encrypted_api_key = encrypted_key
         prov.default_model = payload.default_model.strip()
         prov.base_url = (payload.base_url or "").strip()
         prov.custom_models = clean_custom_models
@@ -331,8 +340,9 @@ async def ai_generate_stream(
     user_msg = f"Instrução: {payload.prompt}\nHTML Atual da Tela:\n{payload.current_html}"
 
     headers = {"Content-Type": "application/json"}
-    if prov and prov.encrypted_api_key:
-        headers["Authorization"] = f"Bearer {prov.encrypted_api_key}"
+    api_key_plain = _get_provider_api_key(prov)
+    if api_key_plain:
+        headers["Authorization"] = f"Bearer {api_key_plain}"
     else:
         headers["Authorization"] = "Bearer local-llm"
 
@@ -463,7 +473,8 @@ async def ai_generate_or_modify(
         "11434" in raw_base_url
     )
 
-    if not prov or (not is_local_or_custom and not prov.encrypted_api_key):
+    api_key_plain = _get_provider_api_key(prov)
+    if not prov or (not is_local_or_custom and not api_key_plain):
         print(f"[AI CHAT] Nenhum provedor configurado. Usando mock offline.", flush=True)
         return {
             "status": "simulated",
@@ -503,7 +514,7 @@ async def ai_generate_or_modify(
         async with httpx.AsyncClient(timeout=timeout_val) as client:
             if p_type == "anthropic":
                 headers = {
-                    "x-api-key": prov.encrypted_api_key or "dummy",
+                    "x-api-key": api_key_plain or "dummy",
                     "anthropic-version": "2023-06-01",
                     "Content-Type": "application/json"
                 }
@@ -528,8 +539,8 @@ async def ai_generate_or_modify(
                     return {"status": "error", "detail": f"Erro retornado por Anthropic ({res.status_code}): {res.text}"}
             else:
                 headers = {"Content-Type": "application/json"}
-                if prov.encrypted_api_key:
-                    headers["Authorization"] = f"Bearer {prov.encrypted_api_key}"
+                if api_key_plain:
+                    headers["Authorization"] = f"Bearer {api_key_plain}"
                 else:
                     headers["Authorization"] = "Bearer local-llm"
 
@@ -723,10 +734,11 @@ async def ai_vision_critique(
 
     try:
         async with httpx.AsyncClient(timeout=timeout_val) as client:
+            api_key_plain = _get_provider_api_key(prov)
             # 1. Provedor Anthropic com Imagem Real Multimodal
             if p_type == "anthropic" and supports_native_vision and has_valid_image:
                 headers = {
-                    "x-api-key": (prov.encrypted_api_key if prov else "") or "dummy",
+                    "x-api-key": api_key_plain or "dummy",
                     "anthropic-version": "2023-06-01",
                     "Content-Type": "application/json"
                 }
@@ -774,8 +786,8 @@ async def ai_vision_critique(
             # 2. Provedor OpenAI / OpenRouter / Gemini com Imagem Real Multimodal
             elif supports_native_vision and has_valid_image:
                 headers = {"Content-Type": "application/json"}
-                if prov and prov.encrypted_api_key:
-                    headers["Authorization"] = f"Bearer {prov.encrypted_api_key}"
+                if api_key_plain:
+                    headers["Authorization"] = f"Bearer {api_key_plain}"
                 else:
                     headers["Authorization"] = "Bearer local-llm"
 
@@ -816,8 +828,8 @@ async def ai_vision_critique(
 
             # 3. Provedor Local / Bonsai-27b / Fallback com Auto-Auditoria Heurística
             headers = {"Content-Type": "application/json"}
-            if prov and prov.encrypted_api_key:
-                headers["Authorization"] = f"Bearer {prov.encrypted_api_key}"
+            if api_key_plain:
+                headers["Authorization"] = f"Bearer {api_key_plain}"
             else:
                 headers["Authorization"] = "Bearer local-llm"
 
@@ -912,8 +924,9 @@ async def ai_agent_graph_stream(
     resolved_base_url = resolve_docker_base_url(raw_base_url)
 
     headers = {"Content-Type": "application/json"}
-    if prov and prov.encrypted_api_key:
-        headers["Authorization"] = f"Bearer {prov.encrypted_api_key}"
+    api_key_plain = _get_provider_api_key(prov)
+    if api_key_plain:
+        headers["Authorization"] = f"Bearer {api_key_plain}"
     else:
         headers["Authorization"] = "Bearer local-llm"
 

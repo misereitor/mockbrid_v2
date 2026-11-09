@@ -4,7 +4,8 @@ from sqlalchemy.future import select
 from typing import Dict, Any, List
 
 from app.database import get_db
-from app.models import Project, Canvas, Screen, DesignTokens, Comment
+from app.models import Project, Canvas, Screen, DesignTokens, Comment, Workspace, User
+from app.routes_auth import get_current_user
 
 router = APIRouter(prefix="/mcp", tags=["mcp"])
 
@@ -40,9 +41,20 @@ async def mcp_server_info():
 
 
 @router.post("/tools/get_project_map")
-async def mcp_get_project_map(project_id: str, db: AsyncSession = Depends(get_db)):
-    # Busca projeto
-    p_query = await db.execute(select(Project).where(Project.id == project_id))
+async def mcp_get_project_map(
+    project_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Busca projeto garantindo tenant isolation
+    p_query = await db.execute(
+        select(Project)
+        .join(Workspace, Workspace.id == Project.workspace_id)
+        .where(
+            Project.id == project_id,
+            Workspace.organization_id == current_user.organization_id
+        )
+    )
     project = p_query.scalars().first()
     if not project:
         raise HTTPException(status_code=404, detail="Projeto não encontrado")
@@ -89,8 +101,21 @@ async def mcp_get_project_map(project_id: str, db: AsyncSession = Depends(get_db
 
 
 @router.post("/tools/get_implementation_bundle")
-async def mcp_get_implementation_bundle(screen_id: str, db: AsyncSession = Depends(get_db)):
-    s_query = await db.execute(select(Screen).where(Screen.id == screen_id))
+async def mcp_get_implementation_bundle(
+    screen_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    s_query = await db.execute(
+        select(Screen)
+        .join(Canvas, Canvas.id == Screen.canvas_id)
+        .join(Project, Project.id == Canvas.project_id)
+        .join(Workspace, Workspace.id == Project.workspace_id)
+        .where(
+            Screen.id == screen_id,
+            Workspace.organization_id == current_user.organization_id
+        )
+    )
     screen = s_query.scalars().first()
     if not screen:
         raise HTTPException(status_code=404, detail="Tela não encontrada")

@@ -92,7 +92,7 @@ interface AIChatPanelProps {
 export function cleanAndExtractHtml(text: string): string {
   if (!text) return '';
   
-  // 1. Bloco de código com crases ```html ... ```
+  // 1. Bloco de código com crases fechadas ```html ... ```
   const fenceMatch = text.match(/```(?:html)?\s*(<[\s\S]+?>[\s\S]*?)```/i);
   if (fenceMatch) {
     const inside = fenceMatch[1].trim();
@@ -101,9 +101,29 @@ export function cleanAndExtractHtml(text: string): string {
     }
   }
 
+  // 1b. Bloco de código iniciado com ```html que não fechou com crases (corte por length)
+  const openFenceMatch = text.match(/```(?:html)?\s*(<!DOCTYPE[\s\S]+|<html[\s\S]+|<(?:div|section|main|header|footer)[\s\S]+)/i);
+  if (openFenceMatch) {
+    let inside = openFenceMatch[1].trim();
+    inside = inside.replace(/```+$/, '').trim();
+    if (inside.includes('<') && inside.includes('>')) {
+      return inside;
+    }
+  }
+
   // 2. Documento completo HTML
   const docMatch = text.match(/(<!DOCTYPE\s+html[\s\S]+?<\/html>|<html[\s\S]+?<\/html>)/i);
   if (docMatch) return docMatch[1].trim();
+
+  // 2b. Documento iniciado com <!DOCTYPE ou <html>
+  const openDocMatch = text.match(/(<!DOCTYPE\s+html[\s\S]+|<html\b[\s\S]+)/i);
+  if (openDocMatch) {
+    let inside = openDocMatch[1].trim();
+    inside = inside.replace(/```+$/, '').trim();
+    if (inside.includes('<') && inside.includes('>')) {
+      return inside;
+    }
+  }
 
   // 3. Tags HTML estruturais comuns
   const tagMatch = text.match(/(<(?:div|section|main|header|footer|aside|article|form|nav|button|ul|ol|table|dialog|p|span|a|h[1-6])\b[\s\S]+?<\/(?:div|section|main|header|footer|aside|article|form|nav|button|ul|ol|table|dialog|p|span|a|h[1-6])>)/i);
@@ -471,13 +491,35 @@ export function AIChatPanel({
         }
 
         const effectivePatch = cleanAndExtractHtml(finalPatch);
+        const hasValidPatch = Boolean(effectivePatch && effectivePatch.trim().length > 0);
+        const nowTime = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+
+        // Auto-aplicação imediata no Canvas quando o Agente produz um patch de código válido
+        if (hasValidPatch) {
+          try {
+            if (finalPatchType === 'element' && onApplyElementPatch) {
+              onApplyElementPatch(effectivePatch, {
+                mbId: finalTargetMbId,
+                selector: finalTargetSelector
+              });
+            } else {
+              onApplyHtml(effectivePatch);
+            }
+            if (onClearSelectedElement) {
+              onClearSelectedElement();
+            }
+          } catch (e) {
+            console.error('Erro ao auto-aplicar patch no Canvas:', e);
+          }
+        }
+
         const assistantMessage: ChatMessage = {
           id: `msg_asst_${Date.now()}`,
           role: 'assistant',
-          content: finalSummary || 'Instrução processada com sucesso pelo Agente.',
+          content: finalSummary || (hasValidPatch ? 'Interface construída e aplicada diretamente no Canvas.' : 'Instrução processada pelo Agente.'),
           reasoning: finalReasoning.trim() || undefined,
-          patch: effectivePatch || undefined,
-          patchType: effectivePatch ? finalPatchType : 'none',
+          patch: hasValidPatch ? effectivePatch : undefined,
+          patchType: hasValidPatch ? finalPatchType : 'none',
           targetSelector: finalTargetSelector,
           targetMbId: finalTargetMbId,
           targetTag: finalTargetTag,
@@ -486,8 +528,10 @@ export function AIChatPanel({
           audit: collectedAudit || undefined,
           htmlSnapshotBefore: currentSnapshot,
           elementSnapshotBefore: selectedElement?.snippet,
-          isApplied: false,
-          timestamp: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
+          isApplied: hasValidPatch,
+          appliedAt: hasValidPatch ? nowTime : undefined,
+          htmlSnapshotAfter: hasValidPatch ? effectivePatch : undefined,
+          timestamp: nowTime
         };
 
         setSessions(prev => prev.map(s => {

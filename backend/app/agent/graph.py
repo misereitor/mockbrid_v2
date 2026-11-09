@@ -18,10 +18,18 @@ def clean_extracted_html(text: str) -> str:
     if not text:
         return ""
     
-    # 1. Procura bloco de código ```html ... ```
+    # 1. Procura bloco de código fechado ```html ... ```
     m = re.search(r"```(?:html)?\s*(<[\s\S]+?>[\s\S]*?)```", text, re.IGNORECASE)
     if m:
         extracted = m.group(1).strip()
+        if "<" in extracted and ">" in extracted:
+            return extracted
+
+    # 1b. Procura bloco de código iniciado com ```html que não fechou com ``` (corte por length)
+    m_open = re.search(r"```(?:html)?\s*(<!DOCTYPE[\s\S]+|<html[\s\S]+|<(?:div|section|main|header|footer)[\s\S]+)", text, re.IGNORECASE)
+    if m_open:
+        extracted = m_open.group(1).strip()
+        extracted = re.sub(r"```+$", "", extracted).strip()
         if "<" in extracted and ">" in extracted:
             return extracted
 
@@ -29,6 +37,14 @@ def clean_extracted_html(text: str) -> str:
     m_doc = re.search(r"(<!DOCTYPE\s+html[\s\S]+?</html>|<html[\s\S]+?</html>)", text, re.IGNORECASE)
     if m_doc:
         return m_doc.group(1).strip()
+
+    # 2b. Procura documento iniciado com <!DOCTYPE html> ou <html> mesmo que não tenha fechado </html>
+    m_doc_open = re.search(r"(<!DOCTYPE\s+html[\s\S]+|<html\b[\s\S]+)", text, re.IGNORECASE)
+    if m_doc_open:
+        extracted = m_doc_open.group(1).strip()
+        extracted = re.sub(r"```+$", "", extracted).strip()
+        if "<" in extracted and ">" in extracted:
+            return extracted
 
     # 3. Procura tags estruturais com fechamento (div, section, main, header, footer, button, form, etc.)
     m_tag = re.search(r"(<(?:div|section|main|header|footer|aside|article|form|nav|button|ul|ol|table|dialog|p|span|a|h[1-6])\b[\s\S]+?</(?:div|section|main|header|footer|aside|article|form|nav|button|ul|ol|table|dialog|p|span|a|h[1-6])>)", text, re.IGNORECASE)
@@ -56,10 +72,11 @@ class MockbirdAgentGraph:
         messages: List[Dict[str, str]],
         model: str,
         temperature: float = 0.4,
-        max_tokens: int = 4096
+        max_tokens: int = 8192
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Chama a LLM com stream ativo, separando estritamente reasoning_content de content."""
-        async with httpx.AsyncClient(timeout=300.0) as client:
+        timeout_config = httpx.Timeout(600.0, read=300.0, write=60.0, connect=60.0)
+        async with httpx.AsyncClient(timeout=timeout_config) as client:
             async with client.stream(
                 "POST",
                 f"{self.base_url.rstrip('/')}/chat/completions",
@@ -121,11 +138,18 @@ class MockbirdAgentGraph:
                 full_r = "".join(accumulated_reasoning)
 
                 # Extrai tag <think>...</think> se vier dentro de content
-                if "<think>" in full_c and "</think>" in full_c:
-                    think_part = re.search(r"<think>([\s\S]*?)</think>", full_c)
-                    if think_part:
-                        full_r += ("\n" if full_r else "") + think_part.group(1).strip()
-                        full_c = re.sub(r"<think>[\s\S]*?</think>", "", full_c).strip()
+                if "<think>" in full_c:
+                    if "</think>" in full_c:
+                        think_part = re.search(r"<think>([\s\S]*?)</think>", full_c)
+                        if think_part:
+                            full_r += ("\n" if full_r else "") + think_part.group(1).strip()
+                            full_c = re.sub(r"<think>[\s\S]*?</think>", "", full_c).strip()
+                    else:
+                        # Tag think aberta mas não fechada: todo o texto é raciocínio
+                        open_think = re.search(r"<think>([\s\S]*)", full_c)
+                        if open_think:
+                            full_r += ("\n" if full_r else "") + open_think.group(1).strip()
+                            full_c = ""
 
                 yield {
                     "type": "completed",
@@ -276,6 +300,7 @@ class MockbirdAgentGraph:
                 f"SELETOR: {target_selector}\n"
                 f"CÓDIGO ATUAL DO ELEMENTO:\n{target_snippet or 'Elemento no Canvas'}\n\n"
                 "REGRAS ESTRITAS:\n"
+                "0. Raciocínio conciso (máximo 3 a 5 linhas). Inicie imediatamente a geração do código do elemento dentro de ```html ... ```.\n"
                 "1. Retorne APENAS o código HTML atualizado deste elemento específico dentro do bloco ```html ... ```.\n"
                 "2. PRESERVE o atributo data-mb-id no elemento modificado.\n"
                 "3. NUNCA gere o documento HTML inteiro ou tags <html>/<body>. Apenas o elemento modificado!\n"
@@ -290,7 +315,7 @@ class MockbirdAgentGraph:
                 [{"role": "user", "content": element_prompt}],
                 state.model_name,
                 temperature=0.3,
-                max_tokens=2048
+                max_tokens=4096
             ):
                 if chunk["type"] == "heartbeat":
                     yield {
@@ -316,7 +341,10 @@ class MockbirdAgentGraph:
 
             # Mensagem explicativa em português (remove bloco de código para a resposta de texto)
             explanation = re.sub(r"```(?:html)?[\s\S]*?```", "", raw_code).strip()
-            state.final_summary = explanation or f"Elemento <{target_tag}> atualizado cirurgicamente com sucesso."
+            if state.accumulated_patch:
+                state.final_summary = explanation or f"Elemento <{target_tag}> atualizado cirurgicamente com sucesso."
+            else:
+                state.final_summary = "Aviso: Não foi possível gerar a modificação cirúrgica do elemento. Tente novamente."
 
             yield {
                 "type": "tool_call",
@@ -374,10 +402,11 @@ class MockbirdAgentGraph:
                 f"DIAGNÓSTICO TÉCNICO INICIAL:\n{issues_prompt}\n\n"
                 f"HTML ATUAL DA TELA:\n{state.current_html}\n\n"
                 "INSTRUÇÕES CRUCIAIS:\n"
-                "1. Corrija o layout quebradiço (alinhe containers com flex/grid adequados, garanta overflow correto, feche tags e garanta responsividade).\n"
-                "2. PRESERVE a identidade, os textos e o propósito da tela existente. NUNCA substitua a tela por um template aleatório!\n"
-                "3. Emita o código HTML corrigido completo dentro de ```html ... ```.\n"
-                "4. Explique em uma frase inicial o que você corrigiu."
+                "1. Seja extremamente conciso no raciocínio preliminar (máximo 5 linhas). Inicie imediatamente a geração do código HTML dentro do bloco ```html ... ```.\n"
+                "2. Corrija o layout quebradiço (alinhe containers com flex/grid adequados, garanta overflow correto, feche tags e garanta responsividade).\n"
+                "3. PRESERVE a identidade, os textos e o propósito da tela existente. NUNCA substitua a tela por um template aleatório!\n"
+                "4. Emita o código HTML corrigido completo dentro de ```html ... ```.\n"
+                "5. Explique em uma frase inicial o que você corrigiu."
             )
 
             raw_code = ""
@@ -387,7 +416,7 @@ class MockbirdAgentGraph:
                 [{"role": "user", "content": repair_prompt}],
                 state.model_name,
                 temperature=0.3,
-                max_tokens=4096
+                max_tokens=8192
             ):
                 if chunk["type"] == "heartbeat":
                     yield {
@@ -414,9 +443,11 @@ class MockbirdAgentGraph:
                     "issues": state.audit.issues,
                     "suggestions": state.audit.suggestions
                 }
-
-            explanation = re.sub(r"```(?:html)?[\s\S]*?```", "", raw_code).strip()
-            state.final_summary = explanation or "Layout corrigido: ajustadas estruturas de container, alinhamentos e tags."
+                explanation = re.sub(r"```(?:html)?[\s\S]*?```", "", raw_code).strip()
+                state.final_summary = explanation or "Layout corrigido: ajustadas estruturas de container, alinhamentos e tags."
+            else:
+                state.audit = None
+                state.final_summary = "Aviso: A correção de layout não pôde ser concluída integralmente nesta execução. Tente selecionar o elemento específico para edição cirúrgica."
 
             yield {
                 "type": "agent_done",
@@ -513,6 +544,7 @@ class MockbirdAgentGraph:
             f"SOLICITAÇÃO: {state.prompt}\n"
             f"PLANO APROVADO:\n{plan_desc}\n\n"
             "REGRAS INEGOCIÁVEIS (LEIA COM ATENÇÃO):\n"
+            "0. RACIOCÍNIO ULTRA-CONCISO: Limite seu raciocínio preliminar a no máximo 5 a 8 linhas. Comece IMEDIATAMENTE a gerar o código HTML completo dentro do bloco ```html ... ```.\n"
             "1. PROIBIDO RESUMIR: NUNCA escreva textos como 'noise overlay div', 'hero div' ou comentários de TODO. Escreva CADA tag, classe, texto e botão por completo!\n"
             "2. IMAGENS REAIS: Use sempre tags <img> com URLs completas e reais do Unsplash.\n"
             "3. DESIGN SYSTEM: Fundo escuro premium (bg-[#09090b] ou bg-slate-950), superfícies bg-[#121215], bordas border-white/10, tipografia sans-serif limpa.\n"
@@ -526,8 +558,8 @@ class MockbirdAgentGraph:
         async for chunk in self._call_llm_stream(
             [{"role": "user", "content": executor_prompt}],
             state.model_name,
-            temperature=0.4,
-            max_tokens=4096
+            temperature=0.35,
+            max_tokens=12288
         ):
             if chunk["type"] == "heartbeat":
                 yield {
@@ -564,12 +596,20 @@ class MockbirdAgentGraph:
                 "suggestions": audit.suggestions
             }
 
-        state.is_complete = True
-        state.final_summary = (
-            f"Interface construída com sucesso. "
-            f"Qualidade avaliada com nota {state.audit.score if state.audit else 100}/100. "
-            f"Pronta para exibição e testes no Canvas."
-        )
+            state.is_complete = True
+            state.final_summary = (
+                f"Interface construída com sucesso. "
+                f"Qualidade avaliada com nota {state.audit.score if state.audit else 100}/100. "
+                f"Pronta para exibição e testes no Canvas."
+            )
+        else:
+            state.audit = None
+            state.is_complete = False
+            state.final_summary = (
+                "Aviso: Não foi possível gerar o código HTML completo nesta tentativa. "
+                "O modelo pode ter excedido o tempo limite ou não completou o bloco de código. "
+                "Por favor, tente novamente solicitando uma seção ou detalhe específico."
+            )
 
         yield {
             "type": "agent_done",

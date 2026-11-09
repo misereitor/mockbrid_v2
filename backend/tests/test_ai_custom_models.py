@@ -19,6 +19,9 @@ async def test_ai_custom_models_flow():
             "organization_name": f"Org AI {secrets.token_hex(3)}"
         })
         assert res_reg.status_code == 200, res_reg.text
+        csrf = client.cookies.get("mockbird_csrf")
+        if csrf:
+            client.headers["X-CSRF-Token"] = csrf
 
         # 2. Configura Provedor com Modelos Customizados livres
         res_save = await client.post("/api/ai/providers", json={

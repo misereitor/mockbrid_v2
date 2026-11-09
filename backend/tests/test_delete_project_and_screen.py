@@ -18,6 +18,9 @@ async def test_delete_project_and_screen():
             "organization_name": f"Org Del {secrets.token_hex(3)}"
         })
         assert reg.status_code == 200
+        csrf = client.cookies.get("mockbird_csrf")
+        if csrf:
+            client.headers["X-CSRF-Token"] = csrf
 
         # 2. Cria projeto de teste
         proj_res = await client.post("/api/projects", json={

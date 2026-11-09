@@ -6,10 +6,25 @@ from typing import List, Optional
 from datetime import datetime
 
 from app.database import get_db
-from app.models import User, Comment, Screen
+from app.models import User, Comment, Screen, Canvas, Project, Workspace
 from app.routes_auth import get_current_user
 
 router = APIRouter(prefix="/api/comments", tags=["comments"])
+
+
+async def _validate_screen_ownership(screen_id: str, current_user: User, db: AsyncSession) -> Screen:
+    """Garante que a tela pertence à organização do usuário para evitar vazamento IDOR."""
+    res = await db.execute(
+        select(Screen)
+        .join(Canvas, Canvas.id == Screen.canvas_id)
+        .join(Project, Project.id == Canvas.project_id)
+        .join(Workspace, Workspace.id == Project.workspace_id)
+        .where(Screen.id == screen_id, Workspace.organization_id == current_user.organization_id)
+    )
+    screen = res.scalars().first()
+    if not screen:
+        raise HTTPException(status_code=404, detail="Tela não encontrada")
+    return screen
 
 
 class CommentCreate(BaseModel):
@@ -40,8 +55,10 @@ class CommentOut(BaseModel):
 @router.get("/screen/{screen_id}", response_model=List[CommentOut])
 async def list_comments_by_screen(
     screen_id: str,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
+    await _validate_screen_ownership(screen_id, current_user, db)
     query = await db.execute(
         select(Comment).where(Comment.screen_id == screen_id).order_by(Comment.created_at.asc())
     )
@@ -54,6 +71,7 @@ async def create_comment(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
+    await _validate_screen_ownership(payload.screen_id, current_user, db)
     comment = Comment(
         screen_id=payload.screen_id,
         author_id=current_user.id,
@@ -74,12 +92,14 @@ async def create_comment(
 @router.patch("/{comment_id}/resolve", response_model=CommentOut)
 async def resolve_comment(
     comment_id: str,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     result = await db.execute(select(Comment).where(Comment.id == comment_id))
     comment = result.scalars().first()
     if not comment:
         raise HTTPException(status_code=404, detail="Comentário não encontrado")
+    await _validate_screen_ownership(comment.screen_id, current_user, db)
     comment.status = "resolved"
     comment.resolved_at = datetime.utcnow()
     await db.commit()

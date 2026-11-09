@@ -17,6 +17,9 @@ async def test_screen_revision_and_revert():
             "organization_name": f"Org Rev {secrets.token_hex(3)}"
         })
         assert reg.status_code == 200
+        csrf = client.cookies.get("mockbird_csrf")
+        if csrf:
+            client.headers["X-CSRF-Token"] = csrf
 
         # Cria projeto
         proj = await client.post("/api/projects", json={

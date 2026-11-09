@@ -1,9 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Response, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy import delete
 from datetime import datetime, timedelta
 import secrets
 
+from app.config import settings
 from app.database import get_db
 from app.models import User, Organization, Workspace, Session
 from app.schemas import UserRegister, UserLogin, UserOut
@@ -13,8 +15,11 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 async def get_current_user(request: Request, db: AsyncSession = Depends(get_db)) -> User:
+    is_cookie_auth = False
     token = request.cookies.get("mockbird_token")
-    if not token:
+    if token:
+        is_cookie_auth = True
+    else:
         # Tenta pelo header Authorization
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
@@ -28,6 +33,23 @@ async def get_current_user(request: Request, db: AsyncSession = Depends(get_db))
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token inválido ou expirado")
 
     user_id = payload["sub"]
+
+    # Valida sessão ativa no banco se houver
+    session_res = await db.execute(select(Session).where(Session.token == token))
+    active_session = session_res.scalars().first()
+    if active_session and active_session.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sessão expirada")
+
+    # Proteção CSRF para requisições autenticadas via Cookie nos métodos mutantes
+    if is_cookie_auth and request.method in ["POST", "PUT", "PATCH", "DELETE"]:
+        csrf_header = request.headers.get("X-CSRF-Token")
+        expected_csrf = active_session.csrf_token if active_session else request.cookies.get("mockbird_csrf")
+        if not csrf_header or not expected_csrf or not secrets.compare_digest(csrf_header, expected_csrf):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Falha de validação CSRF: token ausente ou inválido"
+            )
+
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalars().first()
 
@@ -79,13 +101,14 @@ async def register(payload: UserRegister, response: Response, db: AsyncSession =
     await db.commit()
     await db.refresh(user)
 
-    # Define o cookie HTTP-Only seguro
+    # Define cookies (secure=True em produção, False em homologação HTTP)
+    is_prod = (settings.ENVIRONMENT == "production")
     response.set_cookie(
         key="mockbird_token",
         value=token,
         httponly=True,
         samesite="lax",
-        secure=False,  # Permite HTTP em ambiente de homologação
+        secure=is_prod,
         max_age=60 * 60 * 24 * 7,
     )
     response.set_cookie(
@@ -93,7 +116,7 @@ async def register(payload: UserRegister, response: Response, db: AsyncSession =
         value=csrf_token,
         httponly=False,  # JS pode ler para anexar no header CSRF
         samesite="lax",
-        secure=False,
+        secure=is_prod,
         max_age=60 * 60 * 24 * 7,
     )
 
@@ -123,12 +146,13 @@ async def login(payload: UserLogin, response: Response, db: AsyncSession = Depen
     db.add(session)
     await db.commit()
 
+    is_prod = (settings.ENVIRONMENT == "production")
     response.set_cookie(
         key="mockbird_token",
         value=token,
         httponly=True,
         samesite="lax",
-        secure=False,
+        secure=is_prod,
         max_age=60 * 60 * 24 * 7,
     )
     response.set_cookie(
@@ -136,7 +160,7 @@ async def login(payload: UserLogin, response: Response, db: AsyncSession = Depen
         value=csrf_token,
         httponly=False,
         samesite="lax",
-        secure=False,
+        secure=is_prod,
         max_age=60 * 60 * 24 * 7,
     )
 
@@ -150,8 +174,9 @@ async def get_me(current_user: User = Depends(get_current_user)):
 
 @router.post("/logout")
 async def logout(response: Response, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    # Deleta sessões do usuário
-    await db.execute(select(Session).where(Session.user_id == current_user.id))
+    # Deleta sessões ativas do usuário
+    await db.execute(delete(Session).where(Session.user_id == current_user.id))
+    await db.commit()
     response.delete_cookie("mockbird_token")
     response.delete_cookie("mockbird_csrf")
     return {"message": "Sessão encerrada com sucesso"}
