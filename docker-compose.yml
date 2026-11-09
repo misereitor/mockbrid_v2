@@ -1,0 +1,43 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: mockbird_v2_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mockbird
+      POSTGRES_PASSWORD: mockbird_homolog_secret
+      POSTGRES_DB: mockbird_v2
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - mockbird_v2_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mockbird -d mockbird_v2"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mockbird_v2_api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://mockbird:mockbird_homolog_secret@db:5432/mockbird_v2
+      DATABASE_URL_SYNC: postgresql://mockbird:mockbird_homolog_secret@db:5432/mockbird_v2
+      SECRET_KEY: mockbird_v2_homolog_secret_jwt_key_super_secure_987654321
+      ENVIRONMENT: homologation
+      ALLOW_ORIGINS: "http://localhost:8082,http://127.0.0.1:8082"
+    ports:
+      - "127.0.0.1:8082:8000"
+    volumes:
+      - ./backend:/app
+      - ./frontend/dist:/app/frontend_dist:ro
+
+volumes:
+  mockbird_v2_pgdata:
+
