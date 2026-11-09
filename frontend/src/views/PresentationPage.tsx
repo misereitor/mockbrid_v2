@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useMemo } from 'react';
 import { ArrowLeft, Bell } from 'lucide-react';
 
 interface PresentationPageProps {
@@ -48,18 +48,14 @@ export const PresentationPage: React.FC<PresentationPageProps> = ({ slug, onBack
   const activeScreen = projectData?.screens?.[currentScreenIndex];
   const tokens = projectData?.tokens || {};
 
-  useEffect(() => {
-    if (!activeScreen) return;
-    const iframe = iframeRef.current;
-    if (!iframe) return;
-    const doc = iframe.contentDocument || iframe.contentWindow?.document;
-    if (!doc) return;
-
+  // Gera HTML e Mock Runtime isolado declarativamente para renderizar via srcDoc
+  const htmlDoc = useMemo(() => {
+    if (!activeScreen) return '';
     const cssVars = Object.entries(tokens)
       .map(([k, v]) => `--${k}: ${v};`)
       .join('\n');
 
-    const htmlDoc = `
+    return `
       <!doctype html>
       <html>
         <head>
@@ -97,10 +93,6 @@ export const PresentationPage: React.FC<PresentationPageProps> = ({ slug, onBack
         </body>
       </html>
     `;
-
-    doc.open();
-    doc.write(htmlDoc);
-    doc.close();
   }, [activeScreen, tokens]);
 
   if (loading) {
@@ -193,12 +185,13 @@ export const PresentationPage: React.FC<PresentationPageProps> = ({ slug, onBack
         </div>
       </div>
 
-      {/* Frame Fullscreen de Apresentação com Sandbox Seguro */}
+      {/* Frame Fullscreen de Apresentação com Sandbox Estrito (sem allow-same-origin) */}
       <div className="flex-1 w-full h-full bg-[#09090b] overflow-hidden">
         <iframe
           ref={iframeRef}
           title={activeScreen?.name || 'Apresentação'}
-          sandbox="allow-scripts allow-forms allow-modals allow-same-origin"
+          srcDoc={htmlDoc}
+          sandbox="allow-scripts allow-forms allow-modals"
           className="w-full h-full border-0"
         />
       </div>

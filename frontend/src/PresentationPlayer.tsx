@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useMemo } from 'react';
 import { RotateCcw, X, Bell } from 'lucide-react';
 
 interface PresentationPlayerProps {
@@ -20,7 +20,7 @@ export function PresentationPlayer({
   // Escuta mensagens vindas do runtime do protótipo dentro do iframe
   useEffect(() => {
     const handleMsg = (ev: MessageEvent) => {
-      if (ev.data?.type === 'MOCK_TOAST') {
+      if (ev.data?.type === 'MOCK_TOAST' && typeof ev.data.message === 'string') {
         setToastMessage(ev.data.message);
         setTimeout(() => setToastMessage(null), 3000);
       }
@@ -29,18 +29,13 @@ export function PresentationPlayer({
     return () => window.removeEventListener('message', handleMsg);
   }, []);
 
-  // Injeta HTML e o Mock Runtime leve no iframe
-  useEffect(() => {
-    const iframe = iframeRef.current;
-    if (!iframe) return;
-    const doc = iframe.contentDocument || iframe.contentWindow?.document;
-    if (!doc) return;
-
+  // Gera HTML e Mock Runtime isolado de forma declarativa para renderizar via srcDoc
+  const htmlDoc = useMemo(() => {
     const cssVars = Object.entries(tokens)
       .map(([k, v]) => `--${k}: ${v};`)
       .join('\n');
 
-    const htmlDoc = `
+    return `
       <!doctype html>
       <html>
         <head>
@@ -83,10 +78,6 @@ export function PresentationPlayer({
         </body>
       </html>
     `;
-
-    doc.open();
-    doc.write(htmlDoc);
-    doc.close();
   }, [initialHtml, tokens]);
 
   return (
@@ -110,7 +101,7 @@ export function PresentationPlayer({
           <button 
             onClick={() => {
               // Reinicia o iframe recarregando
-              if (iframeRef.current) iframeRef.current.src = iframeRef.current.src;
+              if (iframeRef.current) iframeRef.current.srcdoc = htmlDoc;
             }}
             className="p-1.5 rounded-lg bg-slate-900/90 border border-slate-700 text-slate-300 hover:text-white transition"
             title="Reiniciar Fluxo"
@@ -126,11 +117,12 @@ export function PresentationPlayer({
         </div>
       </div>
 
-      {/* Iframe 100% da Janela com Sandbox Seguro */}
+      {/* Iframe 100% da Janela com Sandbox Estrito (sem allow-same-origin para isolamento total) */}
       <iframe 
         ref={iframeRef}
         title="Modo Apresentação"
-        sandbox="allow-scripts allow-forms allow-modals allow-same-origin"
+        srcDoc={htmlDoc}
+        sandbox="allow-scripts allow-forms allow-modals"
         className="w-full h-full border-0"
       />
     </div>
