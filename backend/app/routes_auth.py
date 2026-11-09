@@ -62,6 +62,23 @@ async def get_current_user(request: Request, db: AsyncSession = Depends(get_db))
     return user
 
 
+def require_role(*allowed_roles: str):
+    """Fábrica de dependências para controle de acesso baseado em papéis (RBAC)."""
+    async def role_checker(current_user: User = Depends(get_current_user)) -> User:
+        if current_user.role not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Ação não permitida para o seu papel ({current_user.role}). Permissões necessárias: {', '.join(allowed_roles)}"
+            )
+        return current_user
+    return role_checker
+
+
+require_editor = require_role("owner", "admin", "editor")
+require_commenter = require_role("owner", "admin", "editor", "commenter")
+require_admin = require_role("owner", "admin")
+
+
 @router.post("/register", response_model=UserOut)
 async def register(payload: UserRegister, response: Response, db: AsyncSession = Depends(get_db)):
     # Verifica se o e-mail já existe

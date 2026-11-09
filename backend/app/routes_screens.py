@@ -6,7 +6,7 @@ from typing import List
 from app.database import get_db
 from app.models import User, Screen, Canvas, Project, Workspace, ScreenRevision
 from app.schemas import ScreenCreate, ScreenUpdate, ScreenOut, ScreenRevisionOut
-from app.routes_auth import get_current_user
+from app.routes_auth import get_current_user, require_editor
 
 router = APIRouter(prefix="/api/screens", tags=["screens"])
 
@@ -63,7 +63,7 @@ async def get_screen(
 @router.post("", response_model=ScreenOut)
 async def create_screen(
     payload: ScreenCreate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
     await _owned_canvas(payload.canvas_id, current_user, db)
@@ -90,7 +90,7 @@ async def create_screen(
 async def update_screen(
     screen_id: str,
     payload: ScreenUpdate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
     screen = await _owned_screen(screen_id, current_user, db)
@@ -128,7 +128,7 @@ async def update_screen(
 @router.delete("/{screen_id}")
 async def delete_screen(
     screen_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
     """Exclui uma tela do projeto."""
@@ -158,7 +158,7 @@ async def list_screen_revisions(
 async def revert_screen_revision(
     screen_id: str,
     revision_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
     """Reverte o código da tela para uma revisão histórica específica."""
@@ -197,7 +197,7 @@ async def revert_screen_revision(
 @router.post("/{screen_id}/duplicate", response_model=ScreenOut)
 async def duplicate_screen(
     screen_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
     """Duplica uma tela inteira no mesmo canvas."""

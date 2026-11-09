@@ -20,6 +20,9 @@ async def test_agent_intent_and_separation():
         })
         assert res_reg.status_code == 200, res_reg.text
 
+        csrf = client.cookies.get("mockbird_csrf")
+        stream_headers = {"X-CSRF-Token": csrf} if csrf else {}
+
         # -------------------------------------------------------------------
         # TESTE 1: Pergunta conceitual (NÃO deve gerar patch nem vazar reasoning)
         # -------------------------------------------------------------------
@@ -27,6 +30,7 @@ async def test_agent_intent_and_separation():
         async with client.stream(
             "POST",
             "/api/ai/agent/stream",
+            headers=stream_headers,
             json={
                 "prompt": "O que você acha da tipografia e do contraste desta interface?",
                 "current_html": "<div class='bg-slate-900 text-white p-4'><h1 class='text-2xl font-bold'>Título</h1></div>",
@@ -66,6 +70,7 @@ async def test_agent_intent_and_separation():
         async with client.stream(
             "POST",
             "/api/ai/agent/stream",
+            headers=stream_headers,
             json={
                 "prompt": "Mude a cor do botão para verde-esmeralda e altere o texto para 'Garantir Vaga'",
                 "current_html": "<section class='p-8'><button data-mb-id='btn-cta' class='bg-blue-600 text-white px-4 py-2 rounded'>Começar</button></section>",
@@ -116,6 +121,7 @@ async def test_agent_intent_and_separation():
         async with client.stream(
             "POST",
             "/api/ai/agent/stream",
+            headers=stream_headers,
             json={
                 "prompt": "O layout tá quebrado, poderia ver para concertar?",
                 "current_html": "<div class='flex'><div class='w-full'>Card 1</div><div>Card 2</div>",

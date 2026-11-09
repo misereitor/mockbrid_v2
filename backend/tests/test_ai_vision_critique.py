@@ -1,39 +1,28 @@
 import pytest
-import pytest_asyncio
-from httpx import AsyncClient, ASGITransport
-from app.main import app
-from app.models import User, Organization, AIProvider
-from app.database import AsyncSessionLocal
-from app.routes_auth import create_access_token
+import httpx
+import secrets
+import os
+
+BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8082")
 
 
 @pytest.mark.asyncio
 async def test_ai_vision_critique_endpoint():
-    async with AsyncSessionLocal() as session:
-        # Pega ou cria usuário de teste
-        from sqlalchemy.future import select
-        res = await session.execute(select(User).limit(1))
-        user = res.scalars().first()
-        if not user:
-            org = Organization(name="Vision Test Org", slug="vision-test-org")
-            session.add(org)
-            await session.commit()
-            await session.refresh(org)
-            user = User(
-                email="vision_test@mockbird.local",
-                hashed_password="dummy",
-                name="Vision Tester",
-                role="owner",
-                organization_id=org.id
-            )
-            session.add(user)
-            await session.commit()
-            await session.refresh(user)
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=120.0) as client:
+        email = f"vision_user_{secrets.token_hex(4)}@empresa.com"
+        pwd = "VisionPass123!"
 
-    token = create_access_token({"sub": user.id, "org": user.organization_id})
-    transport = ASGITransport(app=app)
+        reg_res = await client.post("/api/auth/register", json={
+            "email": email,
+            "password": pwd,
+            "name": "Vision Tester",
+            "organization_name": f"Org Vision {secrets.token_hex(3)}"
+        })
+        assert reg_res.status_code == 200, reg_res.text
 
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        csrf = client.cookies.get("mockbird_csrf")
+        headers = {"X-CSRF-Token": csrf} if csrf else {}
+
         # Envia requisição com HTML simples e pedido de carro da Honda
         payload = {
             "image_base64": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
@@ -43,7 +32,7 @@ async def test_ai_vision_critique_endpoint():
         }
         res = await client.post(
             "/api/ai/vision-critique",
-            headers={"Authorization": f"Bearer {token}"},
+            headers=headers,
             json=payload,
             timeout=120.0
         )

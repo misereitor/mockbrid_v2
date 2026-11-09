@@ -61,3 +61,4 @@ async def test_api_providers_returns_only_masked_keys():
         assert secret_api_key not in str(prov)
         assert prov["masked_api_key"].startswith("sk-p")
         assert prov["masked_api_key"].endswith("7654")
+

@@ -7,7 +7,7 @@ from datetime import datetime
 
 from app.database import get_db
 from app.models import User, Comment, Screen, Canvas, Project, Workspace
-from app.routes_auth import get_current_user
+from app.routes_auth import get_current_user, require_commenter, require_editor
 
 router = APIRouter(prefix="/api/comments", tags=["comments"])
 
@@ -68,7 +68,7 @@ async def list_comments_by_screen(
 @router.post("", response_model=CommentOut)
 async def create_comment(
     payload: CommentCreate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_commenter),
     db: AsyncSession = Depends(get_db)
 ):
     await _validate_screen_ownership(payload.screen_id, current_user, db)
@@ -92,7 +92,7 @@ async def create_comment(
 @router.patch("/{comment_id}/resolve", response_model=CommentOut)
 async def resolve_comment(
     comment_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_commenter),
     db: AsyncSession = Depends(get_db)
 ):
     result = await db.execute(select(Comment).where(Comment.id == comment_id))
@@ -100,6 +100,8 @@ async def resolve_comment(
     if not comment:
         raise HTTPException(status_code=404, detail="Comentário não encontrado")
     await _validate_screen_ownership(comment.screen_id, current_user, db)
+    if comment.author_id != current_user.id and current_user.role not in ["editor", "admin", "owner"]:
+        raise HTTPException(status_code=403, detail="Apenas o autor ou editores podem resolver este comentário")
     comment.status = "resolved"
     comment.resolved_at = datetime.utcnow()
     await db.commit()

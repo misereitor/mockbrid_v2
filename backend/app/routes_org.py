@@ -7,9 +7,9 @@ from datetime import datetime, timedelta
 import secrets
 
 from app.database import get_db
-from app.models import User, Organization, Workspace, Project
-from app.routes_auth import get_current_user
-from app.auth import hash_password
+from app.models import User, Organization, Workspace, Project, OrganizationInvite
+from app.routes_auth import get_current_user, require_admin
+from app.auth import hash_password, create_access_token
 
 router = APIRouter(prefix="/api/org", tags=["organization"])
 
@@ -18,6 +18,7 @@ class MemberInvite(BaseModel):
     email: EmailStr
     name: Optional[str] = None
     role: str = "editor"  # admin, editor, viewer
+    temporary_password: Optional[str] = None
 
 
 class MemberRoleUpdate(BaseModel):
@@ -31,9 +32,17 @@ class MemberOut(BaseModel):
     role: str
     is_active: bool
     created_at: datetime
+    invite_token: Optional[str] = None
+    invite_url: Optional[str] = None
 
     class Config:
         from_attributes = True
+
+
+class AcceptInviteRequest(BaseModel):
+    token: str
+    password: str
+    name: Optional[str] = None
 
 
 class WorkspaceCreate(BaseModel):
@@ -67,29 +76,77 @@ async def list_members(
 @router.post("/members/invite", response_model=MemberOut)
 async def invite_member(
     payload: MemberInvite,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
-    if current_user.role not in ["owner", "admin"]:
-        raise HTTPException(status_code=403, detail="Apenas administradores podem convidar membros")
-
     existing = await db.execute(select(User).where(User.email == payload.email))
     if existing.scalars().first():
         raise HTTPException(status_code=400, detail="Usuário com este e-mail já existe")
 
-    temp_password = secrets.token_urlsafe(10)
+    initial_password = payload.temporary_password if payload.temporary_password else secrets.token_urlsafe(12)
     resolved_name = (payload.name or payload.email.split('@')[0]).strip()
     new_user = User(
         organization_id=current_user.organization_id,
         email=payload.email,
         name=resolved_name,
         role=payload.role,
-        password_hash=hash_password(temp_password)
+        password_hash=hash_password(initial_password)
     )
     db.add(new_user)
+    await db.flush()
+
+    invite_token = secrets.token_urlsafe(32)
+    invite = OrganizationInvite(
+        organization_id=current_user.organization_id,
+        email=payload.email,
+        role=payload.role,
+        token=invite_token,
+        expires_at=datetime.utcnow() + timedelta(hours=48)
+    )
+    db.add(invite)
     await db.commit()
     await db.refresh(new_user)
-    return new_user
+
+    out = MemberOut.model_validate(new_user)
+    out.invite_token = invite_token
+    out.invite_url = f"/accept-invite?token={invite_token}"
+    return out
+
+
+@router.post("/members/accept-invite")
+async def accept_invite(
+    payload: AcceptInviteRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    res = await db.execute(
+        select(OrganizationInvite).where(
+            OrganizationInvite.token == payload.token,
+            OrganizationInvite.used_at.is_(None)
+        )
+    )
+    invite = res.scalars().first()
+    if not invite or invite.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Convite inválido ou expirado")
+
+    user_res = await db.execute(select(User).where(User.email == invite.email))
+    user = user_res.scalars().first()
+    if not user:
+        user = User(
+            organization_id=invite.organization_id,
+            email=invite.email,
+            name=(payload.name or invite.email.split('@')[0]).strip(),
+            role=invite.role,
+            password_hash=hash_password(payload.password)
+        )
+        db.add(user)
+    else:
+        user.password_hash = hash_password(payload.password)
+        if payload.name:
+            user.name = payload.name.strip()
+
+    invite.used_at = datetime.utcnow()
+    await db.commit()
+    return {"status": "success", "message": "Convite aceito com sucesso", "email": invite.email}
 
 
 @router.get("/workspaces", response_model=List[WorkspaceOut])

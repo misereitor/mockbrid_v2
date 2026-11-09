@@ -37,3 +37,4 @@ async def test_logout_must_revoke_token_immediately():
         assert reused_res.status_code == 401, (
             f"Esperava 401 Unauthorized após logout, mas recebeu {reused_res.status_code}: {reused_res.text}"
         )
+

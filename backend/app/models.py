@@ -64,6 +64,36 @@ class Session(Base):
     user = relationship("User", back_populates="sessions")
 
 
+class OrganizationInvite(Base):
+    __tablename__ = "organization_invites"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    organization_id = Column(String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    email = Column(String(255), nullable=False, index=True)
+    role = Column(String(50), default="editor", nullable=False)
+    token = Column(String(100), unique=True, nullable=False, index=True)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    organization = relationship("Organization")
+
+
+class ShareLink(Base):
+    __tablename__ = "share_links"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    slug = Column(String(100), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=True)
+    allow_comments = Column(Boolean, default=False, nullable=False)
+    expires_at = Column(DateTime, nullable=True)
+    view_count = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    project = relationship("Project")
+
+
 class Workspace(Base):
     __tablename__ = "workspaces"
 

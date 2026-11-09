@@ -5,9 +5,9 @@ from typing import List, Optional
 import secrets
 
 from app.database import get_db
-from app.models import User, Workspace, Project, Canvas, Screen, DesignTokens
+from app.models import User, Workspace, Project, Canvas, Screen, DesignTokens, DataScenario, ScreenRevision
 from app.schemas import ProjectCreate, ProjectOut, ScreenCreate, ScreenUpdate, ScreenOut
-from app.routes_auth import get_current_user
+from app.routes_auth import get_current_user, require_editor, require_admin
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -37,7 +37,7 @@ async def list_projects(
 @router.post("", response_model=ProjectOut)
 async def create_project(
     payload: ProjectCreate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
     workspace_id = payload.workspace_id
@@ -137,7 +137,7 @@ async def get_project(
 @router.delete("/{project_id}")
 async def delete_project(
     project_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Exclui um projeto e todos os seus recursos vinculados (canvases, telas, tokens)."""
@@ -182,7 +182,7 @@ async def list_project_screens(
 async def create_project_screen(
     project_id: str,
     payload: dict,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
     """Cria uma nova tela no primeiro canvas do projeto."""
@@ -216,7 +216,7 @@ async def create_project_screen(
 @router.post("/{project_id}/duplicate", response_model=ProjectOut)
 async def duplicate_project(
     project_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
     """Duplica um projeto inteiro incluindo canvases, telas e design tokens."""
@@ -256,6 +256,16 @@ async def duplicate_project(
         await db.flush()
         canvas_map[c.id] = new_canvas.id
 
+        # Copia cenários de dados deste canvas
+        scenarios_res = await db.execute(select(DataScenario).where(DataScenario.canvas_id == c.id))
+        for sc in scenarios_res.scalars().all():
+            new_sc = DataScenario(
+                canvas_id=new_canvas.id,
+                name=sc.name,
+                mock_data=sc.mock_data
+            )
+            db.add(new_sc)
+
         # Copia telas deste canvas
         screens_res = await db.execute(select(Screen).where(Screen.canvas_id == c.id))
         for s in screens_res.scalars().all():
@@ -277,6 +287,19 @@ async def duplicate_project(
             )
             db.add(new_screen)
             await db.flush()
+
+            # Cria revisão inicial no novo projeto
+            new_rev = ScreenRevision(
+                screen_id=new_screen.id,
+                revision_number=1,
+                html_content=new_screen.html_content,
+                css_content=new_screen.css_content,
+                js_content=new_screen.js_content,
+                change_summary="Duplicação de projeto",
+                actor=current_user.name
+            )
+            db.add(new_rev)
+
             if s.is_entry:
                 new_proj.entry_screen_id = new_screen.id
 
