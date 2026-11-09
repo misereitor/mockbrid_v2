@@ -34,11 +34,14 @@ async def get_current_user(request: Request, db: AsyncSession = Depends(get_db))
 
     user_id = payload["sub"]
 
-    # Valida sessão ativa no banco se houver
+    # Valida estritamente sessão ativa no banco (revogação real de token)
     session_res = await db.execute(select(Session).where(Session.token == token))
     active_session = session_res.scalars().first()
-    if active_session and active_session.expires_at < datetime.utcnow():
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sessão expirada")
+    if not active_session or active_session.expires_at < datetime.utcnow():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Sessão inválida, revogada ou expirada"
+        )
 
     # Proteção CSRF para requisições autenticadas via Cookie nos métodos mutantes
     if is_cookie_auth and request.method in ["POST", "PUT", "PATCH", "DELETE"]:
