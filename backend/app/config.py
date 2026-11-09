@@ -28,6 +28,8 @@ class Settings(BaseSettings):
                 raise RuntimeError("ERRO CRÍTICO: SECRET_KEY padrão detectada em ambiente de produção!")
             if "mockbird_homolog_secret" in self.DATABASE_URL:
                 raise RuntimeError("ERRO CRÍTICO: Senha de banco de dados padrão detectada em ambiente de produção!")
+            if not self.ENCRYPTION_KEY or len(self.ENCRYPTION_KEY.strip()) < 32:
+                raise RuntimeError("ERRO CRÍTICO: ENCRYPTION_KEY obrigatória (mínimo 32 caracteres) em ambiente de produção!")
 
 
 settings = Settings()

@@ -55,6 +55,8 @@ class AIProviderOut(BaseModel):
     is_active: bool
     monthly_token_limit: int
     tokens_used_month: int
+    has_api_key: bool = False
+    masked_api_key: Optional[str] = ""
 
     class Config:
         from_attributes = True
@@ -92,7 +94,26 @@ async def list_providers(
     query = await db.execute(
         select(AIProvider).where(AIProvider.organization_id == current_user.organization_id)
     )
-    return query.scalars().all()
+    providers = query.scalars().all()
+    results = []
+    for p in providers:
+        raw_key = _get_provider_api_key(p)
+        masked = ""
+        if raw_key:
+            masked = raw_key[:4] + "..." + raw_key[-4:] if len(raw_key) > 8 else "***"
+        results.append(AIProviderOut(
+            id=p.id,
+            provider_type=p.provider_type,
+            default_model=p.default_model,
+            base_url=p.base_url,
+            custom_models=p.custom_models or [],
+            is_active=p.is_active,
+            monthly_token_limit=p.monthly_token_limit,
+            tokens_used_month=p.tokens_used_month,
+            has_api_key=bool(raw_key),
+            masked_api_key=masked,
+        ))
+    return results
 
 
 @router.post("/providers")
