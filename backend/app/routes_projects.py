@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from typing import List
+from typing import List, Optional
 import secrets
 
 from app.database import get_db
@@ -14,6 +14,7 @@ router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 @router.get("", response_model=List[ProjectOut])
 async def list_projects(
+    q: Optional[str] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -24,12 +25,12 @@ async def list_projects(
     if not ws_ids:
         return []
 
-    # Busca projetos desses workspaces
-    proj_query = await db.execute(
-        select(Project)
-        .where(Project.workspace_id.in_(ws_ids), Project.is_archived == False)
-        .order_by(Project.updated_at.desc())
-    )
+    # Busca projetos desses workspaces com busca opcional
+    query = select(Project).where(Project.workspace_id.in_(ws_ids), Project.is_archived == False)
+    if q and q.strip():
+        query = query.where(Project.name.ilike(f"%{q.strip()}%"))
+
+    proj_query = await db.execute(query.order_by(Project.updated_at.desc()))
     return proj_query.scalars().all()
 
 
@@ -210,3 +211,124 @@ async def create_project_screen(
     await db.commit()
     await db.refresh(screen)
     return screen
+
+
+@router.post("/{project_id}/duplicate", response_model=ProjectOut)
+async def duplicate_project(
+    project_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Duplica um projeto inteiro incluindo canvases, telas e design tokens."""
+    orig_proj = await _get_project_for_user(project_id, current_user, db)
+
+    new_slug = f"{orig_proj.slug}-copia-{secrets.token_hex(2)}"
+    new_proj = Project(
+        name=f"{orig_proj.name} (Cópia)",
+        slug=new_slug,
+        description=orig_proj.description,
+        workspace_id=orig_proj.workspace_id,
+    )
+    db.add(new_proj)
+    await db.flush()
+
+    # Copia Tokens
+    tokens_res = await db.execute(select(DesignTokens).where(DesignTokens.project_id == orig_proj.id))
+    orig_tokens = tokens_res.scalars().first()
+    if orig_tokens:
+        new_tokens = DesignTokens(
+            project_id=new_proj.id,
+            light_tokens=orig_tokens.light_tokens,
+            dark_tokens=orig_tokens.dark_tokens,
+        )
+        db.add(new_tokens)
+
+    # Copia Canvases e Telas
+    canvas_map = {}
+    canvases_res = await db.execute(select(Canvas).where(Canvas.project_id == orig_proj.id))
+    for c in canvases_res.scalars().all():
+        new_canvas = Canvas(
+            project_id=new_proj.id,
+            name=c.name,
+            sort_order=c.sort_order
+        )
+        db.add(new_canvas)
+        await db.flush()
+        canvas_map[c.id] = new_canvas.id
+
+        # Copia telas deste canvas
+        screens_res = await db.execute(select(Screen).where(Screen.canvas_id == c.id))
+        for s in screens_res.scalars().all():
+            new_screen = Screen(
+                canvas_id=new_canvas.id,
+                name=s.name,
+                is_entry=s.is_entry,
+                screen_kind=s.screen_kind,
+                device_type=s.device_type,
+                width=s.width,
+                height=s.height,
+                pos_x=s.pos_x,
+                pos_y=s.pos_y,
+                html_content=s.html_content,
+                css_content=s.css_content,
+                js_content=s.js_content,
+                transition=s.transition,
+                current_revision=1
+            )
+            db.add(new_screen)
+            await db.flush()
+            if s.is_entry:
+                new_proj.entry_screen_id = new_screen.id
+
+    await db.commit()
+    await db.refresh(new_proj)
+    return new_proj
+
+
+@router.get("/{project_id}/export/bundle")
+async def export_project_bundle(
+    project_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Dev Mode: Retorna mapa consolidado de todas as telas, tokens e templates do projeto."""
+    project = await _get_project_for_user(project_id, current_user, db)
+
+    # Tokens
+    t_query = await db.execute(select(DesignTokens).where(DesignTokens.project_id == project_id))
+    tokens = t_query.scalars().first()
+
+    # Telas
+    screens_res = await db.execute(
+        select(Screen)
+        .join(Canvas, Canvas.id == Screen.canvas_id)
+        .where(Canvas.project_id == project_id)
+        .order_by(Screen.is_entry.desc(), Screen.created_at.asc())
+    )
+    screens = screens_res.scalars().all()
+
+    bundle_screens = []
+    for s in screens:
+        component_name = "".join(w.capitalize() for w in s.name.split()) + "Screen"
+        clean_jsx = s.html_content.replace('class="', 'className="')
+        bundle_screens.append({
+            "id": s.id,
+            "name": s.name,
+            "is_entry": s.is_entry,
+            "html": s.html_content,
+            "css": s.css_content,
+            "react_component": f"export function {component_name}() {{\n  return (\n    {clean_jsx}\n  );\n}}"
+        })
+
+    return {
+        "project": {
+            "id": project.id,
+            "name": project.name,
+            "slug": project.slug
+        },
+        "tokens": {
+            "light": tokens.light_tokens if tokens else {},
+            "dark": tokens.dark_tokens if tokens else {}
+        },
+        "screens": bundle_screens
+    }

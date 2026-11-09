@@ -44,10 +44,20 @@ app.include_router(ai_router)
 
 @app.get("/api/health")
 async def health_check():
+    db_status = "connected"
+    try:
+        from sqlalchemy import text
+        from app.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+    except Exception as e:
+        db_status = f"unhealthy: {str(e)}"
+
     return {
-        "status": "healthy",
+        "status": "healthy" if db_status == "connected" else "degraded",
         "service": settings.PROJECT_NAME,
         "environment": settings.ENVIRONMENT,
+        "database": db_status
     }
 
 

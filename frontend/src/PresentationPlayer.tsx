@@ -126,10 +126,11 @@ export function PresentationPlayer({
         </div>
       </div>
 
-      {/* Iframe 100% da Janela (Simulação do Sistema Real) */}
+      {/* Iframe 100% da Janela com Sandbox Seguro */}
       <iframe 
         ref={iframeRef}
         title="Modo Apresentação"
+        sandbox="allow-scripts allow-forms allow-modals allow-same-origin"
         className="w-full h-full border-0"
       />
     </div>

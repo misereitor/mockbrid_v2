@@ -193,11 +193,12 @@ export const PresentationPage: React.FC<PresentationPageProps> = ({ slug, onBack
         </div>
       </div>
 
-      {/* Frame Fullscreen de Apresentação */}
+      {/* Frame Fullscreen de Apresentação com Sandbox Seguro */}
       <div className="flex-1 w-full h-full bg-[#09090b] overflow-hidden">
         <iframe
           ref={iframeRef}
           title={activeScreen?.name || 'Apresentação'}
+          sandbox="allow-scripts allow-forms allow-modals allow-same-origin"
           className="w-full h-full border-0"
         />
       </div>

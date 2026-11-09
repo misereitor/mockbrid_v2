@@ -30,6 +30,7 @@ interface DashboardPageProps {
   onSelectProject: (projectId: string) => void;
   onCreateProject: (name: string, description: string) => Promise<void>;
   onDeleteProject?: (projectId: string) => Promise<void> | void;
+  onDuplicateProject?: (projectId: string) => Promise<void> | void;
   onNavigate: (view: 'dashboard' | 'editor' | 'team' | 'settings' | 'presentation') => void;
   memberCount: number;
 }
@@ -46,6 +47,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   onSelectProject,
   onCreateProject,
   onDeleteProject,
+  onDuplicateProject,
   onNavigate,
   memberCount,
 }) => {
@@ -238,6 +240,20 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                         >
                           {copiedSlug === proj.slug ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
                         </button>
+                        {onDuplicateProject && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onDuplicateProject(proj.id);
+                            }}
+                            className="mb-btn-ghost !p-1.5 hover:!text-mockbird-cyan text-slate-500 transition-colors"
+                            title="Duplicar projeto"
+                            aria-label="Duplicar projeto"
+                          >
+                            <Copy size={14} />
+                          </button>
+                        )}
                         {onDeleteProject && (
                           <button
                             type="button"

@@ -5,7 +5,7 @@ from typing import List
 
 from app.database import get_db
 from app.models import User, Screen, Canvas, Project, Workspace, ScreenRevision
-from app.schemas import ScreenCreate, ScreenUpdate, ScreenOut
+from app.schemas import ScreenCreate, ScreenUpdate, ScreenOut, ScreenRevisionOut
 from app.routes_auth import get_current_user
 
 router = APIRouter(prefix="/api/screens", tags=["screens"])
@@ -136,4 +136,123 @@ async def delete_screen(
     await db.delete(screen)
     await db.commit()
     return {"message": "Tela excluída com sucesso", "screen_id": screen_id}
+
+
+@router.get("/{screen_id}/revisions", response_model=List[ScreenRevisionOut])
+async def list_screen_revisions(
+    screen_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Lista o histórico de revisões da tela para auditoria e reversão."""
+    await _owned_screen(screen_id, current_user, db)
+    res = await db.execute(
+        select(ScreenRevision)
+        .where(ScreenRevision.screen_id == screen_id)
+        .order_by(ScreenRevision.revision_number.desc())
+    )
+    return res.scalars().all()
+
+
+@router.post("/{screen_id}/revisions/{revision_id}/revert", response_model=ScreenOut)
+async def revert_screen_revision(
+    screen_id: str,
+    revision_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Reverte o código da tela para uma revisão histórica específica."""
+    screen = await _owned_screen(screen_id, current_user, db)
+    rev_res = await db.execute(
+        select(ScreenRevision).where(
+            ScreenRevision.id == revision_id,
+            ScreenRevision.screen_id == screen.id
+        )
+    )
+    rev = rev_res.scalars().first()
+    if not rev:
+        raise HTTPException(status_code=404, detail="Revisão não encontrada")
+
+    screen.html_content = rev.html_content
+    screen.css_content = rev.css_content
+    screen.js_content = rev.js_content
+    screen.current_revision += 1
+
+    # Cria snapshot da reversão
+    new_rev = ScreenRevision(
+        screen_id=screen.id,
+        revision_number=screen.current_revision,
+        html_content=screen.html_content,
+        css_content=screen.css_content,
+        js_content=screen.js_content,
+        actor=current_user.name,
+        change_summary=f"Reversão para revisão #{rev.revision_number}",
+    )
+    db.add(new_rev)
+    await db.commit()
+    await db.refresh(screen)
+    return screen
+
+
+@router.post("/{screen_id}/duplicate", response_model=ScreenOut)
+async def duplicate_screen(
+    screen_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Duplica uma tela inteira no mesmo canvas."""
+    original = await _owned_screen(screen_id, current_user, db)
+    new_screen = Screen(
+        canvas_id=original.canvas_id,
+        name=f"{original.name} (Cópia)",
+        is_entry=False,
+        screen_kind=original.screen_kind,
+        device_type=original.device_type,
+        width=original.width,
+        height=original.height,
+        pos_x=original.pos_x + 60,
+        pos_y=original.pos_y + 60,
+        html_content=original.html_content,
+        css_content=original.css_content,
+        js_content=original.js_content,
+        transition=original.transition,
+        current_revision=1,
+    )
+    db.add(new_screen)
+    await db.commit()
+    await db.refresh(new_screen)
+
+    # Cria revisão inicial da cópia
+    rev = ScreenRevision(
+        screen_id=new_screen.id,
+        revision_number=1,
+        html_content=new_screen.html_content,
+        css_content=new_screen.css_content,
+        js_content=new_screen.js_content,
+        actor=current_user.name,
+        change_summary="Duplicação da tela",
+    )
+    db.add(rev)
+    await db.commit()
+    return new_screen
+
+
+@router.get("/{screen_id}/export")
+async def export_screen_bundle(
+    screen_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Dev Mode / Handoff: Retorna o pacote de código pronto para desenvolvimento."""
+    screen = await _owned_screen(screen_id, current_user, db)
+    component_name = "".join(w.capitalize() for w in screen.name.split()) + "Screen"
+    clean_jsx = screen.html_content.replace('class="', 'className="')
+    return {
+        "screen_id": screen.id,
+        "name": screen.name,
+        "html": screen.html_content,
+        "css": screen.css_content,
+        "js": screen.js_content,
+        "react_jsx": f"export function {component_name}() {{\n  return (\n    {clean_jsx}\n  );\n}}"
+    }
 

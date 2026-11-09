@@ -20,6 +20,10 @@ class MemberInvite(BaseModel):
     role: str = "editor"  # admin, editor, viewer
 
 
+class MemberRoleUpdate(BaseModel):
+    role: str  # admin, editor, viewer
+
+
 class MemberOut(BaseModel):
     id: str
     name: str
@@ -117,4 +121,60 @@ async def create_workspace(
     await db.commit()
     await db.refresh(ws)
     return ws
+
+
+@router.patch("/members/{member_id}/role", response_model=MemberOut)
+async def update_member_role(
+    member_id: str,
+    payload: MemberRoleUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    if current_user.role not in ["owner", "admin"]:
+        raise HTTPException(status_code=403, detail="Apenas administradores podem alterar permissões")
+
+    if payload.role not in ["admin", "editor", "viewer"]:
+        raise HTTPException(status_code=400, detail="Papel inválido. Opções: admin, editor, viewer")
+
+    res = await db.execute(
+        select(User).where(User.id == member_id, User.organization_id == current_user.organization_id)
+    )
+    member = res.scalars().first()
+    if not member:
+        raise HTTPException(status_code=404, detail="Membro não encontrado")
+
+    if member.role == "owner":
+        raise HTTPException(status_code=400, detail="Não é permitido alterar o papel do proprietário")
+
+    member.role = payload.role
+    await db.commit()
+    await db.refresh(member)
+    return member
+
+
+@router.delete("/members/{member_id}")
+async def remove_member(
+    member_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    if current_user.role not in ["owner", "admin"]:
+        raise HTTPException(status_code=403, detail="Apenas administradores podem remover membros")
+
+    if member_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Você não pode remover a si mesmo da organização")
+
+    res = await db.execute(
+        select(User).where(User.id == member_id, User.organization_id == current_user.organization_id)
+    )
+    member = res.scalars().first()
+    if not member:
+        raise HTTPException(status_code=404, detail="Membro não encontrado")
+
+    if member.role == "owner":
+        raise HTTPException(status_code=400, detail="O proprietário da organização não pode ser removido")
+
+    await db.delete(member)
+    await db.commit()
+    return {"message": "Membro removido com sucesso", "member_id": member_id}
 

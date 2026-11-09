@@ -17,7 +17,8 @@ import {
   MessageSquare,
   Copy,
   PanelRightClose,
-  X
+  X,
+  History
 } from 'lucide-react';
 import { CanvasEditor, CanvasEditorHandle, SelectedElementInfo } from '../CanvasEditor';
 import { TokensPanel } from '../TokensPanel';
@@ -26,6 +27,7 @@ import { ScenariosManager } from '../ScenariosManager';
 import { ComponentsCatalogPanel } from '../components/ComponentsCatalogPanel';
 import { CommentsPanel } from '../components/CommentsPanel';
 import { InspectorPanel } from '../components/InspectorPanel';
+import { HistoryPanel } from '../components/HistoryPanel';
 
 interface ScreenData {
   id: string;
@@ -63,10 +65,11 @@ const PANEL_TABS: { id: ActiveEditorTab; label: string; icon: React.ElementType 
   { id: 'code', label: 'Código', icon: Code2 },
   { id: 'tokens', label: 'Tokens', icon: Palette },
   { id: 'comments', label: 'Comentários', icon: MessageSquare },
+  { id: 'history', label: 'Histórico', icon: History },
   { id: 'scenarios', label: 'Cenários', icon: Database },
 ];
 
-type ActiveEditorTab = 'ai' | 'visual' | 'blocks' | 'code' | 'tokens' | 'comments' | 'scenarios';
+type ActiveEditorTab = 'ai' | 'visual' | 'blocks' | 'code' | 'tokens' | 'comments' | 'history' | 'scenarios';
 
 export const EditorPage: React.FC<EditorPageProps> = ({
   project,
@@ -243,6 +246,19 @@ export const EditorPage: React.FC<EditorPageProps> = ({
     }
   };
 
+  const handleDuplicateScreen = async (screenId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      const res = await fetch(`/api/screens/${screenId}/duplicate`, { method: 'POST' });
+      if (!res.ok) throw new Error('Falha ao duplicar tela');
+      const newScreen = await res.json();
+      setScreens(prev => [...prev, newScreen]);
+      setCurrentScreenIndex(screens.length);
+    } catch (err: any) {
+      alert(err.message || 'Erro ao duplicar tela');
+    }
+  };
+
   const vp = VIEWPORT_SIZES[viewport];
   const cleanJsx = `export function ${activeScreen.name.replace(/\s+/g, '')}Screen() {\n  return (\n    ${activeScreen.html_content.replace(/class="/g, 'className="')}\n  );\n}`;
   const cssTokensCode = `:root {\n${Object.entries(tokens).map(([k, v]) => `  --${k}: ${v};`).join('\n')}\n}`;
@@ -276,6 +292,14 @@ export const EditorPage: React.FC<EditorPageProps> = ({
               >
                 {s.is_main && <span className="text-amber-400">★</span>}
                 <span>{s.name}</span>
+                <button
+                  type="button"
+                  onClick={(e) => handleDuplicateScreen(s.id, e)}
+                  className="opacity-0 group-hover:opacity-100 hover:text-mockbird-cyan p-0.5 rounded transition text-slate-500"
+                  title="Duplicar tela"
+                >
+                  <Copy size={11} />
+                </button>
                 {screens.length > 1 && (
                   <button
                     type="button"
@@ -519,6 +543,18 @@ export const EditorPage: React.FC<EditorPageProps> = ({
                   currentTheme={tokenTheme}
                   onThemeChange={setTokenTheme}
                   onTokensUpdate={setTokens}
+                />
+              </div>
+            )}
+
+            {activeTab === 'history' && activeScreen && (
+              <div className="w-80 border-l border-mockbird-border bg-mockbird-surface flex flex-col h-full shrink-0 shadow-2xl">
+                <HistoryPanel
+                  screenId={activeScreen.id}
+                  onRevertSuccess={(revertedScreen) => {
+                    setScreens(prev => prev.map((s, idx) => idx === currentScreenIndex ? { ...s, ...revertedScreen } : s));
+                  }}
+                  onClose={() => setActiveTab(null)}
                 />
               </div>
             )}

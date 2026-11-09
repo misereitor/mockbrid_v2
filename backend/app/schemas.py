@@ -120,3 +120,27 @@ class ScreenOut(BaseModel):
     class Config:
         from_attributes = True
 
+
+class UserProfileUpdate(BaseModel):
+    name: str = Field(..., min_length=2, max_length=100)
+
+
+class UserPasswordChange(BaseModel):
+    current_password: str
+    new_password: str = Field(..., min_length=8)
+
+
+class ScreenRevisionOut(BaseModel):
+    id: str
+    screen_id: str
+    revision_number: int
+    actor: str
+    change_summary: str
+    created_at: datetime
+    html_content: str
+    css_content: str
+    js_content: str
+
+    class Config:
+        from_attributes = True
+

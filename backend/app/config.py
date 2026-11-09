@@ -21,6 +21,15 @@ class Settings(BaseSettings):
         env_file = ".env"
         extra = "ignore"
 
+    def validate_production_secrets(self):
+        """Bloqueia a inicialização em produção se segredos padrão ainda estiverem ativos."""
+        if self.ENVIRONMENT == "production":
+            if "homolog" in self.SECRET_KEY or "super_secure" in self.SECRET_KEY:
+                raise RuntimeError("ERRO CRÍTICO: SECRET_KEY padrão detectada em ambiente de produção!")
+            if "mockbird_homolog_secret" in self.DATABASE_URL:
+                raise RuntimeError("ERRO CRÍTICO: Senha de banco de dados padrão detectada em ambiente de produção!")
+
 
 settings = Settings()
+settings.validate_production_secrets()
 

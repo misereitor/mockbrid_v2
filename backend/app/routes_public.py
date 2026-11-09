@@ -40,6 +40,28 @@ async def get_public_presentation(
     if not screen:
         raise HTTPException(status_code=404, detail="Nenhuma tela configurada para este projeto")
 
+    # Busca todas as telas para navegação completa interativa do protótipo
+    screens_res = await db.execute(
+        select(Screen)
+        .join(Canvas, Canvas.id == Screen.canvas_id)
+        .where(Canvas.project_id == project.id)
+        .order_by(Screen.is_entry.desc(), Screen.created_at.asc())
+    )
+    all_screens = screens_res.scalars().all()
+    screens_data = [
+        {
+            "id": s.id,
+            "name": s.name,
+            "is_main": s.is_entry,
+            "html_content": s.html_content,
+            "css_content": s.css_content,
+            "js_content": s.js_content,
+            "width": s.width,
+            "height": s.height
+        }
+        for s in all_screens
+    ]
+
     return {
         "project_name": project.name,
         "slug": project.slug,
@@ -50,6 +72,7 @@ async def get_public_presentation(
             "width": screen.width,
             "height": screen.height,
         },
+        "screens": screens_data,
         "tokens": {
             "light": tokens.light_tokens if tokens else {},
             "dark": tokens.dark_tokens if tokens else {},

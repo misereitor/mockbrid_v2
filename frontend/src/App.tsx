@@ -188,6 +188,18 @@ export function App() {
     }
   };
 
+  const handleDuplicateProject = async (id: string) => {
+    try {
+      const res = await fetch(`/api/projects/${id}/duplicate`, { method: 'POST' });
+      if (!res.ok) throw new Error('Falha ao duplicar projeto');
+      const duplicated = await res.json();
+      setProjects((prev) => [duplicated, ...prev]);
+    } catch (e: any) {
+      console.error('Erro ao duplicar projeto:', e);
+      alert(e.message || 'Erro ao duplicar projeto');
+    }
+  };
+
   const handleLogout = async () => {
     try {
       await fetch('/api/auth/logout', { method: 'POST' });
@@ -281,6 +293,7 @@ export function App() {
             }}
             onCreateProject={handleCreateProject}
             onDeleteProject={handleDeleteProject}
+            onDuplicateProject={handleDuplicateProject}
             onNavigate={handleSidebarNavigate}
             memberCount={memberCount}
           />

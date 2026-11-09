@@ -8,7 +8,7 @@ import secrets
 from app.config import settings
 from app.database import get_db
 from app.models import User, Organization, Workspace, Session
-from app.schemas import UserRegister, UserLogin, UserOut
+from app.schemas import UserRegister, UserLogin, UserOut, UserProfileUpdate, UserPasswordChange
 from app.auth import hash_password, verify_password, create_access_token, decode_access_token
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -180,4 +180,32 @@ async def logout(response: Response, current_user: User = Depends(get_current_us
     response.delete_cookie("mockbird_token")
     response.delete_cookie("mockbird_csrf")
     return {"message": "Sessão encerrada com sucesso"}
+
+
+@router.patch("/profile", response_model=UserOut)
+async def update_profile(
+    payload: UserProfileUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    current_user.name = payload.name.strip()
+    await db.commit()
+    await db.refresh(current_user)
+    return current_user
+
+
+@router.post("/change-password")
+async def change_password(
+    payload: UserPasswordChange,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    if not verify_password(payload.current_password, current_user.password_hash):
+        raise HTTPException(status_code=400, detail="Senha atual incorreta")
+    
+    current_user.password_hash = hash_password(payload.new_password)
+    # Revoga sessões antigas por segurança
+    await db.execute(delete(Session).where(Session.user_id == current_user.id))
+    await db.commit()
+    return {"message": "Senha alterada com sucesso. Por favor faça login novamente."}
 
