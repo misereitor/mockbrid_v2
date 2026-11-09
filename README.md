@@ -41,3 +41,4 @@ npm run dev
 - **Multi-tenancy:** Isolamento estrito por `organization_id` em todos os recursos (projetos, telas, tokens, comentários).
 - **Proteção CSRF:** Tokens de sessão com cookies HTTP-only e cabeçalho `X-CSRF-Token`.
 - **Criptografia BYOK:** Chaves de API de provedores de IA são criptografadas em repouso no banco de dados.
+

@@ -47,3 +47,4 @@ def decrypt_secret(cipher_text: Optional[str]) -> str:
             pass
     # Fallback se for legado em plain-text
     return text
+
