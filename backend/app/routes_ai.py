@@ -10,7 +10,7 @@ import re
 import os
 
 from app.database import get_db, AsyncSessionLocal
-from app.models import User, AIProvider, AIConversation, AIMessage, Screen
+from app.models import User, AIProvider, AIConversation, AIMessage, Screen, AIGenerationLog
 from app.routes_auth import get_current_user, require_editor, require_admin
 from app.authz import authorize_screen
 from app.agent.state import AgentState
@@ -1180,15 +1180,19 @@ async def ai_agent_graph_stream(
     )
     graph = MockbirdAgentGraph(base_url=resolved_base_url, headers=headers)
 
+    start_time = datetime.utcnow()
+
     async def event_generator():
         done_ev = None
+        error_msg = None
         try:
             async for ev in graph.run(state):
                 if ev.get("type") == "agent_done":
                     done_ev = ev
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'detail': f'Falha no grafo do agente: {str(e)}'}, ensure_ascii=False)}\n\n"
+            error_msg = str(e)
+            yield f"data: {json.dumps({'type': 'error', 'detail': f'Falha no grafo do agente: {error_msg}'}, ensure_ascii=False)}\n\n"
 
         # Contabilização de tokens e histórico após streaming
         tokens_consumed = 150 + (len(done_ev.get("patch", "") or "") // 4 if done_ev else 50)
@@ -1210,7 +1214,56 @@ async def ai_agent_graph_stream(
             )
             db.add(user_msg)
             db.add(bot_msg)
+
+        # Registro de Telemetria e Diagnóstico da IA
+        duration_ms = int((datetime.utcnow() - start_time).total_seconds() * 1000)
+        log_status = "success" if (done_ev and done_ev.get("patch")) else ("error" if error_msg else "incomplete")
+        gen_log = AIGenerationLog(
+            user_id=current_user.id,
+            screen_id=payload.screen_id,
+            model_name=selected_model,
+            prompt=payload.prompt,
+            status=log_status,
+            tokens_prompt=len(payload.prompt) // 4,
+            tokens_completion=tokens_consumed,
+            duration_ms=duration_ms,
+            finish_reason="stop" if log_status == "success" else ("error" if error_msg else "incomplete"),
+            raw_snippet=(done_ev.get("summary", "") or "")[:500] if done_ev else (error_msg or "")[:500],
+            error_message=error_msg
+        )
+        db.add(gen_log)
         await db.commit()
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.get("/logs")
+async def list_ai_generation_logs(
+    limit: int = 20,
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db)
+):
+    """Consulta os registros de telemetria e diagnósticos de execução da IA."""
+    stmt = (
+        select(AIGenerationLog)
+        .order_by(AIGenerationLog.created_at.desc())
+        .limit(min(limit, 50))
+    )
+    res = await db.execute(stmt)
+    logs = res.scalars().all()
+    return [
+        {
+            "id": l.id,
+            "created_at": l.created_at.isoformat(),
+            "model_name": l.model_name,
+            "prompt": l.prompt[:80],
+            "status": l.status,
+            "duration_ms": l.duration_ms,
+            "tokens_completion": l.tokens_completion,
+            "finish_reason": l.finish_reason,
+            "raw_snippet": l.raw_snippet,
+            "error_message": l.error_message
+        }
+        for l in logs
+    ]
 

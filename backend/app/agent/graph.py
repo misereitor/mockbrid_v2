@@ -13,52 +13,240 @@ from app.agent.tools import (
 )
 
 
-def clean_extracted_html(text: str) -> str:
-    """Extrai bloco HTML limpo defensivamente.
-    Se o texto não contiver HTML real com tags estruturais, retorna string vazia."""
+HTML_CANVAS_TEMPLATE = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mockbird Interface</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Bebas+Neue&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: 'Plus Jakarta Sans', sans-serif; }
+    .font-display { font-family: 'Bebas Neue', sans-serif; }
+    .font-mono-accent { font-family: 'Space Grotesk', sans-serif; }
+  </style>
+</head>
+<body class="bg-[#09090b] text-slate-100 antialiased min-h-screen">
+__BODY_CONTENT__
+</body>
+</html>"""
+
+
+def balance_html_tags(html: str) -> str:
+    """Detecta tags estruturais abertas e fecha na ordem inversa se o modelo foi truncado."""
+    if not html:
+        return ""
+
+    # Se houver tag <style aberta sem fechamento, descarta o estilo inacabado
+    if "<style" in html.lower() and "</style>" not in html.lower():
+        html = re.sub(r"<style[\s\S]*$", "", html, flags=re.IGNORECASE).strip()
+
+    # Se estiver truncado no meio de uma tag incompleta (ex: <div class="card), remove o fragmento inacabado
+    html = re.sub(r"<[a-zA-Z0-9_-]+(?:\s+[^>]*)?$", "", html).strip()
+
+    # Tags estruturais que devem ser balanceadas
+    struct_tags = [
+        "div", "section", "main", "header", "footer", "nav", "article",
+        "aside", "ul", "ol", "form", "button", "p", "a"
+    ]
+    stack = []
+
+    tokens = re.finditer(r"<\s*(/)?\s*([a-zA-Z0-9_-]+)(?:\s+[^>]*)?>", html)
+    for t in tokens:
+        is_closing = bool(t.group(1))
+        tag_name = t.group(2).lower()
+        if tag_name not in struct_tags:
+            continue
+        if is_closing:
+            if stack and stack[-1] == tag_name:
+                stack.pop()
+        else:
+            if not t.group(0).endswith("/>"):
+                stack.append(tag_name)
+
+    closing_tags = "".join(f"</{tag}>" for tag in reversed(stack))
+    return html + closing_tags
+
+
+def heal_and_wrap_html(raw_html: str) -> str:
+    """Valida, repara e envelopa o HTML para garantir renderização perfeita no Canvas."""
+    if not raw_html:
+        return ""
+
+    # Descarta se terminou travado dentro de uma folha de estilo manual sem body
+    if "<style" in raw_html.lower() and ("</style>" not in raw_html.lower() or ("<body" not in raw_html.lower() and "<div" not in raw_html.lower())):
+        cleaned = re.sub(r"<style[\s\S]*?(?:</style>|$)", "", raw_html, flags=re.IGNORECASE).strip()
+        if not cleaned:
+            return ""
+        raw_html = cleaned
+
+    balanced = balance_html_tags(raw_html)
+
+    # Se já é um documento completo com <!DOCTYPE html> ou <html>
+    if "<!DOCTYPE" in balanced.upper() or "<html" in balanced.lower():
+        # Assegura fechamento de body e html se faltarem
+        if "</body" not in balanced.lower():
+            balanced += "\n</body>"
+        if "</html" not in balanced.lower():
+            balanced += "\n</html>"
+        # Injeta Tailwind CDN se o modelo esqueceu
+        if "tailwindcss.com" not in balanced:
+            balanced = re.sub(
+                r"(<head[^>]*>)",
+                r"\1\n  <script src=\"https://cdn.tailwindcss.com\"></script>",
+                balanced,
+                flags=re.IGNORECASE
+            )
+        return balanced
+
+    # Se for um fragmento de seções (<header>, <section>, <div id="app-root">), envelopa no template completo
+    return HTML_CANVAS_TEMPLATE.format(body_content=balanced)
+
+
+HTML_CANVAS_TEMPLATE = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mockbird Interface</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Bebas+Neue&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: 'Plus Jakarta Sans', sans-serif; }
+    .font-display { font-family: 'Bebas Neue', sans-serif; }
+    .font-mono-accent { font-family: 'Space Grotesk', sans-serif; }
+  </style>
+</head>
+<body class="bg-[#09090b] text-slate-100 antialiased min-h-screen">
+__BODY_CONTENT__
+</body>
+</html>"""
+
+
+def balance_html_tags(html: str) -> str:
+    """Detecta tags estruturais abertas e fecha na ordem inversa se o modelo foi truncado."""
+    if not html:
+        return ""
+
+    # Se houver tag <style aberta sem fechamento, descarta o estilo inacabado
+    if "<style" in html.lower() and "</style>" not in html.lower():
+        html = re.sub(r"<style[\s\S]*$", "", html, flags=re.IGNORECASE).strip()
+
+    # Se estiver truncado no meio de uma tag incompleta (ex: <div class="card), remove o fragmento inacabado
+    html = re.sub(r"<[a-zA-Z0-9_-]+(?:\s+[^>]*)?$", "", html).strip()
+
+    # Tags estruturais que devem ser balanceadas
+    struct_tags = [
+        "div", "section", "main", "header", "footer", "nav", "article",
+        "aside", "ul", "ol", "form", "button", "p", "a"
+    ]
+    stack = []
+
+    tokens = re.finditer(r"<\s*(/)?\s*([a-zA-Z0-9_-]+)(?:\s+[^>]*)?>", html)
+    for t in tokens:
+        is_closing = bool(t.group(1))
+        tag_name = t.group(2).lower()
+        if tag_name not in struct_tags:
+            continue
+        if is_closing:
+            if stack and stack[-1] == tag_name:
+                stack.pop()
+        else:
+            if not t.group(0).endswith("/>"):
+                stack.append(tag_name)
+
+    closing_tags = "".join(f"</{tag}>" for tag in reversed(stack))
+    return html + closing_tags
+
+
+def heal_and_wrap_html(raw_html: str) -> str:
+    """Valida, repara e envelopa o HTML para garantir renderização perfeita no Canvas."""
+    if not raw_html:
+        return ""
+
+    # Descarta se terminou travado dentro de uma folha de estilo manual sem body
+    if "<style" in raw_html.lower() and ("</style>" not in raw_html.lower() or ("<body" not in raw_html.lower() and "<div" not in raw_html.lower())):
+        cleaned = re.sub(r"<style[\s\S]*?(?:</style>|$)", "", raw_html, flags=re.IGNORECASE).strip()
+        if not cleaned:
+            return ""
+        raw_html = cleaned
+
+    balanced = balance_html_tags(raw_html)
+
+    # Se já é um documento completo com <!DOCTYPE html> ou <html>
+    if "<!DOCTYPE" in balanced.upper() or "<html" in balanced.lower():
+        # Assegura fechamento de body e html se faltarem
+        if "</body" not in balanced.lower():
+            balanced += "\n</body>"
+        if "</html" not in balanced.lower():
+            balanced += "\n</html>"
+        # Injeta Tailwind CDN se o modelo esqueceu
+        if "tailwindcss.com" not in balanced:
+            balanced = re.sub(
+                r"(<head[^>]*>)",
+                r"\1\n  <script src=\"https://cdn.tailwindcss.com\"></script>",
+                balanced,
+                flags=re.IGNORECASE
+            )
+        return balanced
+
+    # Se for um fragmento de seções (<header>, <section>, <div id="app-root">), envelopa no template completo
+    return HTML_CANVAS_TEMPLATE.replace("__BODY_CONTENT__", balanced)
+
+
+def clean_extracted_html(text: str, is_full_page: bool = True) -> str:
+    """Extrai bloco HTML limpo defensivamente e aplica auto-recuperação (Self-Healing)."""
     if not text:
         return ""
-    
+
+    extracted = ""
+
     # 1. Procura bloco de código fechado ```html ... ```
     m = re.search(r"```(?:html)?\s*(<[\s\S]+?>[\s\S]*?)```", text, re.IGNORECASE)
     if m:
-        extracted = m.group(1).strip()
-        if "<" in extracted and ">" in extracted:
-            return extracted
+        candidate = m.group(1).strip()
+        if "<" in candidate and ">" in candidate:
+            extracted = candidate
 
     # 1b. Procura bloco de código iniciado com ```html que não fechou com ``` (corte por length)
-    m_open = re.search(r"```(?:html)?\s*(<!DOCTYPE[\s\S]+|<html[\s\S]+|<(?:div|section|main|header|footer)[\s\S]+)", text, re.IGNORECASE)
-    if m_open:
-        extracted = m_open.group(1).strip()
-        extracted = re.sub(r"```+$", "", extracted).strip()
-        if "<" in extracted and ">" in extracted:
-            return extracted
+    if not extracted:
+        m_open = re.search(r"```(?:html)?\s*(<!DOCTYPE[\s\S]+|<html[\s\S]+|<(?:div|section|main|header|footer)[\s\S]+)", text, re.IGNORECASE)
+        if m_open:
+            candidate = m_open.group(1).strip()
+            candidate = re.sub(r"```+$", "", candidate).strip()
+            if "<" in candidate and ">" in candidate:
+                extracted = candidate
 
     # 2. Procura documento completo <!DOCTYPE html> ... </html> ou <html ... </html>
-    m_doc = re.search(r"(<!DOCTYPE\s+html[\s\S]+?</html>|<html[\s\S]+?</html>)", text, re.IGNORECASE)
-    if m_doc:
-        return m_doc.group(1).strip()
+    if not extracted:
+        m_doc = re.search(r"(<!DOCTYPE\s+html[\s\S]+?</html>|<html[\s\S]+?</html>)", text, re.IGNORECASE)
+        if m_doc:
+            extracted = m_doc.group(1).strip()
 
-    # 2b. Procura documento iniciado com <!DOCTYPE html> ou <html> mesmo que não tenha fechado </html>
-    m_doc_open = re.search(r"(<!DOCTYPE\s+html[\s\S]+|<html\b[\s\S]+)", text, re.IGNORECASE)
-    if m_doc_open:
-        extracted = m_doc_open.group(1).strip()
-        extracted = re.sub(r"```+$", "", extracted).strip()
-        if "<" in extracted and ">" in extracted:
-            return extracted
-
-    # 3. Procura tags estruturais com fechamento (div, section, main, header, footer, button, form, etc.)
-    m_tag = re.search(r"(<(?:div|section|main|header|footer|aside|article|form|nav|button|ul|ol|table|dialog|p|span|a|h[1-6])\b[\s\S]+?</(?:div|section|main|header|footer|aside|article|form|nav|button|ul|ol|table|dialog|p|span|a|h[1-6])>)", text, re.IGNORECASE)
-    if m_tag:
-        return m_tag.group(1).strip()
+    # 3. Procura tags estruturais com fechamento (div, section, main, header, footer, etc.)
+    if not extracted:
+        m_tag = re.search(r"(<(?:div|section|main|header|footer|aside|article|form|nav|button|ul|ol|table|dialog|p|span|a|h[1-6])\b[\s\S]+?</(?:div|section|main|header|footer|aside|article|form|nav|button|ul|ol|table|dialog|p|span|a|h[1-6])>)", text, re.IGNORECASE)
+        if m_tag:
+            extracted = m_tag.group(1).strip()
 
     # 4. Procura tags autocontidas válidas (img, input)
-    m_self = re.search(r"(<(?:img|input|hr|br)\b[^>]*\/?>)", text, re.IGNORECASE)
-    if m_self:
-        return m_self.group(1).strip()
+    if not extracted:
+        m_self = re.search(r"(<(?:img|input|hr|br)\b[^>]*\/?>)", text, re.IGNORECASE)
+        if m_self:
+            extracted = m_self.group(1).strip()
 
-    # Se não houver tags HTML reais, NUNCA retorna texto corrido ou pensamento em prosa!
-    return ""
+    if not extracted:
+        return ""
+
+    if is_full_page:
+        return heal_and_wrap_html(extracted)
+    else:
+        return balance_html_tags(extracted)
 
 
 class MockbirdAgentGraph:
@@ -88,6 +276,8 @@ class MockbirdAgentGraph:
                         "model": model,
                         "messages": messages,
                         "temperature": temperature,
+                        "frequency_penalty": 0.2,
+                        "presence_penalty": 0.1,
                         "max_tokens": max_tokens,
                         "stream": True
                     }
@@ -341,7 +531,7 @@ class MockbirdAgentGraph:
                     raw_code = chunk["content"]
                     assistant_reasoning = chunk["reasoning"]
 
-            extracted_snippet = clean_extracted_html(raw_code)
+            extracted_snippet = clean_extracted_html(raw_code, is_full_page=False)
             
             # Se a LLM não colocou data-mb-id e tínhamos um, garante que o elemento mantenha
             if extracted_snippet and target_mb_id and "data-mb-id" not in extracted_snippet:
@@ -557,13 +747,14 @@ class MockbirdAgentGraph:
             "Crie o código HTML COMPLETO, ESTONTEANTE e PROFISSIONAL para a solicitação do usuário.\n\n"
             f"SOLICITAÇÃO: {state.prompt}\n"
             f"PLANO APROVADO:\n{plan_desc}\n\n"
-            "REGRAS INEGOCIÁVEIS (LEIA COM ATENÇÃO):\n"
-            "0. RACIOCÍNIO ULTRA-CONCISO: Limite seu raciocínio preliminar a no máximo 5 a 8 linhas. Comece IMEDIATAMENTE a gerar o código HTML completo dentro do bloco ```html ... ```.\n"
-            "1. PROIBIDO RESUMIR: NUNCA escreva textos como 'noise overlay div', 'hero div' ou comentários de TODO. Escreva CADA tag, classe, texto e botão por completo!\n"
-            "2. IMAGENS REAIS: Use sempre tags <img> com URLs completas e reais do Unsplash.\n"
-            "3. DESIGN SYSTEM: Fundo escuro premium (bg-[#09090b] ou bg-slate-950), superfícies bg-[#121215], bordas border-white/10, tipografia sans-serif limpa.\n"
-            "4. INTERATIVIDADE: Todo elemento relevante deve ter data-mb-id='...' único.\n"
-            "5. EMITA DIRETAMENTE dentro do bloco ```html ... ```."
+            "REGRAS INEGOCIÁVEIS DE ALTA PERFORMANCE (LEIA COM EXTREMA ATENÇÃO):\n"
+            "0. ZERO CSS EM <style>: O Tailwind CSS CDN já está ativo no Canvas! É TERMINANTEMENTE PROIBIDO criar blocos <style> ou escrever CSS manual. Use EXCLUSIVAMENTE classes utilitárias do Tailwind direto nos elementos (ex: class='bg-[#09090b] text-white p-8 rounded-2xl flex items-center border border-white/10'). Isso economiza 80% dos seus tokens!\n"
+            "1. DIRETO AO HTML: Emita DIRETAMENTE a estrutura semântica (<header>, <section id='hero'>, <section id='modelos'>, <section id='simulador'>, <footer>) dentro de um container raiz <div id='app-root' class='min-h-screen bg-[#09090b] text-slate-100 font-sans antialiased'>. NÃO perca tokens gerando <!DOCTYPE>, <head>, <meta> ou <title> (o Mockbird já envelopa automaticamente no canvas).\n"
+            "2. PROIBIDO RESUMIR: NUNCA escreva comentários de TODO ou textos como 'conteúdo aqui'. Escreva CADA card, imagem, botão e especificação por completo!\n"
+            "3. IMAGENS REAIS: Use sempre tags <img> com fotos reais do Unsplash em alta resolução (ex: fotos reais de veículos, interiores, produtos) com classes 'w-full h-full object-cover rounded-xl'.\n"
+            "4. DESIGN SYSTEM: Fundo escuro grafite (bg-[#09090b]), superfícies de cards (bg-[#121215] border border-white/10 rounded-2xl p-6 hover:border-red-500/50 transition), tipografia sans-serif nítida, badges translúcidos (bg-white/5 border border-white/10 backdrop-blur-md px-3 py-1 rounded-full text-xs).\n"
+            "5. INTERATIVIDADE: Todo elemento interativo (botões, cards, formulários) DEVE ter data-mb-id='...' único.\n"
+            "6. Inicie IMEDIATAMENTE com ```html\n<div id='app-root' class='min-h-screen bg-[#09090b] text-slate-100 font-sans antialiased'>"
         )
 
         raw_code = ""

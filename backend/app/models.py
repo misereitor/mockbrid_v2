@@ -503,3 +503,34 @@ class AIMessage(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     conversation = relationship("AIConversation", back_populates="messages")
+
+
+class AIGenerationLog(Base):
+    __tablename__ = "ai_generation_logs"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    user_id = Column(
+        String(36),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    screen_id = Column(
+        String(36),
+        ForeignKey("screens.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    model_name = Column(String(100), nullable=False)
+    prompt = Column(Text, nullable=False)
+    status = Column(String(50), default="success", nullable=False)  # success, incomplete, error
+    tokens_prompt = Column(Integer, default=0, nullable=False)
+    tokens_completion = Column(Integer, default=0, nullable=False)
+    duration_ms = Column(Integer, default=0, nullable=False)
+    finish_reason = Column(String(50), nullable=True)
+    raw_snippet = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+    user = relationship("User")
+    screen = relationship("Screen")
