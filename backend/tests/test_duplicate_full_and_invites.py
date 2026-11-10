@@ -22,10 +22,11 @@ async def test_full_project_duplication_and_secure_invites():
         csrf = client.cookies.get("mockbird_csrf")
         headers = {"X-CSRF-Token": csrf} if csrf else {}
 
-        # 2. Cria projeto original
+        # 2. Cria projeto original visível na organização
         orig_proj_res = await client.post("/api/projects", json={
             "name": "Projeto Base com Scenarios",
-            "description": "Projeto para teste de duplicação profunda"
+            "description": "Projeto para teste de duplicação profunda",
+            "visibility": "org"
         }, headers=headers)
         assert orig_proj_res.status_code == 200, orig_proj_res.text
         orig_proj = orig_proj_res.json()

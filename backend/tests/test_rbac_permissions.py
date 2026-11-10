@@ -25,7 +25,8 @@ async def test_viewer_role_cannot_modify_screens_or_duplicate():
 
         proj_res = await admin_client.post("/api/projects", json={
             "name": "Projeto RBAC",
-            "description": "Teste de Permissões"
+            "description": "Teste de Permissões",
+            "visibility": "org"
         }, headers=admin_headers)
         assert proj_res.status_code == 200
         proj_id = proj_res.json()["id"]

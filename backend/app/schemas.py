@@ -52,14 +52,17 @@ class ProjectCreate(BaseModel):
     name: str = Field(..., min_length=1)
     description: Optional[str] = ""
     workspace_id: Optional[str] = None
+    visibility: Optional[str] = "private"
 
 
 class ProjectOut(BaseModel):
     id: str
     workspace_id: str
+    owner_id: Optional[str] = None
     name: str
     slug: str
     description: str
+    visibility: Optional[str] = "private"
     design_dials: Dict[str, Any]
     entry_screen_id: Optional[str]
     is_archived: bool
@@ -68,6 +71,28 @@ class ProjectOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ProjectMemberCreate(BaseModel):
+    user_id: str
+    role: str = "editor"  # viewer, commenter, editor, admin
+
+
+class ProjectMemberOut(BaseModel):
+    id: str
+    project_id: str
+    user_id: str
+    role: str
+    created_at: datetime
+    user_name: Optional[str] = ""
+    user_email: Optional[str] = ""
+
+    class Config:
+        from_attributes = True
+
+
+class ProjectVisibilityUpdate(BaseModel):
+    visibility: str  # private, org
 
 
 class ScreenCreate(BaseModel):

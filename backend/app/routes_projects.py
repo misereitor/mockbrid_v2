@@ -5,9 +5,10 @@ from typing import List, Optional
 import secrets
 
 from app.database import get_db
-from app.models import User, Workspace, Project, Canvas, Screen, DesignTokens, DataScenario, ScreenRevision
-from app.schemas import ProjectCreate, ProjectOut, ScreenCreate, ScreenUpdate, ScreenOut
+from app.models import User, Workspace, Project, Canvas, Screen, DesignTokens, DataScenario, ScreenRevision, ProjectMember
+from app.schemas import ProjectCreate, ProjectOut, ScreenCreate, ScreenUpdate, ScreenOut, ProjectMemberCreate, ProjectMemberOut, ProjectVisibilityUpdate
 from app.routes_auth import get_current_user, require_editor, require_admin
+from app.authz import authorize_project, get_effective_project_role
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -25,8 +26,20 @@ async def list_projects(
     if not ws_ids:
         return []
 
-    # Busca projetos desses workspaces com busca opcional
-    query = select(Project).where(Project.workspace_id.in_(ws_ids), Project.is_archived == False)
+    # Se for admin ou owner da organização, vê todos os projetos
+    if current_user.role in ["owner", "admin"]:
+        query = select(Project).where(Project.workspace_id.in_(ws_ids), Project.is_archived == False)
+    else:
+        # Busca IDs de projetos onde o usuário é membro explicitamente
+        m_query = await db.execute(select(ProjectMember.project_id).where(ProjectMember.user_id == current_user.id))
+        member_proj_ids = m_query.scalars().all()
+
+        query = select(Project).where(
+            Project.workspace_id.in_(ws_ids),
+            Project.is_archived == False,
+            (Project.visibility == "org") | (Project.owner_id == current_user.id) | (Project.id.in_(member_proj_ids))
+        )
+
     if q and q.strip():
         query = query.where(Project.name.ilike(f"%{q.strip()}%"))
 
@@ -60,6 +73,8 @@ async def create_project(
         slug=proj_slug,
         description=payload.description or "",
         workspace_id=workspace_id,
+        owner_id=current_user.id,
+        visibility=payload.visibility or "private",
     )
     db.add(project)
     await db.flush()
@@ -141,24 +156,119 @@ async def delete_project(
     db: AsyncSession = Depends(get_db)
 ):
     """Exclui um projeto e todos os seus recursos vinculados (canvases, telas, tokens)."""
-    project = await _get_project_for_user(project_id, current_user, db)
+    project = await _get_project_for_user(project_id, current_user, db, action="delete")
     await db.delete(project)
     await db.commit()
     return {"message": "Projeto excluído com sucesso", "project_id": project_id}
 
 
+async def _get_project_for_user(project_id: str, current_user: User, db: AsyncSession, action: str = "read") -> Project:
+    """Carrega o projeto garantindo que pertence à organização do usuário e respeita regras de visibilidade e papel."""
+    return await authorize_project(project_id, current_user, action, db)
 
-async def _get_project_for_user(project_id: str, current_user: User, db: AsyncSession) -> Project:
-    """Carrega o projeto garantindo que pertence à organização do usuário (isolamento multi-tenant)."""
-    result = await db.execute(
-        select(Project)
-        .join(Workspace, Workspace.id == Project.workspace_id)
-        .where(Project.id == project_id, Workspace.organization_id == current_user.organization_id)
-    )
-    project = result.scalars().first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Projeto não encontrado")
+
+@router.patch("/{project_id}/visibility", response_model=ProjectOut)
+async def update_project_visibility(
+    project_id: str,
+    payload: ProjectVisibilityUpdate,
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db)
+):
+    project = await authorize_project(project_id, current_user, "admin", db)
+    if payload.visibility not in ["private", "org"]:
+        raise HTTPException(status_code=400, detail="Visibilidade inválida. Opções: 'private', 'org'")
+    project.visibility = payload.visibility
+    await db.commit()
+    await db.refresh(project)
     return project
+
+
+@router.get("/{project_id}/members", response_model=List[ProjectMemberOut])
+async def list_project_members(
+    project_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    await authorize_project(project_id, current_user, "read", db)
+    res = await db.execute(
+        select(ProjectMember, User)
+        .join(User, User.id == ProjectMember.user_id)
+        .where(ProjectMember.project_id == project_id)
+    )
+    members_out = []
+    for pm, u in res.all():
+        out = ProjectMemberOut.model_validate(pm)
+        out.user_name = u.name
+        out.user_email = u.email
+        members_out.append(out)
+    return members_out
+
+
+@router.post("/{project_id}/members", response_model=ProjectMemberOut)
+async def add_project_member(
+    project_id: str,
+    payload: ProjectMemberCreate,
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db)
+):
+    project = await authorize_project(project_id, current_user, "admin", db)
+
+    user_res = await db.execute(
+        select(User).where(
+            User.id == payload.user_id,
+            User.organization_id == current_user.organization_id
+        )
+    )
+    target_user = user_res.scalars().first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado na organização")
+
+    existing = await db.execute(
+        select(ProjectMember).where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id == payload.user_id
+        )
+    )
+    pm = existing.scalars().first()
+    if pm:
+        pm.role = payload.role
+    else:
+        pm = ProjectMember(
+            project_id=project_id,
+            user_id=payload.user_id,
+            role=payload.role
+        )
+        db.add(pm)
+
+    await db.commit()
+    await db.refresh(pm)
+    out = ProjectMemberOut.model_validate(pm)
+    out.user_name = target_user.name
+    out.user_email = target_user.email
+    return out
+
+
+@router.delete("/{project_id}/members/{user_id}")
+async def remove_project_member(
+    project_id: str,
+    user_id: str,
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db)
+):
+    project = await authorize_project(project_id, current_user, "admin", db)
+    res = await db.execute(
+        select(ProjectMember).where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id == user_id
+        )
+    )
+    pm = res.scalars().first()
+    if not pm:
+        raise HTTPException(status_code=404, detail="Membro não encontrado no projeto")
+
+    await db.delete(pm)
+    await db.commit()
+    return {"message": "Membro removido do projeto com sucesso"}
 
 
 @router.get("/{project_id}/screens", response_model=List[ScreenOut])

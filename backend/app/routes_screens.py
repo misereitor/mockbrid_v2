@@ -7,37 +7,28 @@ from app.database import get_db
 from app.models import User, Screen, Canvas, Project, Workspace, ScreenRevision
 from app.schemas import ScreenCreate, ScreenUpdate, ScreenOut, ScreenRevisionOut
 from app.routes_auth import get_current_user, require_editor
+from app.authz import authorize_screen, authorize_project
 
 router = APIRouter(prefix="/api/screens", tags=["screens"])
 
 
-async def _owned_canvas(canvas_id: str, current_user: User, db: AsyncSession) -> Canvas:
-    """Canvas só é acessível se o projeto pertence à organização do usuário."""
+async def _owned_canvas(canvas_id: str, current_user: User, db: AsyncSession, action: str = "read") -> Canvas:
     res = await db.execute(
-        select(Canvas)
+        select(Canvas, Project)
         .join(Project, Project.id == Canvas.project_id)
         .join(Workspace, Workspace.id == Project.workspace_id)
         .where(Canvas.id == canvas_id, Workspace.organization_id == current_user.organization_id)
     )
-    canvas = res.scalars().first()
-    if not canvas:
+    row = res.first()
+    if not row:
         raise HTTPException(status_code=404, detail="Canvas não encontrado")
+    canvas, project = row[0], row[1]
+    await authorize_project(project.id, current_user, action, db)
     return canvas
 
 
-async def _owned_screen(screen_id: str, current_user: User, db: AsyncSession) -> Screen:
-    """Tela só é acessível se pertence à organização do usuário (evita IDOR entre tenants)."""
-    res = await db.execute(
-        select(Screen)
-        .join(Canvas, Canvas.id == Screen.canvas_id)
-        .join(Project, Project.id == Canvas.project_id)
-        .join(Workspace, Workspace.id == Project.workspace_id)
-        .where(Screen.id == screen_id, Workspace.organization_id == current_user.organization_id)
-    )
-    screen = res.scalars().first()
-    if not screen:
-        raise HTTPException(status_code=404, detail="Tela não encontrada")
-    return screen
+async def _owned_screen(screen_id: str, current_user: User, db: AsyncSession, action: str = "read") -> Screen:
+    return await authorize_screen(screen_id, current_user, action, db)
 
 
 @router.get("/canvas/{canvas_id}", response_model=List[ScreenOut])
@@ -46,7 +37,7 @@ async def list_screens_by_canvas(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    await _owned_canvas(canvas_id, current_user, db)
+    await _owned_canvas(canvas_id, current_user, db, action="read")
     query = await db.execute(select(Screen).where(Screen.canvas_id == canvas_id).order_by(Screen.created_at.asc()))
     return query.scalars().all()
 
@@ -57,7 +48,7 @@ async def get_screen(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    return await _owned_screen(screen_id, current_user, db)
+    return await _owned_screen(screen_id, current_user, db, action="read")
 
 
 @router.post("", response_model=ScreenOut)
@@ -66,7 +57,7 @@ async def create_screen(
     current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
-    await _owned_canvas(payload.canvas_id, current_user, db)
+    await _owned_canvas(payload.canvas_id, current_user, db, action="edit")
     screen = Screen(
         canvas_id=payload.canvas_id,
         name=payload.name,
@@ -93,7 +84,7 @@ async def update_screen(
     current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
-    screen = await _owned_screen(screen_id, current_user, db)
+    screen = await _owned_screen(screen_id, current_user, db, action="edit")
 
     update_data = payload.model_dump(exclude_unset=True)
     
@@ -132,7 +123,7 @@ async def delete_screen(
     db: AsyncSession = Depends(get_db)
 ):
     """Exclui uma tela do projeto."""
-    screen = await _owned_screen(screen_id, current_user, db)
+    screen = await _owned_screen(screen_id, current_user, db, action="edit")
     await db.delete(screen)
     await db.commit()
     return {"message": "Tela excluída com sucesso", "screen_id": screen_id}
@@ -145,7 +136,7 @@ async def list_screen_revisions(
     db: AsyncSession = Depends(get_db)
 ):
     """Lista o histórico de revisões da tela para auditoria e reversão."""
-    await _owned_screen(screen_id, current_user, db)
+    await _owned_screen(screen_id, current_user, db, action="read")
     res = await db.execute(
         select(ScreenRevision)
         .where(ScreenRevision.screen_id == screen_id)
@@ -162,7 +153,7 @@ async def revert_screen_revision(
     db: AsyncSession = Depends(get_db)
 ):
     """Reverte o código da tela para uma revisão histórica específica."""
-    screen = await _owned_screen(screen_id, current_user, db)
+    screen = await _owned_screen(screen_id, current_user, db, action="edit")
     rev_res = await db.execute(
         select(ScreenRevision).where(
             ScreenRevision.id == revision_id,
@@ -201,7 +192,7 @@ async def duplicate_screen(
     db: AsyncSession = Depends(get_db)
 ):
     """Duplica uma tela inteira no mesmo canvas."""
-    original = await _owned_screen(screen_id, current_user, db)
+    original = await _owned_screen(screen_id, current_user, db, action="edit")
     new_screen = Screen(
         canvas_id=original.canvas_id,
         name=f"{original.name} (Cópia)",

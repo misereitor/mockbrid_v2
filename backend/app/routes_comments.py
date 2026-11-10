@@ -9,22 +9,13 @@ from app.database import get_db
 from app.models import User, Comment, Screen, Canvas, Project, Workspace
 from app.routes_auth import get_current_user, require_commenter, require_editor
 
+from app.authz import authorize_screen
+
 router = APIRouter(prefix="/api/comments", tags=["comments"])
 
 
-async def _validate_screen_ownership(screen_id: str, current_user: User, db: AsyncSession) -> Screen:
-    """Garante que a tela pertence à organização do usuário para evitar vazamento IDOR."""
-    res = await db.execute(
-        select(Screen)
-        .join(Canvas, Canvas.id == Screen.canvas_id)
-        .join(Project, Project.id == Canvas.project_id)
-        .join(Workspace, Workspace.id == Project.workspace_id)
-        .where(Screen.id == screen_id, Workspace.organization_id == current_user.organization_id)
-    )
-    screen = res.scalars().first()
-    if not screen:
-        raise HTTPException(status_code=404, detail="Tela não encontrada")
-    return screen
+async def _validate_screen_ownership(screen_id: str, current_user: User, db: AsyncSession, action: str = "read") -> Screen:
+    return await authorize_screen(screen_id, current_user, action, db)
 
 
 class CommentCreate(BaseModel):
@@ -71,7 +62,7 @@ async def create_comment(
     current_user: User = Depends(require_commenter),
     db: AsyncSession = Depends(get_db)
 ):
-    await _validate_screen_ownership(payload.screen_id, current_user, db)
+    await _validate_screen_ownership(payload.screen_id, current_user, db, action="comment")
     comment = Comment(
         screen_id=payload.screen_id,
         author_id=current_user.id,
@@ -99,7 +90,7 @@ async def resolve_comment(
     comment = result.scalars().first()
     if not comment:
         raise HTTPException(status_code=404, detail="Comentário não encontrado")
-    await _validate_screen_ownership(comment.screen_id, current_user, db)
+    await _validate_screen_ownership(comment.screen_id, current_user, db, action="comment")
     if comment.author_id != current_user.id and current_user.role not in ["editor", "admin", "owner"]:
         raise HTTPException(status_code=403, detail="Apenas o autor ou editores podem resolver este comentário")
     comment.status = "resolved"

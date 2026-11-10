@@ -7,20 +7,13 @@ from typing import Dict, Any
 from app.database import get_db
 from app.models import User, DesignTokens, Project, Workspace
 from app.routes_auth import get_current_user, require_editor
+from app.authz import authorize_project
 
 router = APIRouter(prefix="/api/tokens", tags=["tokens"])
 
 
-async def _validate_project_ownership(project_id: str, current_user: User, db: AsyncSession) -> Project:
-    res = await db.execute(
-        select(Project)
-        .join(Workspace, Workspace.id == Project.workspace_id)
-        .where(Project.id == project_id, Workspace.organization_id == current_user.organization_id)
-    )
-    proj = res.scalars().first()
-    if not proj:
-        raise HTTPException(status_code=404, detail="Projeto não encontrado")
-    return proj
+async def _validate_project_ownership(project_id: str, current_user: User, db: AsyncSession, action: str = "read") -> Project:
+    return await authorize_project(project_id, current_user, action, db)
 
 
 class TokensUpdate(BaseModel):
@@ -46,7 +39,7 @@ async def get_project_tokens(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    await _validate_project_ownership(project_id, current_user, db)
+    await _validate_project_ownership(project_id, current_user, db, action="read")
     result = await db.execute(select(DesignTokens).where(DesignTokens.project_id == project_id))
     tokens = result.scalars().first()
     if not tokens:
@@ -86,7 +79,7 @@ async def update_project_tokens(
     current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
-    await _validate_project_ownership(project_id, current_user, db)
+    await _validate_project_ownership(project_id, current_user, db, action="edit")
     result = await db.execute(select(DesignTokens).where(DesignTokens.project_id == project_id))
     tokens = result.scalars().first()
     if not tokens:

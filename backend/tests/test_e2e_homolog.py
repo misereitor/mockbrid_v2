@@ -67,11 +67,18 @@ async def test_auth_and_project_flow():
         assert "color-primary" in tokens_data["light_tokens"]
         assert "color-primary" in tokens_data["dark_tokens"]
 
-        # 5. MCP Tools: get_project_map (agora protegido por autenticação e isolado por tenant)
+        # 5. Gera chave MCP segura e testa MCP Tools
+        mcp_key_res = await client.post("/api/mcp/keys", json={
+            "name": "E2E Key",
+            "project_id": proj_id
+        }, cookies=cookies, headers=csrf_headers)
+        assert mcp_key_res.status_code == 200
+        mcp_token = mcp_key_res.json()["raw_key"]
+        mcp_auth_headers = {"Authorization": f"Bearer {mcp_token}"}
+
         mcp_res = await client.post(
             f"/mcp/tools/get_project_map?project_id={proj_id}",
-            cookies=cookies,
-            headers=csrf_headers
+            headers=mcp_auth_headers
         )
         assert mcp_res.status_code == 200
         mcp_data = mcp_res.json()
@@ -79,11 +86,10 @@ async def test_auth_and_project_flow():
         assert len(mcp_data["canvases"]) > 0
         screen_id = mcp_data["canvases"][0]["screens"][0]["id"]
 
-        # 6. MCP Tools: get_implementation_bundle (protegido por autenticação)
+        # 6. MCP Tools: get_implementation_bundle (protegido por autenticação MCP)
         bundle_res = await client.post(
             f"/mcp/tools/get_implementation_bundle?screen_id={screen_id}",
-            cookies=cookies,
-            headers=csrf_headers
+            headers=mcp_auth_headers
         )
         assert bundle_res.status_code == 200
         bundle_data = bundle_res.json()

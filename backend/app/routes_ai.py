@@ -10,13 +10,85 @@ import re
 import os
 
 from app.database import get_db, AsyncSessionLocal
-from app.models import User, AIProvider
-from app.routes_auth import get_current_user
+from app.models import User, AIProvider, AIConversation, AIMessage, Screen
+from app.routes_auth import get_current_user, require_editor, require_admin
+from app.authz import authorize_screen
 from app.agent.state import AgentState
 from app.agent.graph import MockbirdAgentGraph
 from app.crypto import encrypt_secret, decrypt_secret
+from datetime import datetime
+import ipaddress
+import socket
+from urllib.parse import urlparse
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
+
+FORBIDDEN_PORTS = {22, 25, 110, 143, 445, 5432, 5434, 6379, 11211, 2375, 2376, 3306, 27017}
+
+
+def validate_ai_endpoint_url(url: str) -> str:
+    """Valida rigorosamente URLs de IA contra ataques de Server-Side Request Forgery (SSRF).
+    Bloqueia acesso a metadados de nuvem, IPs privados não autorizados e portas de serviços de infraestrutura."""
+    if not url:
+        return ""
+
+    clean_url = url.strip()
+    parsed = urlparse(clean_url)
+
+    if parsed.scheme not in ["http", "https"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Esquema de URL inválido. Apenas HTTP e HTTPS são permitidos."
+        )
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise HTTPException(status_code=400, detail="Hostname ausente na URL")
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if port in FORBIDDEN_PORTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Porta {port} terminantemente proibida por política de segurança SSRF."
+        )
+
+    lower_host = hostname.lower()
+    if lower_host in ["metadata.google.internal", "metadata", "instance-data", "db", "mockbird_v2_db", "mockbird_v2_api"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Acesso ao host de metadados ou infraestrutura interna bloqueado por política de segurança SSRF."
+        )
+
+    # Hosts locais autorizados explicitamente para provedores de LLM locais
+    allowed_local = [
+        h.strip().lower() for h in os.getenv("AI_ALLOWED_LOCAL_HOSTS", "localhost,127.0.0.1,172.31.0.1").split(",") if h.strip()
+    ]
+    is_explicitly_allowed_local = lower_host in allowed_local
+
+    try:
+        target_ip = ipaddress.ip_address(hostname)
+        ips_to_check = [target_ip]
+    except ValueError:
+        try:
+            addr_info = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+            ips_to_check = [ipaddress.ip_address(item[4][0]) for item in addr_info]
+        except socket.gaierror:
+            raise HTTPException(status_code=400, detail=f"Não foi possível resolver o hostname '{hostname}' via DNS.")
+
+    for ip in ips_to_check:
+        if str(ip) == "169.254.169.254":
+            raise HTTPException(
+                status_code=400,
+                detail="Acesso ao endereço de metadados 169.254.169.254 bloqueado por política de segurança SSRF."
+            )
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+            if not is_explicitly_allowed_local:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Endereço de rede ({ip}) não permitido por política de segurança SSRF."
+                )
+
+    return clean_url
 
 
 def _get_provider_api_key(prov: Optional[AIProvider]) -> str:
@@ -69,6 +141,40 @@ class AIChatRequest(BaseModel):
     system_role: Optional[str] = "assistant"
     model_name: Optional[str] = None
     provider_id: Optional[str] = None
+    conversation_id: Optional[str] = None
+    screen_id: Optional[str] = None
+    project_id: Optional[str] = None
+
+
+class ConversationCreate(BaseModel):
+    title: Optional[str] = "Nova Conversa"
+    project_id: Optional[str] = None
+    screen_id: Optional[str] = None
+
+
+class ConversationOut(BaseModel):
+    id: str
+    title: str
+    project_id: Optional[str]
+    screen_id: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class MessageOut(BaseModel):
+    id: str
+    role: str
+    content: str
+    patch: Optional[str]
+    patch_type: str
+    tokens_used: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 class AIVisionCritiqueRequest(BaseModel):
@@ -119,11 +225,11 @@ async def list_providers(
 @router.post("/providers")
 async def save_provider(
     payload: AIProviderConfig,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
-    if current_user.role not in ["owner", "admin"]:
-        raise HTTPException(status_code=403, detail="Apenas administradores podem configurar provedores de IA")
+    if payload.base_url and payload.base_url.strip():
+        validate_ai_endpoint_url(payload.base_url)
 
     result = await db.execute(
         select(AIProvider).where(
@@ -170,7 +276,7 @@ async def save_provider(
 @router.post("/test-connection")
 async def test_ai_connection(
     payload: AITestRequest,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_admin)
 ):
     url = (payload.base_url or "").strip()
     p_type = payload.provider_type.lower()
@@ -188,6 +294,9 @@ async def test_ai_connection(
             url = "https://api.anthropic.com/v1"
         else:
             url = "https://api.openai.com/v1"
+
+    # Valida proteção contra SSRF antes de qualquer conexão de rede
+    validate_ai_endpoint_url(url)
 
     resolved_url = resolve_docker_base_url(url)
     print(f"[AI TEST] Conexao: original={url} -> resolvido={resolved_url}, modelo={payload.model_name}", flush=True)
@@ -298,10 +407,92 @@ def clean_and_extract_html(text: str) -> str:
     return ""
 
 
+@router.get("/conversations", response_model=List[ConversationOut])
+async def list_conversations(
+    project_id: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Lista as conversas de IA criadas exclusivamente pelo usuário atual."""
+    query = select(AIConversation).where(
+        AIConversation.user_id == current_user.id,
+        AIConversation.organization_id == current_user.organization_id
+    )
+    if project_id:
+        query = query.where(AIConversation.project_id == project_id)
+    res = await db.execute(query.order_by(AIConversation.updated_at.desc()))
+    return res.scalars().all()
+
+
+@router.post("/conversations", response_model=ConversationOut)
+async def create_conversation(
+    payload: ConversationCreate,
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db)
+):
+    """Cria uma nova sessão de conversa para o usuário."""
+    conv = AIConversation(
+        user_id=current_user.id,
+        organization_id=current_user.organization_id,
+        project_id=payload.project_id,
+        screen_id=payload.screen_id,
+        title=payload.title or "Nova Conversa"
+    )
+    db.add(conv)
+    await db.commit()
+    await db.refresh(conv)
+    return conv
+
+
+@router.get("/conversations/{conv_id}/messages", response_model=List[MessageOut])
+async def get_conversation_messages(
+    conv_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Retorna o histórico de mensagens de uma conversa pertencente ao usuário."""
+    res = await db.execute(
+        select(AIConversation).where(
+            AIConversation.id == conv_id,
+            AIConversation.user_id == current_user.id
+        )
+    )
+    conv = res.scalars().first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversa não encontrada")
+
+    msg_res = await db.execute(
+        select(AIMessage).where(AIMessage.conversation_id == conv_id).order_by(AIMessage.created_at.asc())
+    )
+    return msg_res.scalars().all()
+
+
+@router.delete("/conversations/{conv_id}")
+async def delete_conversation(
+    conv_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Exclui uma conversa do usuário."""
+    res = await db.execute(
+        select(AIConversation).where(
+            AIConversation.id == conv_id,
+            AIConversation.user_id == current_user.id
+        )
+    )
+    conv = res.scalars().first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversa não encontrada")
+
+    await db.delete(conv)
+    await db.commit()
+    return {"message": "Conversa excluída com sucesso", "conversation_id": conv_id}
+
+
 @router.post("/chat/stream")
 async def ai_generate_stream(
     payload: AIChatRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
     """Endpoint Server-Sent Events (SSE) para streaming em tempo real do pensamento e do HTML."""
@@ -454,7 +645,7 @@ async def ai_generate_stream(
 @router.post("/chat")
 async def ai_generate_or_modify(
     payload: AIChatRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
     if payload.provider_id:
@@ -654,7 +845,7 @@ def audit_html_design_defects(html: str, prompt: str) -> List[str]:
 @router.post("/vision-critique")
 async def ai_vision_critique(
     payload: AIVisionCritiqueRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
     """Loop de Auto-Validação Visual (Vision Self-Correction Loop):
@@ -904,10 +1095,23 @@ async def ai_vision_critique(
 @router.post("/agent/stream")
 async def ai_agent_graph_stream(
     payload: AIChatRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
     """Executa o Grafo de Estados (LangGraph) do Agente Autônomo do Mockbird v2 e streama eventos em tempo real."""
+    # 1. Validação de Cota Mensal do Usuário
+    if current_user.tokens_used_month >= current_user.monthly_token_limit:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Limite mensal de tokens de IA atingido ({current_user.tokens_used_month}/{current_user.monthly_token_limit}). Contate o administrador da organização."
+        )
+
+    # 2. Resolução Segura de Tela (carrega o HTML oficial diretamente do banco se screen_id informado)
+    active_html = payload.current_html or ""
+    if payload.screen_id:
+        screen = await authorize_screen(payload.screen_id, current_user, "edit", db)
+        active_html = screen.html_content
+
     if payload.provider_id:
         result = await db.execute(
             select(AIProvider).where(
@@ -949,6 +1153,8 @@ async def ai_agent_graph_stream(
         else:
             raw_base_url = "https://api.openai.com/v1"
 
+    # Validação rigorosa anti-SSRF
+    validate_ai_endpoint_url(raw_base_url)
     resolved_base_url = resolve_docker_base_url(raw_base_url)
 
     headers = {"Content-Type": "application/json"}
@@ -968,18 +1174,43 @@ async def ai_agent_graph_stream(
 
     state = AgentState(
         prompt=payload.prompt,
-        current_html=payload.current_html or "",
+        current_html=active_html,
         target_element=target_info,
         model_name=selected_model
     )
     graph = MockbirdAgentGraph(base_url=resolved_base_url, headers=headers)
 
     async def event_generator():
+        done_ev = None
         try:
             async for ev in graph.run(state):
+                if ev.get("type") == "agent_done":
+                    done_ev = ev
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'detail': f'Falha no grafo do agente: {str(e)}'}, ensure_ascii=False)}\n\n"
+
+        # Contabilização de tokens e histórico após streaming
+        tokens_consumed = 150 + (len(done_ev.get("patch", "") or "") // 4 if done_ev else 50)
+        current_user.tokens_used_month += tokens_consumed
+        if payload.conversation_id:
+            user_msg = AIMessage(
+                conversation_id=payload.conversation_id,
+                role="user",
+                content=payload.prompt,
+                tokens_used=len(payload.prompt) // 4
+            )
+            bot_msg = AIMessage(
+                conversation_id=payload.conversation_id,
+                role="assistant",
+                content=done_ev.get("summary", "") if done_ev else "Concluído",
+                patch=done_ev.get("patch") if done_ev else None,
+                patch_type=done_ev.get("patch_type", "none") if done_ev else "none",
+                tokens_used=tokens_consumed
+            )
+            db.add(user_msg)
+            db.add(bot_msg)
+        await db.commit()
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
