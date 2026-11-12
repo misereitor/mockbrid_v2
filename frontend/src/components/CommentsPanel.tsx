@@ -18,12 +18,15 @@ interface CommentsPanelProps {
   screenId: string;
   onSendToAI: (commentText: string) => void;
   initialElementContext?: { selector: string; snippet?: string } | null;
+  /** Incrementado quando outro usuário cria um comentário via WebSocket. */
+  refreshKey?: number;
 }
 
 export const CommentsPanel: React.FC<CommentsPanelProps> = ({ 
   screenId, 
   onSendToAI,
-  initialElementContext 
+  initialElementContext,
+  refreshKey = 0
 }) => {
   const [comments, setComments] = useState<CommentItem[]>([]);
   const [newCommentBody, setNewCommentBody] = useState('');
@@ -44,7 +47,7 @@ export const CommentsPanel: React.FC<CommentsPanelProps> = ({
 
   useEffect(() => {
     loadComments();
-  }, [screenId]);
+  }, [screenId, refreshKey]);
 
   const handleAddComment = async (e: React.FormEvent) => {
     e.preventDefault();

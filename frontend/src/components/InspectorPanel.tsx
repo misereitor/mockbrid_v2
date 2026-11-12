@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { 
   Eye, 
   Type, 
@@ -9,9 +9,22 @@ import {
   Trash2,
 } from 'lucide-react';
 
+/** Converte rgb()/rgba() do computed style para o #rrggbb aceito pelo input color. */
+function toHexColor(value?: string): string {
+  if (!value) return '#000000';
+  const match = value.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+  if (match) {
+    return '#' + [match[1], match[2], match[3]]
+      .map((part) => Number(part).toString(16).padStart(2, '0'))
+      .join('');
+  }
+  return /^#[0-9a-f]{6}$/i.test(value) ? value : '#000000';
+}
+
 export interface SelectedElementData {
   mbId: string;
   tag: string;
+  leaf?: boolean;
   styles: {
     text?: string;
     bg?: string;
@@ -35,6 +48,16 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   onApplyStylePatch,
   onSendAction
 }) => {
+  // O estado do elemento no pai só é atualizado ao selecionar; manter cópias
+  // locais evita que os campos voltem ao valor antigo a cada tecla digitada.
+  const [text, setText] = useState(selectedElement?.styles.text ?? '');
+  const [bg, setBg] = useState(toHexColor(selectedElement?.styles.bg));
+
+  useEffect(() => {
+    setText(selectedElement?.styles.text ?? '');
+    setBg(toHexColor(selectedElement?.styles.bg));
+  }, [selectedElement?.mbId, selectedElement?.styles.text, selectedElement?.styles.bg]);
+
   return (
     <div className="w-80 border-l border-mockbird-border bg-mockbird-surface flex flex-col h-full overflow-y-auto shrink-0 space-y-5 p-4 select-none shadow-2xl">
       {selectedElement && (
@@ -95,18 +118,27 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
             </p>
           </div>
 
-          {selectedElement.styles.text !== undefined && (
+          {selectedElement.styles.text !== undefined && selectedElement.leaf !== false && (
             <div className="space-y-1.5">
               <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
                 <Type className="h-3.5 w-3.5 text-mockbird-cyan" /> Texto
               </label>
               <textarea 
-                value={selectedElement.styles.text}
-                onChange={(e) => onApplyStylePatch({ text: e.target.value })}
+                value={text}
+                onChange={(e) => {
+                  setText(e.target.value);
+                  onApplyStylePatch({ text: e.target.value });
+                }}
                 className="w-full px-3 py-2 text-xs rounded-lg bg-mockbird-card border border-mockbird-border text-slate-200 focus:outline-none focus:border-mockbird-cyan"
                 rows={2}
               />
             </div>
+          )}
+
+          {selectedElement.leaf === false && (
+            <p className="text-[11px] text-slate-400 bg-mockbird-card border border-mockbird-border rounded-lg p-2.5 leading-relaxed">
+              Este elemento tem filhos. Dê um duplo clique no canvas para editar o texto sem perder a estrutura.
+            </p>
           )}
 
           <div className="space-y-1.5">
@@ -116,8 +148,11 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
             <div className="flex items-center gap-2">
               <input 
                 type="color" 
-                value={selectedElement.styles.bg || '#000000'}
-                onChange={(e) => onApplyStylePatch({ bg: e.target.value })}
+                value={bg}
+                onChange={(e) => {
+                  setBg(e.target.value);
+                  onApplyStylePatch({ bg: e.target.value });
+                }}
                 className="h-7 w-8 rounded cursor-pointer bg-transparent border-0 p-0"
               />
               <button 

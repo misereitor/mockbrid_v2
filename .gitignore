@@ -41,3 +41,9 @@ frontend/node_modules/
 .DS_Store
 Thumbs.db
 
+
+# Uploads locais de assets (dev/homologação)
+backend/assets_storage/
+
+# Harness state (ulw plans/ledger/evidence)
+.omo/

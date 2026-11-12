@@ -6,8 +6,9 @@ from typing import List, Optional
 from datetime import datetime
 
 from app.database import get_db
-from app.models import User, Comment, Screen, Canvas, Project, Workspace
-from app.routes_auth import get_current_user, require_commenter, require_editor
+from app.timeutils import utcnow
+from app.models import User, Comment, Screen
+from app.routes_auth import get_current_user, require_commenter
 
 from app.authz import authorize_screen
 
@@ -94,7 +95,7 @@ async def resolve_comment(
     if comment.author_id != current_user.id and current_user.role not in ["editor", "admin", "owner"]:
         raise HTTPException(status_code=403, detail="Apenas o autor ou editores podem resolver este comentário")
     comment.status = "resolved"
-    comment.resolved_at = datetime.utcnow()
+    comment.resolved_at = utcnow()
     await db.commit()
     await db.refresh(comment)
     return comment

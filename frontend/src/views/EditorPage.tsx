@@ -18,7 +18,13 @@ import {
   Copy,
   PanelRightClose,
   X,
-  History
+  History,
+  Image as ImageIcon,
+  Wifi,
+  WifiOff,
+  Download,
+  Undo2,
+  Redo2
 } from 'lucide-react';
 import { CanvasEditor, CanvasEditorHandle, SelectedElementInfo } from '../CanvasEditor';
 import { TokensPanel } from '../TokensPanel';
@@ -28,6 +34,16 @@ import { ComponentsCatalogPanel } from '../components/ComponentsCatalogPanel';
 import { CommentsPanel } from '../components/CommentsPanel';
 import { InspectorPanel } from '../components/InspectorPanel';
 import { HistoryPanel } from '../components/HistoryPanel';
+import { ensurePublished } from '../lib/presentation';
+import { useProjectSocket } from '../lib/realtime';
+import { imageHtml, uploadProjectAsset } from '../lib/assets';
+import { resolveScreenIndex } from '../lib/mockNav';
+import { useUndoHistory } from '../lib/useUndoHistory';
+import {
+  buildDesignBundle,
+  designBundleFilename,
+  downloadDesignBundle,
+} from '../lib/designBundle';
 
 interface ScreenData {
   id: string;
@@ -37,6 +53,9 @@ interface ScreenData {
   css_content?: string;
   js_content?: string;
   is_main?: boolean;
+  width?: number;
+  height?: number;
+  device_type?: string;
 }
 
 interface ProjectData {
@@ -74,6 +93,7 @@ type ActiveEditorTab = 'ai' | 'visual' | 'blocks' | 'code' | 'tokens' | 'comment
 export const EditorPage: React.FC<EditorPageProps> = ({
   project,
   onOpenPresentation,
+  onNotify,
 }) => {
   const [screens, setScreens] = useState<ScreenData[]>(project.screens || []);
   const [currentScreenIndex, setCurrentScreenIndex] = useState(0);
@@ -97,7 +117,58 @@ export const EditorPage: React.FC<EditorPageProps> = ({
   const [codeMode, setCodeMode] = useState<'html' | 'jsx' | 'css'>('html');
   const [copiedCode, setCopiedCode] = useState(false);
   const [selectedElement, setSelectedElement] = useState<SelectedElementInfo | null>(null);
+  const [commentsRefresh, setCommentsRefresh] = useState(0);
+  const [remoteRevision, setRemoteRevision] = useState(0);
+  const [uploading, setUploading] = useState(false);
+  const [exportingBundle, setExportingBundle] = useState<string | null>(null);
   const canvasEditorRef = useRef<CanvasEditorHandle>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const dirtyRef = useRef(false);
+  const activeScreenIdRef = useRef<string | undefined>(undefined);
+
+  const activeScreen = screens[currentScreenIndex] || {
+    id: 'temp',
+    name: 'Tela Principal',
+    slug: 'main',
+    html_content: '<div class="p-8 text-center"><h1 class="text-2xl font-bold">Mockbird SaaS</h1></div>'
+  };
+
+  // Desfazer/refazer do HTML da tela ativa: cobre edições no canvas, na IA e
+  // no editor de código, porque todas passam pelo mesmo estado da tela.
+  const history = useUndoHistory<string>({
+    key: activeScreen.id,
+    value: activeScreen.html_content || '',
+    onApply: (html) => {
+      dirtyRef.current = true;
+      setScreens(prev =>
+        prev.map((s, idx) => (idx === currentScreenIndex ? { ...s, html_content: html } : s))
+      );
+    },
+  });
+
+  const { participants, connected } = useProjectSocket(project.id, (message) => {
+    if (message.type === 'screen_updated' && message.screen_id) {
+      const isActive = message.screen_id === activeScreenIdRef.current;
+      if (isActive && dirtyRef.current) return;
+      if (isActive) history.markExternal(message.html_content);
+      setScreens(prev =>
+        prev.map(s =>
+          s.id === message.screen_id
+            ? {
+                ...s,
+                html_content: message.html_content ?? s.html_content,
+                css_content: message.css_content ?? s.css_content,
+                js_content: message.js_content ?? s.js_content,
+              }
+            : s
+        )
+      );
+      if (isActive) setRemoteRevision(v => v + 1);
+    }
+    if (message.type === 'comment_created' && message.comment?.screen_id === activeScreenIdRef.current) {
+      setCommentsRefresh(v => v + 1);
+    }
+  });
 
   useEffect(() => {
     fetch(`/api/projects/${project.id}/screens`)
@@ -119,14 +190,75 @@ export const EditorPage: React.FC<EditorPageProps> = ({
       .catch(console.error);
   }, [project.id]);
 
-  const activeScreen = screens[currentScreenIndex] || {
-    id: 'temp',
-    name: 'Tela Principal',
-    slug: 'main',
-    html_content: '<div class="p-8 text-center"><h1 class="text-2xl font-bold">Mockbird SaaS</h1></div>'
+  // Atalhos de desfazer/refazer quando o foco está no editor (dentro do canvas
+  // o próprio runtime encaminha o Ctrl+Z).
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const active = document.activeElement as HTMLElement | null;
+      if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) {
+        return;
+      }
+      if (!e.ctrlKey && !e.metaKey) return;
+      if (e.key === 'z' || e.key === 'Z') {
+        e.preventDefault();
+        if (e.shiftKey) history.redo();
+        else history.undo();
+      } else if (e.key === 'y' || e.key === 'Y') {
+        e.preventDefault();
+        history.redo();
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [history.undo, history.redo]);
+
+  // Clique em link/`data-go` no canvas: troca de tela como num mock navegável.
+  const handleMockNavigate = (target: string, external?: boolean) => {
+    if (external) {
+      onNotify?.(`Link externo não abre dentro do mock: ${target}`);
+      return;
+    }
+    const index = resolveScreenIndex(target, screens);
+    if (index < 0) {
+      onNotify?.(`Nenhuma tela corresponde a "${target}".`);
+      return;
+    }
+    if (index === currentScreenIndex) return;
+    setCurrentScreenIndex(index);
+    setSelectedElement(null);
+    onNotify?.(`Mock: ${screens[index].name}`);
+  };
+
+  const handleExportDesignBundle = async () => {
+    if (exportingBundle) return;
+    setExportingBundle('preparando…');
+    try {
+      const tokensRes = await fetch(`/api/tokens/${project.id}`);
+      const tokenData = tokensRes.ok ? await tokensRes.json() : null;
+      const bundle = await buildDesignBundle({
+        project: { id: project.id, name: project.name, slug: project.slug },
+        screens,
+        tokens: {
+          light: tokenData?.light_tokens || {},
+          dark: tokenData?.dark_tokens || tokens,
+          shared: tokenData?.shared_tokens || {},
+        },
+        onProgress: (done, total) => setExportingBundle(`${done}/${total}`),
+      });
+      downloadDesignBundle(bundle, designBundleFilename(project));
+      onNotify?.(
+        `Bundle exportado com ${bundle.screens.length} tela(s). Importe o arquivo no plugin Figma/Penpot.`,
+      );
+    } catch (error) {
+      onNotify?.(`Falha ao exportar: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setExportingBundle(null);
+    }
   };
 
   const handleHtmlChange = (newHtml: string) => {
+    dirtyRef.current = true;
     setScreens(prev => {
       const copy = [...prev];
       if (copy[currentScreenIndex]) {
@@ -149,6 +281,7 @@ export const EditorPage: React.FC<EditorPageProps> = ({
             js_content: activeScreen.js_content || ''
           })
         });
+        dirtyRef.current = false;
         setSavedSuccess(true);
         setTimeout(() => setSavedSuccess(false), 2500);
       } catch (err) {
@@ -180,6 +313,7 @@ export const EditorPage: React.FC<EditorPageProps> = ({
           js_content: activeScreen.js_content || ''
         })
       });
+      dirtyRef.current = false;
       setSavedSuccess(true);
       setTimeout(() => setSavedSuccess(false), 2000);
     } catch (e) {
@@ -259,6 +393,22 @@ export const EditorPage: React.FC<EditorPageProps> = ({
     }
   };
 
+  const handleUploadImage = async (file: File | undefined) => {
+    if (!file) return;
+    setUploading(true);
+    try {
+      const asset = await uploadProjectAsset(project.id, file);
+      await handleApplyAiPatch(`${(activeScreen.html_content || '').trim()}\n\n${imageHtml(asset)}`);
+    } catch (err: any) {
+      alert(err.message || 'Erro ao enviar imagem');
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  activeScreenIdRef.current = activeScreen.id;
+
   const vp = VIEWPORT_SIZES[viewport];
   const cleanJsx = `export function ${activeScreen.name.replace(/\s+/g, '')}Screen() {\n  return (\n    ${activeScreen.html_content.replace(/class="/g, 'className="')}\n  );\n}`;
   const cssTokensCode = `:root {\n${Object.entries(tokens).map(([k, v]) => `  --${k}: ${v};`).join('\n')}\n}`;
@@ -276,6 +426,35 @@ export const EditorPage: React.FC<EditorPageProps> = ({
         {/* Projeto + telas */}
         <div className="flex items-center gap-2 min-w-0">
           <span className="text-[13px] font-medium text-slate-200 truncate max-w-[180px]">{project.name}</span>
+          <span
+            title={connected ? 'Colaboração em tempo real ativa' : 'Reconectando colaboração…'}
+            className="shrink-0"
+          >
+            {connected ? (
+              <Wifi size={12} className="text-emerald-400" />
+            ) : (
+              <WifiOff size={12} className="text-slate-500" />
+            )}
+          </span>
+          {participants.length > 0 && (
+            <div className="flex items-center -space-x-1.5 shrink-0" title="Pessoas neste projeto agora">
+              {participants.slice(0, 4).map(p => (
+                <span
+                  key={p.user_id}
+                  title={p.name}
+                  style={{ backgroundColor: p.color }}
+                  className="w-5 h-5 rounded-full text-[9px] font-bold text-white flex items-center justify-center ring-2 ring-mockbird-surface"
+                >
+                  {p.name?.[0]?.toUpperCase() || '?'}
+                </span>
+              ))}
+              {participants.length > 4 && (
+                <span className="w-5 h-5 rounded-full bg-slate-600 text-[9px] font-bold text-white flex items-center justify-center ring-2 ring-mockbird-surface">
+                  +{participants.length - 4}
+                </span>
+              )}
+            </div>
+          )}
           <ChevronRight size={13} className="text-slate-600 shrink-0" />
           <div className="flex items-center gap-0.5 overflow-x-auto" role="tablist" aria-label="Telas do projeto">
             {screens.map((s, idx) => (
@@ -340,7 +519,62 @@ export const EditorPage: React.FC<EditorPageProps> = ({
 
         {/* Ações */}
         <div className="flex items-center gap-2">
-          <button onClick={() => onOpenPresentation(project.slug)} className="mb-btn-outline" title="Apresentar em tela cheia">
+          <div className="flex items-center gap-0.5 p-0.5 rounded-md bg-mockbird-bg border border-mockbird-border">
+            <button
+              type="button"
+              onClick={history.undo}
+              disabled={!history.canUndo}
+              className="p-1.5 rounded text-slate-300 hover:text-white hover:bg-mockbird-card disabled:opacity-35 disabled:hover:bg-transparent"
+              title="Desfazer (Ctrl+Z)"
+              aria-label="Desfazer"
+            >
+              <Undo2 size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={history.redo}
+              disabled={!history.canRedo}
+              className="p-1.5 rounded text-slate-300 hover:text-white hover:bg-mockbird-card disabled:opacity-35 disabled:hover:bg-transparent"
+              title="Refazer (Ctrl+Shift+Z)"
+              aria-label="Refazer"
+            >
+              <Redo2 size={14} />
+            </button>
+          </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/gif,image/webp"
+            className="hidden"
+            onChange={(e) => handleUploadImage(e.target.files?.[0])}
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploading}
+            className="mb-btn-outline"
+            title="Enviar imagem e inserir na tela"
+          >
+            <ImageIcon size={14} /> {uploading ? 'Enviando…' : 'Imagem'}
+          </button>
+          <button
+            onClick={handleExportDesignBundle}
+            disabled={exportingBundle !== null}
+            className="mb-btn-outline"
+            title="Exportar bundle JSON com as camadas de cada tela para importar no Figma ou Penpot"
+          >
+            <Download size={14} /> {exportingBundle ? `Exportando ${exportingBundle}` : 'Figma/Penpot'}
+          </button>
+          <button
+            onClick={async () => {
+              try {
+                onOpenPresentation(await ensurePublished(project.id));
+              } catch {
+                /* falha de publicação: mantém o usuário no editor */
+              }
+            }}
+            className="mb-btn-outline"
+            title="Apresentar em tela cheia"
+          >
             <MonitorPlay size={14} /> Apresentar
           </button>
           <button
@@ -381,7 +615,7 @@ export const EditorPage: React.FC<EditorPageProps> = ({
         <div className="flex-1 flex flex-col h-full overflow-hidden">
           <CanvasEditor
             ref={canvasEditorRef}
-            key={activeScreen.id}
+            key={`${activeScreen.id}-${remoteRevision}`}
             initialHtml={activeScreen.html_content}
             tokens={tokens}
             onHtmlChange={handleHtmlChange}
@@ -394,6 +628,9 @@ export const EditorPage: React.FC<EditorPageProps> = ({
               }
             }}
             onRequestOpenTab={(tab) => setActiveTab(tab)}
+            onNavigate={handleMockNavigate}
+            onUndo={history.undo}
+            onRedo={history.redo}
             onNewCommentOnElement={(selector, snippet) => {
               setActiveTab('comments');
               if (selector) {
@@ -434,9 +671,10 @@ export const EditorPage: React.FC<EditorPageProps> = ({
             )}
           </div>
 
-          {activeTab && (
-            <div className="flex-1 min-h-0 flex overflow-hidden [&>*]:!w-full [&>*]:!border-l-0 [&>*]:!shadow-none">
-            {activeTab === 'ai' && (
+          {/* Conteúdo dos painéis. O chat fica sempre montado: trocar de aba
+              não pode interromper a geração em andamento nem perder a conversa. */}
+          <div className={`flex-1 min-h-0 overflow-hidden [&>*]:!w-full [&>*]:!border-l-0 [&>*]:!shadow-none ${activeTab ? 'flex' : 'hidden'}`}>
+            <div className={activeTab === 'ai' ? 'flex w-full min-h-0 h-full [&>*]:!w-full [&>*]:!border-l-0 [&>*]:!shadow-none' : 'hidden'}>
               <AIChatPanel
                 projectId={project.id}
                 currentHtml={activeScreen.html_content}
@@ -449,7 +687,7 @@ export const EditorPage: React.FC<EditorPageProps> = ({
                 initialPrompt={aiPromptInstruction}
                 onClose={() => setActiveTab(null)}
               />
-            )}
+            </div>
 
             {activeTab === 'visual' && (
               <InspectorPanel
@@ -467,6 +705,7 @@ export const EditorPage: React.FC<EditorPageProps> = ({
             {activeTab === 'comments' && (
               <CommentsPanel
                 screenId={activeScreen.id}
+                refreshKey={commentsRefresh}
                 onSendToAI={handleSendCommentToAI}
               />
             )}
@@ -552,6 +791,7 @@ export const EditorPage: React.FC<EditorPageProps> = ({
                 <HistoryPanel
                   screenId={activeScreen.id}
                   onRevertSuccess={(revertedScreen) => {
+                    history.markExternal(revertedScreen.html_content);
                     setScreens(prev => prev.map((s, idx) => idx === currentScreenIndex ? { ...s, ...revertedScreen } : s));
                   }}
                   onClose={() => setActiveTab(null)}
@@ -567,8 +807,7 @@ export const EditorPage: React.FC<EditorPageProps> = ({
                 />
               </div>
             )}
-            </div>
-          )}
+          </div>
         </div>
       </div>
     </div>

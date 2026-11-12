@@ -1,7 +1,6 @@
 import pytest
 import httpx
 import secrets
-import json
 import os
 
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8082")
@@ -92,9 +91,6 @@ async def test_ai_chat_conversations_history_and_quota_block():
 
     # 7. Teste de Bloqueio por Cota Ultrapassada (429)
     # Simula cota estourada atualizando o banco ou chamando com limite baixo
-    from app.database import AsyncSessionLocal
-    from app.models import User
-    from sqlalchemy.future import select
 
     # Vamos atualizar diretamente o user de teste para ter tokens_used_month >= monthly_token_limit
     import asyncpg

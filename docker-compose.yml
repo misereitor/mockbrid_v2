@@ -31,9 +31,11 @@ services:
       DATABASE_URL_SYNC: postgresql://mockbird:mockbird_homolog_secret@db:5432/mockbird_v2
       SECRET_KEY: mockbird_v2_homolog_secret_jwt_key_super_secure_987654321
       ENVIRONMENT: homologation
-      ALLOW_ORIGINS: "http://localhost:8082,http://127.0.0.1:8082"
+      ALLOW_ORIGINS: "http://localhost:8082,http://127.0.0.1:8082,http://10.8.0.7:8082"
     ports:
+      # Acesso local (homologação) e acesso pela VPN WireGuard.
       - "127.0.0.1:8082:8000"
+      - "10.8.0.7:8082:8000"
     volumes:
       - ./backend:/app
       - ./frontend/dist:/app/frontend_dist:ro

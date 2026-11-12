@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from typing import List
@@ -8,6 +8,8 @@ from app.models import User, Screen, Canvas, Project, Workspace, ScreenRevision
 from app.schemas import ScreenCreate, ScreenUpdate, ScreenOut, ScreenRevisionOut
 from app.routes_auth import get_current_user, require_editor
 from app.authz import authorize_screen, authorize_project
+from app.jsx import html_to_jsx
+from app.ws import broadcaster
 
 router = APIRouter(prefix="/api/screens", tags=["screens"])
 
@@ -113,6 +115,24 @@ async def update_screen(
 
     await db.commit()
     await db.refresh(screen)
+
+    # Colaboração em tempo real: os demais editores aplicam o novo conteúdo.
+    canvas_res = await db.execute(select(Canvas).where(Canvas.id == screen.canvas_id))
+    canvas = canvas_res.scalars().first()
+    if canvas:
+        await broadcaster.broadcast(
+            canvas.project_id,
+            {
+                "type": "screen_updated",
+                "screen_id": screen.id,
+                "origin": current_user.id,
+                "name": screen.name,
+                "current_revision": screen.current_revision,
+                "html_content": screen.html_content,
+                "css_content": screen.css_content,
+                "js_content": screen.js_content,
+            },
+        )
     return screen
 
 
@@ -132,6 +152,8 @@ async def delete_screen(
 @router.get("/{screen_id}/revisions", response_model=List[ScreenRevisionOut])
 async def list_screen_revisions(
     screen_id: str,
+    limit: int = 100,
+    offset: int = 0,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -141,6 +163,8 @@ async def list_screen_revisions(
         select(ScreenRevision)
         .where(ScreenRevision.screen_id == screen_id)
         .order_by(ScreenRevision.revision_number.desc())
+        .offset(max(0, offset))
+        .limit(min(max(1, limit), 200))
     )
     return res.scalars().all()
 
@@ -236,14 +260,12 @@ async def export_screen_bundle(
 ):
     """Dev Mode / Handoff: Retorna o pacote de código pronto para desenvolvimento."""
     screen = await _owned_screen(screen_id, current_user, db)
-    component_name = "".join(w.capitalize() for w in screen.name.split()) + "Screen"
-    clean_jsx = screen.html_content.replace('class="', 'className="')
     return {
         "screen_id": screen.id,
         "name": screen.name,
         "html": screen.html_content,
         "css": screen.css_content,
         "js": screen.js_content,
-        "react_jsx": f"export function {component_name}() {{\n  return (\n    {clean_jsx}\n  );\n}}"
+        "react_jsx": html_to_jsx(screen.html_content, screen.name),
     }
 

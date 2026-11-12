@@ -38,6 +38,7 @@ export const TeamPage: React.FC<TeamPageProps> = () => {
   const [inviting, setInviting] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [msg, setMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [inviteLink, setInviteLink] = useState<string | null>(null);
 
   const loadMembers = async () => {
     try {
@@ -75,11 +76,20 @@ export const TeamPage: React.FC<TeamPageProps> = () => {
       if (!res.ok) {
         throw new Error(data.detail || 'Falha ao convidar colaborador.');
       }
-      setMsg({ type: 'ok', text: `Convite enviado com sucesso para ${email}!` });
+      // O backend tenta enviar por e-mail; se o transporte não estiver pronto,
+      // o admin ainda recebe o link para repassar manualmente.
+      const link = data.invite_url ? `${window.location.origin}${data.invite_url}` : null;
+      setInviteLink(data.email_sent ? null : link);
+      setMsg({
+        type: 'ok',
+        text: data.email_sent
+          ? `Convite enviado por e-mail para ${email}.`
+          : `Convite criado para ${email}. Envie o link abaixo (e-mail não configurado).`,
+      });
       setEmail('');
       setName('');
       loadMembers();
-      setTimeout(() => setMsg(null), 4000);
+      setTimeout(() => setMsg(null), 8000);
     } catch (err: any) {
       setMsg({ type: 'err', text: err.message || 'Falha na requisição.' });
     } finally {
@@ -121,7 +131,7 @@ export const TeamPage: React.FC<TeamPageProps> = () => {
             <UserPlus size={16} className="text-mockbird-cyan" />
             Convidar Novo Membro
           </h2>
-          <span className="text-[11px] text-slate-500">Acesso instantâneo com senha temporária</span>
+          <span className="text-[11px] text-slate-500">O convidado define a própria senha</span>
         </div>
 
         {msg && (
@@ -138,6 +148,19 @@ export const TeamPage: React.FC<TeamPageProps> = () => {
               <AlertCircle size={15} className="text-rose-400 shrink-0" />
             )}
             <span>{msg.text}</span>
+          </div>
+        )}
+
+        {inviteLink && (
+          <div className="flex items-center gap-2">
+            <input readOnly value={inviteLink} className="mb-input !py-1.5 !text-[11px] flex-1" onFocus={(e) => e.currentTarget.select()} />
+            <button
+              type="button"
+              onClick={() => navigator.clipboard?.writeText(inviteLink)}
+              className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-mockbird-border text-slate-300 hover:text-white"
+            >
+              Copiar
+            </button>
           </div>
         )}
 

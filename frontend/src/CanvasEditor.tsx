@@ -7,6 +7,7 @@ import React, {
   forwardRef,
   useCallback,
 } from 'react';
+import { buildCanvasDoc } from './lib/canvasDoc';
 import {
   ZoomIn,
   ZoomOut,
@@ -23,6 +24,7 @@ import {
   MousePointer,
   Hand,
   MousePointerClick,
+  X,
 } from 'lucide-react';
 
 export interface SelectedElementInfo {
@@ -31,6 +33,7 @@ export interface SelectedElementInfo {
   text?: string;
   selector?: string;
   snippet?: string;
+  leaf?: boolean;
   styles: {
     text?: string;
     bg?: string;
@@ -59,6 +62,11 @@ interface CanvasEditorProps {
   onElementSelected?: (el: SelectedElementInfo | null) => void;
   onRequestOpenTab?: (tab: 'visual' | 'code' | 'comments' | 'ai' | 'blocks') => void;
   onNewCommentOnElement?: (selector: string, snippet?: string) => void;
+  /** Clique em link/`data-go` no modo mock: navegar para outra tela. */
+  onNavigate?: (target: string, external?: boolean) => void;
+  /** Desfazer/refazer vindos do Ctrl+Z dentro do canvas. */
+  onUndo?: () => void;
+  onRedo?: () => void;
 }
 
 interface ContextMenuState {
@@ -86,15 +94,20 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
   onElementSelected,
   onRequestOpenTab,
   onNewCommentOnElement,
+  onNavigate,
+  onUndo,
+  onRedo,
 }, ref) => {
   const [scale, setScale] = useState(0.75);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isPanning, setIsPanning] = useState(false);
   const [selectedMbId, setSelectedMbId] = useState<string | null>(null);
   const [selectedTag, setSelectedTag] = useState<string>('');
+  const [selectionCount, setSelectionCount] = useState(0);
   const [copiedNotification, setCopiedNotification] = useState<string | null>(null);
 
-  const [canvasMode, setCanvasMode] = useState<'edit' | 'interactive'>('edit');
+  // O canvas abre como mock navegável; "Editar" trava o clique como seleção.
+  const [canvasMode, setCanvasMode] = useState<'edit' | 'interactive'>('interactive');
   const [docVersion, setDocVersion] = useState(0);
 
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState>({
@@ -109,11 +122,15 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const prevInitialHtmlRef = useRef(initialHtml);
+  // HTML que originou o documento atual. Alterações feitas dentro do iframe
+  // não voltam para o srcDoc, senão o canvas recarregaria e perderia a seleção.
+  const [docHtml, setDocHtml] = useState(initialHtml);
 
   // Sincroniza quando initialHtml muda de fora (ex: IA aplicou código novo)
   useEffect(() => {
     if (initialHtml !== prevInitialHtmlRef.current) {
       prevInitialHtmlRef.current = initialHtml;
+      setDocHtml(initialHtml);
       setDocVersion((v) => v + 1);
     }
   }, [initialHtml]);
@@ -123,13 +140,18 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
     setCtxMenu((prev) => (prev.open ? { ...prev, open: false } : prev));
   }, []);
 
-  // Notifica o iframe sempre que o modo do canvas mudar (editar vs interagir)
-  useEffect(() => {
+  // Notifica o iframe sempre que o modo mudar ou o documento for recarregado.
+  // O runtime aplica o modo sem remontar o iframe, preservando o estado da página.
+  const syncMode = useCallback(() => {
     iframeRef.current?.contentWindow?.postMessage({
       type: 'MOCKBIRD_SET_MODE',
       mode: canvasMode,
     }, '*');
-  }, [canvasMode, docVersion]);
+  }, [canvasMode]);
+
+  useEffect(() => {
+    syncMode();
+  }, [syncMode, docVersion]);
 
   // Fit: ajusta o frame à área disponível centralizado
   const fitToScreen = useCallback(() => {
@@ -204,305 +226,29 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
   }, [width, height]);
 
   // Script injetado no iframe: lida com cliques, seleção, postMessages e MENU DE CONTEXTO
-  const builtHtmlDoc = useMemo(() => {
-    const cssVars = Object.entries(tokens)
-      .map(([k, v]) => `--${k}: ${v};`)
-      .join('\n');
-
-    const injectionScript = `
-      <script>
-        let selectedEl = null;
-        let currentMode = '${canvasMode}';
-
-        function emitHtmlChanged() {
-          const root = document.getElementById('mockbird-root') || document.body;
-          const clone = root.cloneNode(true);
-          const sel = clone.querySelector('.mb-selected');
-          if (sel) sel.classList.remove('mb-selected');
-          window.parent.postMessage({
-            type: 'MOCKBIRD_HTML_CHANGED',
-            html: clone.innerHTML
-          }, '*');
-        }
-
-        function extractSnippet(target) {
-          if (!target) return '';
-          const text = (target.innerText || '').trim().replace(/\\s+/g, ' ');
-          if (text) return text.length > 36 ? text.substring(0, 36) + '…' : text;
-          const img = target.querySelector('img') || (target.tagName.toLowerCase() === 'img' ? target : null);
-          if (img && img.src) {
-            const parts = img.src.split('/');
-            return parts[parts.length - 1].substring(0, 30);
-          }
-          return '';
-        }
-
-        function buildSelector(target) {
-          if (!target || target === document.body) return '';
-          const tag = target.tagName.toLowerCase();
-          const id = target.id ? '#' + target.id : '';
-          const classes = Array.from(target.classList || [])
-            .filter(c => !c.startsWith('mb-'))
-            .slice(0, 2)
-            .map(c => '.' + c)
-            .join('');
-          return tag + id + classes;
-        }
-
-        function selectElement(target) {
-          if (selectedEl) selectedEl.classList.remove('mb-selected');
-          selectedEl = target;
-          if (selectedEl) selectedEl.classList.add('mb-selected');
-
-          if (!selectedEl) {
-            window.parent.postMessage({ type: 'MOCKBIRD_DESELECT' }, '*');
-            return;
-          }
-
-          const mbId = target.getAttribute('data-mb-id') || target.tagName.toLowerCase();
-          const computed = window.getComputedStyle(target);
-
-          window.parent.postMessage({
-            type: 'MOCKBIRD_ELEMENT_SELECTED',
-            mbId: mbId,
-            tag: target.tagName.toLowerCase(),
-            text: target.innerText || '',
-            selector: buildSelector(target),
-            snippet: extractSnippet(target),
-            styles: {
-              color: computed.color,
-              backgroundColor: computed.backgroundColor,
-              padding: computed.padding,
-              fontSize: computed.fontSize,
-              borderRadius: computed.borderRadius
-            }
-          }, '*');
-        }
-
-        // FECHA O MENU DE CONTEXTO DO PAI IMEDIATAMENTE AO CLICAR NO IFRAME
-        document.addEventListener('pointerdown', () => {
-          window.parent.postMessage({ type: 'MOCKBIRD_CLOSE_CONTEXT_MENU' }, '*');
-        }, true);
-
-        // Clique simples
-        document.addEventListener('click', (e) => {
-          window.parent.postMessage({ type: 'MOCKBIRD_CLOSE_CONTEXT_MENU' }, '*');
-          if (currentMode === 'interactive') return; // Modo interativo: deixa a página funcionar livremente!
-
-          const target = e.target.closest('[data-mb-id]') || e.target;
-          if (target && target !== document.body && target !== document.documentElement) {
-            e.preventDefault();
-            e.stopPropagation();
-            selectElement(target);
-          } else {
-            selectElement(null);
-          }
-        });
-
-        // BOTÃO DIREITO / CONTEXTMENU
-        document.addEventListener('contextmenu', (e) => {
-          window.parent.postMessage({ type: 'MOCKBIRD_CLOSE_CONTEXT_MENU' }, '*');
-
-          // MECANISMO PARA O BOTÃO DIREITO DA PÁGINA:
-          // Se estiver no Modo Interativo OU se o usuário segurar Shift ou Alt:
-          // NÃO intercepta! Permite que a página execute seu próprio menu de contexto nativo!
-          if (currentMode === 'interactive' || e.shiftKey || e.altKey) {
-            return;
-          }
-
-          // Modo edição: abre o menu de contexto do Mockbird
-          e.preventDefault();
-          e.stopPropagation();
-          const target = e.target.closest('[data-mb-id]') || (e.target !== document.body && e.target !== document.documentElement ? e.target : null);
-          if (target) {
-            selectElement(target);
-            window.parent.postMessage({
-              type: 'MOCKBIRD_CONTEXT_MENU',
-              kind: 'element',
-              clientX: e.clientX,
-              clientY: e.clientY,
-              target: {
-                mbId: target.getAttribute('data-mb-id') || target.tagName.toLowerCase(),
-                tag: target.tagName.toLowerCase(),
-                selector: buildSelector(target),
-                snippet: extractSnippet(target),
-                outerHtml: target.outerHTML
-              }
-            }, '*');
-          } else {
-            selectElement(null);
-            window.parent.postMessage({
-              type: 'MOCKBIRD_CONTEXT_MENU',
-              kind: 'canvas',
-              clientX: e.clientX,
-              clientY: e.clientY
-            }, '*');
-          }
-        });
-
-        // Fechar menu de contexto no pai ao rolar dentro do iframe
-        window.addEventListener('wheel', () => {
-          window.parent.postMessage({ type: 'MOCKBIRD_CLOSE_CONTEXT_MENU' }, '*');
-        }, { passive: true });
-
-        // Mensagens do pai
-        window.addEventListener('message', (ev) => {
-          if (!ev.data) return;
-
-          if (ev.data.type === 'MOCKBIRD_SET_MODE') {
-            currentMode = ev.data.mode || 'edit';
-            if (currentMode === 'interactive') {
-              document.body.classList.add('mb-interactive');
-              if (selectedEl) selectedEl.classList.remove('mb-selected');
-              selectedEl = null;
-            } else {
-              document.body.classList.remove('mb-interactive');
-            }
-            return;
-          }
-
-          if (ev.data.type === 'MOCKBIRD_REQUEST_OUTER_HTML') {
-            if (selectedEl) {
-              window.parent.postMessage({
-                type: 'MOCKBIRD_OUTER_HTML_RESPONSE',
-                html: selectedEl.outerHTML
-              }, '*');
-            }
-            return;
-          }
-
-          if (!selectedEl) return;
-
-          if (ev.data.type === 'MOCKBIRD_UPDATE_ELEMENT') {
-            const { text, bg, color, borderRadius, padding } = ev.data.patch || {};
-            if (text !== undefined && selectedEl.children.length === 0) selectedEl.innerText = text;
-            if (bg) selectedEl.style.backgroundColor = bg;
-            if (color) selectedEl.style.color = color;
-            if (borderRadius) selectedEl.style.borderRadius = borderRadius;
-            if (padding) selectedEl.style.padding = padding;
-            emitHtmlChanged();
-          } else if (ev.data.type === 'MOCKBIRD_MOVE_UP') {
-            const prev = selectedEl.previousElementSibling;
-            if (prev) {
-              prev.before(selectedEl);
-              emitHtmlChanged();
-            }
-          } else if (ev.data.type === 'MOCKBIRD_MOVE_DOWN') {
-            const next = selectedEl.nextElementSibling;
-            if (next) {
-              next.after(selectedEl);
-              emitHtmlChanged();
-            }
-          } else if (ev.data.type === 'MOCKBIRD_DUPLICATE') {
-            const clone = selectedEl.cloneNode(true);
-            clone.classList.remove('mb-selected');
-            if (clone.hasAttribute('data-mb-id')) {
-              clone.setAttribute('data-mb-id', clone.getAttribute('data-mb-id') + '-copy');
-            }
-            selectedEl.after(clone);
-            selectElement(clone);
-            emitHtmlChanged();
-          } else if (ev.data.type === 'MOCKBIRD_DELETE') {
-            const parent = selectedEl.parentElement;
-            selectedEl.remove();
-            selectedEl = null;
-            selectElement(null);
-            emitHtmlChanged();
-          } else if (ev.data.type === 'MOCKBIRD_PATCH_ELEMENT') {
-            const newSnippet = (ev.data.html || '').trim();
-            const targetMbId = ev.data.mbId;
-            const targetSel = ev.data.selector;
-            let target = selectedEl;
-            if (!target && targetMbId) {
-              target = document.querySelector('[data-mb-id="' + targetMbId + '"]') || document.getElementById(targetMbId);
-            }
-            if (!target && targetSel) {
-              try { target = document.querySelector(targetSel); } catch(e) {}
-            }
-            if (target && newSnippet) {
-              const temp = document.createElement('div');
-              temp.innerHTML = newSnippet;
-              const newEl = temp.firstElementChild || temp;
-              target.replaceWith(newEl);
-              selectElement(newEl);
-              emitHtmlChanged();
-            }
-          }
-        });
-      </script>
-      <style>
-        :root { ${cssVars} }
-        body:not(.mb-interactive) [data-mb-id]:hover, body:not(.mb-interactive) *:hover {
-          outline: 1px dashed #5e6ad2 !important;
-          outline-offset: 1px;
-          cursor: pointer;
-        }
-        body:not(.mb-interactive) .mb-selected {
-          outline: 2px solid #5e6ad2 !important;
-          outline-offset: 2px;
-          box-shadow: 0 0 0 4px rgba(94, 106, 210, 0.25) !important;
-        }
-        body.mb-interactive * {
-          cursor: auto !important;
-        }
-      </style>
-    `;
-
-    const raw = (initialHtml || '').trim();
-
-    if (raw.toLowerCase().includes('<!doctype') || raw.toLowerCase().includes('<html')) {
-      const tailwindScript = '<script src="https://cdn.tailwindcss.com"></script>';
-      if (raw.includes('</head>')) {
-        return raw.replace('</head>', `${tailwindScript}${injectionScript}</head>`);
-      } else if (raw.includes('</body>')) {
-        return raw.replace('</body>', `${tailwindScript}${injectionScript}</body>`);
-      }
-      return `${raw}\n${tailwindScript}${injectionScript}`;
-    }
-
-    return `
-      <!doctype html>
-      <html lang="pt-BR">
-        <head>
-          <meta charset="utf-8" />
-          <meta name="viewport" content="width=device-width, initial-scale=1" />
-          <script src="https://cdn.tailwindcss.com"></script>
-          ${injectionScript}
-          <style>
-            body {
-              margin: 0;
-              padding: 0;
-              min-height: 100vh;
-              background-color: var(--color-bg, #09090b);
-              color: var(--color-text, #f4f4f5);
-              font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-              user-select: none;
-            }
-          </style>
-        </head>
-        <body>
-          <div id="mockbird-root" style="width: 100%; min-height: 100vh;">
-            ${raw || '<div class="min-h-screen flex items-center justify-center text-slate-500 font-mono text-xs">Tela vazia</div>'}
-          </div>
-        </body>
-      </html>
-    `;
-  }, [initialHtml, tokens, canvasMode]);
+  const builtHtmlDoc = useMemo(
+    () => buildCanvasDoc(docHtml, tokens),
+    [docHtml, tokens, docVersion]
+  );
 
   // Mensagens do iframe
   useEffect(() => {
     const handleMsg = (e: MessageEvent) => {
+      // Só aceita mensagens vindas do próprio canvas.
+      if (e.source !== iframeRef.current?.contentWindow) return;
       if (!e.data) return;
 
       if (e.data.type === 'MOCKBIRD_ELEMENT_SELECTED') {
         setSelectedMbId(e.data.mbId);
         setSelectedTag(e.data.tag);
+        setSelectionCount(Math.max(1, Number(e.data.count) || 1));
         if (onElementSelected) {
           onElementSelected({
             mbId: e.data.mbId,
             tag: e.data.tag,
             selector: e.data.selector,
             snippet: e.data.snippet,
+            leaf: e.data.leaf,
             styles: {
               text: e.data.text,
               ...e.data.styles,
@@ -512,10 +258,17 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
       } else if (e.data.type === 'MOCKBIRD_DESELECT') {
         setSelectedMbId(null);
         setSelectedTag('');
+        setSelectionCount(0);
         if (onElementSelected) onElementSelected(null);
+      } else if (e.data.type === 'MOCKBIRD_UNDO') {
+        onUndo?.();
+      } else if (e.data.type === 'MOCKBIRD_REDO') {
+        onRedo?.();
       } else if (e.data.type === 'MOCKBIRD_HTML_CHANGED') {
         prevInitialHtmlRef.current = e.data.html;
         onHtmlChange(e.data.html);
+      } else if (e.data.type === 'MOCKBIRD_NAVIGATE') {
+        onNavigate?.(String(e.data.target || ''), Boolean(e.data.external));
       } else if (e.data.type === 'MOCKBIRD_CLOSE_CONTEXT_MENU') {
         closeContextMenu();
       } else if (e.data.type === 'MOCKBIRD_CONTEXT_MENU') {
@@ -538,7 +291,7 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
 
     window.addEventListener('message', handleMsg);
     return () => window.removeEventListener('message', handleMsg);
-  }, [onHtmlChange, onElementSelected, scale, closeContextMenu]);
+  }, [onHtmlChange, onElementSelected, scale, closeContextMenu, onNavigate, onUndo, onRedo]);
 
   // Listener nativo de wheel para zoom com Ctrl/Meta e Pan com scroll
   useEffect(() => {
@@ -688,6 +441,7 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
 
   const handleCopyHtml = () => {
     const onResponse = (ev: MessageEvent) => {
+      if (ev.source !== iframeRef.current?.contentWindow) return;
       if (ev.data?.type === 'MOCKBIRD_OUTER_HTML_RESPONSE') {
         window.removeEventListener('message', onResponse);
         navigator.clipboard.writeText(ev.data.html || '');
@@ -744,6 +498,43 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
           backgroundSize: '22px 22px',
         }}
       >
+        {/* Barra da seleção: ações em grupo, inclusive com vários elementos */}
+        {selectionCount > 0 && (
+          <div className="absolute top-4 left-4 z-20 flex items-center gap-1 p-1 rounded-lg bg-mockbird-surface/95 border border-mockbird-border shadow-panel backdrop-blur-md text-xs">
+            <span className="px-2 py-1 font-medium text-slate-200 whitespace-nowrap">
+              {selectionCount === 1 ? '1 elemento' : `${selectionCount} elementos`}
+            </span>
+            <div className="h-4 w-px bg-mockbird-border" />
+            <button
+              type="button"
+              onClick={() => handleAction('MOCKBIRD_DUPLICATE')}
+              className="mb-btn-ghost !p-1.5"
+              title="Duplicar seleção"
+              aria-label="Duplicar seleção"
+            >
+              <Copy size={13} />
+            </button>
+            <button
+              type="button"
+              onClick={() => handleAction('MOCKBIRD_DELETE')}
+              className="mb-btn-ghost !p-1.5 hover:!text-rose-400"
+              title="Excluir seleção (Delete)"
+              aria-label="Excluir seleção"
+            >
+              <Trash2 size={13} />
+            </button>
+            <button
+              type="button"
+              onClick={() => handleAction('MOCKBIRD_DESELECT_ALL')}
+              className="mb-btn-ghost !p-1.5"
+              title="Limpar seleção (Esc)"
+              aria-label="Limpar seleção"
+            >
+              <X size={13} />
+            </button>
+          </div>
+        )}
+
         {/* Barra de Controles de Zoom Flutuante (Canto Inferior Esquerdo) */}
         <div className="absolute bottom-5 left-5 z-20 flex items-center gap-1 p-1 rounded-lg bg-mockbird-surface/95 border border-mockbird-border shadow-panel backdrop-blur-md">
           <button
@@ -801,7 +592,7 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
                 ? 'bg-mockbird-blue text-white shadow-sm'
                 : 'text-slate-400 hover:text-white'
             }`}
-            title="Modo Edição: Seleciona blocos, inspeciona e abre menu Mockbird"
+            title="Modo Edição: clique seleciona, Shift/Ctrl+clique acumula, arraste move e as alças redimensionam"
           >
             <MousePointer size={13} />
             <span>Editar</span>
@@ -814,7 +605,7 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
                 ? 'bg-emerald-600 text-white shadow-sm'
                 : 'text-slate-400 hover:text-white'
             }`}
-            title="Modo Interativo: Libera formulários, cliques e botão direito nativo da página"
+            title="Modo Mock: clique navega como na página. Shift+clique seleciona (e acumula) blocos para editar"
           >
             <Hand size={13} />
             <span>Interagir</span>
@@ -841,7 +632,9 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
             </span>
             <div className="flex items-center gap-3">
               <span className="text-[10px] text-slate-500">
-                Shift + Botão Dir: menu nativo da página
+                {canvasMode === 'interactive'
+                  ? 'Clique: interagir · Shift: selecionar/mover · Esc: limpar'
+                  : 'Clique: selecionar · Shift+clique: vários · Arraste: mover · Alças: redimensionar'}
               </span>
               <span className="font-mono text-[11px] text-slate-500 tabular-nums">
                 {width} × {height}
@@ -854,11 +647,15 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
             style={{ width: `${width}px`, height: `${height}px` }}
             className="bg-mockbird-surface border-x border-b border-mockbird-border rounded-b-xl overflow-hidden"
           >
+            {/* Sem allow-same-origin: HTML gerado por IA/MCP roda em origem opaca
+                e não consegue ler cookies nem chamar a API do app. */}
             <iframe
               key={`canvas_iframe_${docVersion}`}
               ref={iframeRef}
               srcDoc={builtHtmlDoc}
               title="Mockbird Canvas"
+              sandbox="allow-scripts allow-forms allow-modals"
+              onLoad={syncMode}
               className="w-full h-full border-0 bg-[#09090b]"
             />
           </div>

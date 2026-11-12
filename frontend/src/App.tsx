@@ -6,6 +6,9 @@ import { EditorPage } from './views/EditorPage';
 import { TeamPage } from './views/TeamPage';
 import { SettingsPage } from './views/SettingsPage';
 import { PresentationPage } from './views/PresentationPage';
+import { ResetPasswordPage } from './views/ResetPasswordPage';
+import { VerifyEmailPage } from './views/VerifyEmailPage';
+import { AcceptInvitePage } from './views/AcceptInvitePage';
 
 type ViewMode = 'dashboard' | 'editor' | 'team' | 'settings' | 'presentation';
 
@@ -19,6 +22,9 @@ export function App() {
   const [presentationSlug, setPresentationSlug] = useState<string | null>(null);
   const [memberCount, setMemberCount] = useState(1);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [emailStatus, setEmailStatus] = useState<any>(null);
+  const [resending, setResending] = useState(false);
+  const [resendMsg, setResendMsg] = useState<string | null>(null);
 
   // Parseador de URL para rotas reais no navegador
   const parseRouteFromUrl = useCallback(() => {
@@ -105,6 +111,7 @@ export function App() {
         setCurrentUser(user);
         loadProjects();
         loadMembersCount();
+        loadEmailStatus();
       } else {
         setCurrentUser(null);
       }
@@ -144,6 +151,30 @@ export function App() {
     }
   }, [activeProjectId, projects]);
 
+  const loadEmailStatus = async () => {
+    try {
+      const res = await fetch('/api/auth/email-status');
+      if (res.ok) setEmailStatus(await res.json());
+    } catch (e) {
+      console.error('Erro ao ler status de e-mail:', e);
+    }
+  };
+
+  const handleResendVerification = async () => {
+    setResending(true);
+    setResendMsg(null);
+    try {
+      const res = await fetch('/api/auth/resend-verification', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Falha ao reenviar.');
+      setResendMsg(data.status === 'already_verified' ? 'E-mail já confirmado.' : 'Link enviado. Confira sua caixa de entrada.');
+    } catch (err: any) {
+      setResendMsg(err.message || 'Falha ao reenviar.');
+    } finally {
+      setResending(false);
+    }
+  };
+
   const loadMembersCount = async () => {
     try {
       const res = await fetch('/api/org/members');
@@ -169,6 +200,24 @@ export function App() {
       try { localStorage.setItem('mockbird_last_project_id', newProj.id); } catch {}
       navigateTo(`/editor/${newProj.id}`);
     }
+  };
+
+  const handleImportDesign = async (file: File, name: string) => {
+    const form = new FormData();
+    form.append('file', file);
+    if (name.trim()) form.append('name', name.trim());
+    const res = await fetch('/api/projects/import/design', {
+      method: 'POST',
+      body: form,
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) {
+      throw new Error(data?.detail || 'Falha ao importar o corpus design/.');
+    }
+    await loadProjects();
+    setActiveProjectId(data.project.id);
+    try { localStorage.setItem('mockbird_last_project_id', data.project.id); } catch {}
+    navigateTo(`/editor/${data.project.id}`);
   };
 
   const handleDeleteProject = async (id: string) => {
@@ -243,6 +292,12 @@ export function App() {
     );
   }
 
+  // Páginas públicas de autenticação (funcionam com ou sem sessão)
+  const publicPath = window.location.pathname.replace(/\/+$/, '') || '/';
+  if (publicPath === '/reset-password') return <ResetPasswordPage />;
+  if (publicPath === '/verify-email') return <VerifyEmailPage />;
+  if (publicPath === '/accept-invite') return <AcceptInvitePage />;
+
   // Loading inicial
   if (loadingAuth) {
     return (
@@ -277,12 +332,30 @@ export function App() {
         user={currentUser}
         onLogout={handleLogout}
         activeProjectName={activeProject?.name}
-        activeProjectSlug={activeProject?.slug}
+        activeProjectId={activeProject?.id}
         collapsed={sidebarCollapsed}
         onToggleCollapsed={() => setSidebarCollapsed((c) => !c)}
       />
 
       <main className="flex-1 min-w-0 flex flex-col overflow-y-auto">
+        {emailStatus?.configured &&
+          emailStatus.require_verification &&
+          !currentUser.email_verified && (
+            <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-2.5 bg-amber-500/10 border-b border-amber-500/20 text-xs text-amber-200">
+              <span>Confirme seu e-mail para garantir o acesso à conta. Enviamos um link para {currentUser.email}.</span>
+              <div className="flex items-center gap-3">
+                {resendMsg && <span className="text-amber-100/80">{resendMsg}</span>}
+                <button
+                  onClick={handleResendVerification}
+                  disabled={resending}
+                  className="font-semibold text-amber-100 underline underline-offset-2 hover:text-white disabled:opacity-50"
+                >
+                  {resending ? 'Enviando…' : 'Reenviar link'}
+                </button>
+              </div>
+            </div>
+          )}
+
         {currentView === 'dashboard' && (
           <DashboardPage
             projects={projects}
@@ -292,6 +365,7 @@ export function App() {
               navigateTo(`/editor/${id}`);
             }}
             onCreateProject={handleCreateProject}
+            onImportDesign={handleImportDesign}
             onDeleteProject={handleDeleteProject}
             onDuplicateProject={handleDuplicateProject}
             onNavigate={handleSidebarNavigate}
@@ -328,7 +402,7 @@ export function App() {
         )}
 
         {currentView === 'settings' && (
-          <SettingsPage />
+          <SettingsPage currentUser={currentUser} />
         )}
       </main>
     </div>

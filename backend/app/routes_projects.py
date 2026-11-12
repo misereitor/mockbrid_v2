@@ -1,21 +1,92 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from typing import List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 import secrets
 
 from app.database import get_db
 from app.models import User, Workspace, Project, Canvas, Screen, DesignTokens, DataScenario, ScreenRevision, ProjectMember
-from app.schemas import ProjectCreate, ProjectOut, ScreenCreate, ScreenUpdate, ScreenOut, ProjectMemberCreate, ProjectMemberOut, ProjectVisibilityUpdate
-from app.routes_auth import get_current_user, require_editor, require_admin
-from app.authz import authorize_project, get_effective_project_role
+from app.schemas import DesignImportOut, ProjectCreate, ProjectOut, ScreenOut, ProjectMemberCreate, ProjectMemberOut, ProjectVisibilityUpdate
+from app.design_corpus import DesignCorpusError, build_design_corpus, parse_design_corpus
+from app.routes_auth import get_current_user, require_editor
+from app.authz import authorize_project
+from app.jsx import html_to_jsx
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
+
+DEFAULT_LIGHT_TOKENS = {
+    "color-primary": "#0f766e",
+    "color-bg": "#f8fafc",
+    "color-surface": "#ffffff",
+    "color-text": "#0f172a",
+    "color-border": "#e2e8f0",
+}
+DEFAULT_DARK_TOKENS = {
+    "color-primary": "#2dd4bf",
+    "color-bg": "#0b1220",
+    "color-surface": "#111a2e",
+    "color-text": "#e2e8f0",
+    "color-border": "#1e293b",
+}
+DEFAULT_SHARED_TOKENS = {"radius-md": "8px", "font-body": "Inter, sans-serif"}
+
+
+async def _create_project_shell(
+    db: AsyncSession,
+    current_user: User,
+    name: str,
+    description: str = "",
+    visibility: str = "private",
+    workspace_id: Optional[str] = None,
+    tokens_light: Optional[Dict[str, Any]] = None,
+    tokens_dark: Optional[Dict[str, Any]] = None,
+    tokens_shared: Optional[Dict[str, Any]] = None,
+) -> Project:
+    """Cria workspace (se preciso), projeto e tokens — sem canvas nem telas."""
+    if not workspace_id:
+        ws_res = await db.execute(
+            select(Workspace).where(Workspace.organization_id == current_user.organization_id).limit(1)
+        )
+        ws = ws_res.scalars().first()
+        if not ws:
+            ws = Workspace(name="Geral", slug="geral", organization_id=current_user.organization_id)
+            db.add(ws)
+            await db.flush()
+        workspace_id = ws.id
+
+    import re
+    import unicodedata
+    clean_name = unicodedata.normalize('NFKD', name).encode('ASCII', 'ignore').decode('ASCII')
+    proj_slug = re.sub(r'[^a-zA-Z0-9]+', '-', clean_name).strip('-').lower() + f"-{secrets.token_hex(2)}"
+    project = Project(
+        name=name,
+        slug=proj_slug,
+        description=description or "",
+        workspace_id=workspace_id,
+        owner_id=current_user.id,
+        visibility=visibility or "private",
+    )
+    db.add(project)
+    await db.flush()
+
+    tokens = DesignTokens(
+        project_id=project.id,
+        light_tokens=tokens_light or dict(DEFAULT_LIGHT_TOKENS),
+        dark_tokens=tokens_dark or dict(DEFAULT_DARK_TOKENS),
+        shared_tokens=tokens_shared or dict(DEFAULT_SHARED_TOKENS),
+    )
+    db.add(tokens)
+    await db.flush()
+    return project
 
 
 @router.get("", response_model=List[ProjectOut])
 async def list_projects(
     q: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -28,7 +99,7 @@ async def list_projects(
 
     # Se for admin ou owner da organização, vê todos os projetos
     if current_user.role in ["owner", "admin"]:
-        query = select(Project).where(Project.workspace_id.in_(ws_ids), Project.is_archived == False)
+        query = select(Project).where(Project.workspace_id.in_(ws_ids), Project.is_archived.is_(False))
     else:
         # Busca IDs de projetos onde o usuário é membro explicitamente
         m_query = await db.execute(select(ProjectMember.project_id).where(ProjectMember.user_id == current_user.id))
@@ -36,14 +107,15 @@ async def list_projects(
 
         query = select(Project).where(
             Project.workspace_id.in_(ws_ids),
-            Project.is_archived == False,
+            Project.is_archived.is_(False),
             (Project.visibility == "org") | (Project.owner_id == current_user.id) | (Project.id.in_(member_proj_ids))
         )
 
     if q and q.strip():
         query = query.where(Project.name.ilike(f"%{q.strip()}%"))
 
-    proj_query = await db.execute(query.order_by(Project.updated_at.desc()))
+    query = query.order_by(Project.updated_at.desc()).offset(max(0, offset)).limit(min(max(1, limit), 200))
+    proj_query = await db.execute(query)
     return proj_query.scalars().all()
 
 
@@ -53,56 +125,130 @@ async def create_project(
     current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
-    workspace_id = payload.workspace_id
-    if not workspace_id:
-        ws_res = await db.execute(
-            select(Workspace).where(Workspace.organization_id == current_user.organization_id).limit(1)
-        )
-        ws = ws_res.scalars().first()
-        if not ws:
-            ws = Workspace(name="Geral", slug="geral", organization_id=current_user.organization_id)
-            db.add(ws)
-            await db.flush()
-        workspace_id = ws.id
-
-    import re, unicodedata
-    clean_name = unicodedata.normalize('NFKD', payload.name).encode('ASCII', 'ignore').decode('ASCII')
-    proj_slug = re.sub(r'[^a-zA-Z0-9]+', '-', clean_name).strip('-').lower() + f"-{secrets.token_hex(2)}"
-    project = Project(
-        name=payload.name,
-        slug=proj_slug,
-        description=payload.description or "",
-        workspace_id=workspace_id,
-        owner_id=current_user.id,
-        visibility=payload.visibility or "private",
+    project = await _create_project_shell(
+        db,
+        current_user,
+        payload.name,
+        payload.description or "",
+        payload.visibility or "private",
+        workspace_id=payload.workspace_id,
     )
-    db.add(project)
-    await db.flush()
-
-    # Cria Tokens padrão
-    default_light = {
-        "color-primary": "#0f766e",
-        "color-bg": "#f8fafc",
-        "color-surface": "#ffffff",
-        "color-text": "#0f172a",
-        "color-border": "#e2e8f0"
-    }
-    default_dark = {
-        "color-primary": "#2dd4bf",
-        "color-bg": "#0b1220",
-        "color-surface": "#111a2e",
-        "color-text": "#e2e8f0",
-        "color-border": "#1e293b"
-    }
-    tokens = DesignTokens(
-        project_id=project.id,
-        light_tokens=default_light,
-        dark_tokens=default_dark,
-        shared_tokens={"radius-md": "8px", "font-body": "Inter, sans-serif"}
-    )
-    db.add(tokens)
 
     # Cria Canvas inicial
+    canvas = Canvas(
+        project_id=project.id,
+        name="Principal",
+        sort_order=0
+    )
+    db.add(canvas)
+    await db.flush()
+
+    # Cria Tela Principal inicial
+    initial_html = (
+        '<div class="flex flex-col items-center justify-center min-h-[500px] p-8 text-center" data-mb-id="root-hero">'
+        '  <h1 class="text-4xl font-bold mb-4" data-mb-id="hero-title">Bem-vindo ao Mockbird v2</h1>'
+        '  <p class="text-lg text-slate-500 max-w-md mb-6" data-mb-id="hero-desc">Este é o seu primeiro mock. Clique nos elementos para editar ou arraste para compor sua interface.</p>'
+        '  <button class="px-6 py-3 bg-teal-600 text-white rounded-lg font-medium shadow-md hover:bg-teal-700 transition" data-mb-id="hero-cta">Começar Agora</button>'
+        '</div>'
+    )
+    screen = Screen(
+        canvas_id=canvas.id,
+        name="Início",
+        is_entry=True,  # ⭐ Tela Principal
+        html_content=initial_html,
+        css_content="",
+        js_content="",
+        width=1440,
+        height=900
+    )
+    db.add(screen)
+    await db.flush()
+
+    project.entry_screen_id = screen.id
+    canvas.entry_screen_id = screen.id
+
+    await db.commit()
+    await db.refresh(project)
+    return project
+
+
+@router.post("/import/design", response_model=DesignImportOut)
+async def import_design_corpus(
+    file: UploadFile = File(...),
+    name: Optional[str] = Form(None),
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db)
+):
+    """Importa um ZIP com a pasta `design/` do Mockbird v1 como um novo projeto."""
+    blob = await file.read()
+    try:
+        parsed = parse_design_corpus(blob)
+    except DesignCorpusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    raw_name = (name or "").strip()
+    if not raw_name:
+        raw_name = Path(file.filename or "").stem.replace("_", " ").replace("-", " ").strip()
+    if not raw_name or raw_name.lower() in {"design", "zip", "corpus"}:
+        raw_name = "Projeto importado"
+
+    tokens = parsed["tokens"]
+    project = await _create_project_shell(
+        db,
+        current_user,
+        raw_name,
+        "Importado do corpus design/ do Mockbird v1.",
+        tokens_light=tokens["light"] or None,
+        tokens_dark=tokens["dark"] or None,
+        tokens_shared=tokens["shared"] or None,
+    )
+
+    entry_screen_id: Optional[str] = None
+    screen_total = 0
+    for order, canvas_data in enumerate(parsed["canvases"]):
+        canvas = Canvas(
+            project_id=project.id,
+            name=canvas_data["name"][:255],
+            sort_order=order,
+        )
+        db.add(canvas)
+        await db.flush()
+
+        first_screen: Optional[Screen] = None
+        for index, data in enumerate(canvas_data["screens"]):
+            screen = Screen(
+                canvas_id=canvas.id,
+                name=data["name"][:255],
+                is_entry=(index == 0),
+                screen_kind=data.get("screen_kind") or "page",
+                device_type=data.get("device_type") or "desktop",
+                width=data["width"],
+                height=data["height"],
+                pos_x=index * 40,
+                html_content=data["html_content"],
+            )
+            db.add(screen)
+            await db.flush()
+            if first_screen is None:
+                first_screen = screen
+            screen_total += 1
+
+        if first_screen is not None:
+            canvas.entry_screen_id = first_screen.id
+            if entry_screen_id is None:
+                entry_screen_id = first_screen.id
+
+    project.entry_screen_id = entry_screen_id
+    await db.commit()
+    await db.refresh(project)
+
+    return DesignImportOut(
+        project=project,
+        canvases=len(parsed["canvases"]),
+        screens=screen_total,
+        warnings=parsed["warnings"],
+    )
+
     canvas = Canvas(
         project_id=project.id,
         name="Principal",
@@ -152,10 +298,13 @@ async def get_project(
 @router.delete("/{project_id}")
 async def delete_project(
     project_id: str,
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
-    """Exclui um projeto e todos os seus recursos vinculados (canvases, telas, tokens)."""
+    """Exclui um projeto e todos os seus recursos vinculados (canvases, telas, tokens).
+
+    A autorização é a mesma das demais ações (admin do projeto ou da organização),
+    em vez de exigir admin global da organização."""
     project = await _get_project_for_user(project_id, current_user, db, action="delete")
     await db.delete(project)
     await db.commit()
@@ -186,6 +335,8 @@ async def update_project_visibility(
 @router.get("/{project_id}/members", response_model=List[ProjectMemberOut])
 async def list_project_members(
     project_id: str,
+    limit: int = 100,
+    offset: int = 0,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -194,6 +345,8 @@ async def list_project_members(
         select(ProjectMember, User)
         .join(User, User.id == ProjectMember.user_id)
         .where(ProjectMember.project_id == project_id)
+        .offset(max(0, offset))
+        .limit(min(max(1, limit), 200))
     )
     members_out = []
     for pm, u in res.all():
@@ -211,7 +364,7 @@ async def add_project_member(
     current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
-    project = await authorize_project(project_id, current_user, "admin", db)
+    await authorize_project(project_id, current_user, "admin", db)
 
     user_res = await db.execute(
         select(User).where(
@@ -255,7 +408,7 @@ async def remove_project_member(
     current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db)
 ):
-    project = await authorize_project(project_id, current_user, "admin", db)
+    await authorize_project(project_id, current_user, "admin", db)
     res = await db.execute(
         select(ProjectMember).where(
             ProjectMember.project_id == project_id,
@@ -274,6 +427,8 @@ async def remove_project_member(
 @router.get("/{project_id}/screens", response_model=List[ScreenOut])
 async def list_project_screens(
     project_id: str,
+    limit: int = 100,
+    offset: int = 0,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -284,6 +439,8 @@ async def list_project_screens(
         .join(Canvas, Canvas.id == Screen.canvas_id)
         .where(Canvas.project_id == project_id)
         .order_by(Screen.is_entry.desc(), Screen.created_at.asc())
+        .offset(max(0, offset))
+        .limit(min(max(1, limit), 200))
     )
     return result.scalars().all()
 
@@ -442,15 +599,13 @@ async def export_project_bundle(
 
     bundle_screens = []
     for s in screens:
-        component_name = "".join(w.capitalize() for w in s.name.split()) + "Screen"
-        clean_jsx = s.html_content.replace('class="', 'className="')
         bundle_screens.append({
             "id": s.id,
             "name": s.name,
             "is_entry": s.is_entry,
             "html": s.html_content,
             "css": s.css_content,
-            "react_component": f"export function {component_name}() {{\n  return (\n    {clean_jsx}\n  );\n}}"
+            "react_component": html_to_jsx(s.html_content, s.name),
         })
 
     return {
@@ -465,3 +620,60 @@ async def export_project_bundle(
         },
         "screens": bundle_screens
     }
+
+
+@router.get("/{project_id}/export/design")
+async def export_design_corpus(
+    project_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Exporta o projeto no layout `design/` do Mockbird v1 (reimportável)."""
+    project = await _get_project_for_user(project_id, current_user, db)
+
+    tokens_res = await db.execute(select(DesignTokens).where(DesignTokens.project_id == project_id))
+    tokens = tokens_res.scalars().first()
+
+    canvases_res = await db.execute(
+        select(Canvas)
+        .where(Canvas.project_id == project_id)
+        .order_by(Canvas.sort_order.asc(), Canvas.created_at.asc())
+    )
+
+    payload_canvases = []
+    for canvas in canvases_res.scalars().all():
+        screens_res = await db.execute(
+            select(Screen)
+            .where(Screen.canvas_id == canvas.id)
+            .order_by(Screen.is_entry.desc(), Screen.created_at.asc())
+        )
+        payload_canvases.append({
+            "name": canvas.name,
+            "screens": [
+                {
+                    "name": s.name,
+                    "html_content": s.html_content,
+                    "css_content": s.css_content,
+                    "js_content": s.js_content,
+                    "width": s.width,
+                    "height": s.height,
+                    "device_type": s.device_type,
+                }
+                for s in screens_res.scalars().all()
+            ],
+        })
+
+    blob = build_design_corpus(
+        project.name,
+        {
+            "light": tokens.light_tokens if tokens else {},
+            "dark": tokens.dark_tokens if tokens else {},
+        },
+        payload_canvases,
+    )
+    filename = f"design-{project.slug or 'projeto'}.zip"
+    return Response(
+        content=blob,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

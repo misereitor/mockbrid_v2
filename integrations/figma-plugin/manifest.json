@@ -1,0 +1,11 @@
+{
+  "name": "Mockbird Import",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma"],
+  "networkAccess": {
+    "allowedDomains": ["*"],
+    "reason": "Baixar as imagens referenciadas pelas telas exportadas do Mockbird."
+  }
+}

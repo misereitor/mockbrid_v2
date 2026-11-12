@@ -14,8 +14,10 @@ import {
   AlertCircle, 
   CheckCircle2,
   Globe,
-  Sliders
+  Sliders,
+  Mail
 } from 'lucide-react';
+import { EmailSettingsPanel } from '../components/EmailSettingsPanel';
 
 interface AIProviderData {
   id?: string;
@@ -28,6 +30,7 @@ interface AIProviderData {
 
 interface SettingsPageProps {
   onNotify?: (msg: string) => void;
+  currentUser?: { is_system_admin?: boolean } | null;
 }
 
 const PRESET_PROVIDERS = [
@@ -50,8 +53,8 @@ const POPULAR_SUGGESTIONS = [
   { label: 'DeepSeek V3', model: 'deepseek/deepseek-chat' },
 ];
 
-export const SettingsPage: React.FC<SettingsPageProps> = () => {
-  const [activeTab, setActiveTab] = useState<'ai' | 'mcp' | 'org'>('ai');
+export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
+  const [activeTab, setActiveTab] = useState<'ai' | 'mcp' | 'org' | 'email'>('ai');
 
   // AI Config State
   const [providerType, setProviderType] = useState('openrouter');
@@ -72,6 +75,45 @@ export const SettingsPage: React.FC<SettingsPageProps> = () => {
   const [testResult, setTestResult] = useState<{ status: 'ok' | 'error'; message: string } | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [copiedMcp, setCopiedMcp] = useState<string | null>(null);
+
+  // Plano de IA da organização
+  const [usage, setUsage] = useState<any>(null);
+  const [plans, setPlans] = useState<any[]>([]);
+  const [userRole, setUserRole] = useState('');
+  const [assigningPlan, setAssigningPlan] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch('/api/auth/me')
+      .then(r => (r.ok ? r.json() : null))
+      .then(u => u && setUserRole(u.role))
+      .catch(() => {});
+    fetch('/api/org/ai-usage')
+      .then(r => (r.ok ? r.json() : null))
+      .then(setUsage)
+      .catch(() => {});
+    fetch('/api/ai/plans')
+      .then(r => (r.ok ? r.json() : []))
+      .then(setPlans)
+      .catch(() => {});
+  }, []);
+
+  const handleAssignPlan = async (planSlug: string) => {
+    setAssigningPlan(planSlug);
+    try {
+      const res = await fetch('/api/org/plan', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ plan_slug: planSlug }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Falha ao trocar de plano');
+      setUsage(data);
+    } catch (err: any) {
+      alert(err.message);
+    } finally {
+      setAssigningPlan(null);
+    }
+  };
 
   // Carrega configurações existentes
   useEffect(() => {
@@ -261,6 +303,20 @@ export const SettingsPage: React.FC<SettingsPageProps> = () => {
             <ShieldCheck size={14} />
             <span>Organização & Segurança</span>
           </button>
+
+          {currentUser?.is_system_admin && (
+            <button
+              onClick={() => setActiveTab('email')}
+              className={`px-4 py-2 rounded-lg text-xs font-semibold flex items-center gap-2 transition-all ${
+                activeTab === 'email'
+                  ? 'bg-mockbird-blue text-white shadow-sm'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <Mail size={14} />
+              <span>E-mail</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -645,6 +701,89 @@ export const SettingsPage: React.FC<SettingsPageProps> = () => {
               <div className="text-[11px] text-slate-500 mt-1">Testes isolados antes da publicação em produção.</div>
             </div>
           </div>
+
+          {/* Plano de IA da organização */}
+          <div className="border-t border-mockbird-border pt-6 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                  <Sparkles size={16} className="text-mockbird-cyan" /> Plano de IA
+                </h3>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  O limite do plano prevalece sobre o limite individual de cada usuário.
+                </p>
+              </div>
+              {usage && (
+                <div className="text-right text-xs text-slate-400">
+                  <div className="font-mono text-white">
+                    {Number(usage.tokens_used_month).toLocaleString('pt-BR')} /{' '}
+                    {Number(usage.monthly_token_limit).toLocaleString('pt-BR')} tokens
+                  </div>
+                  <div className="w-48 h-1.5 bg-mockbird-bg rounded-full mt-1 overflow-hidden">
+                    <div
+                      className="h-full bg-mockbird-blue"
+                      style={{
+                        width: `${Math.min(100, (usage.tokens_used_month / Math.max(1, usage.monthly_token_limit)) * 100)}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              {plans.map(plan => {
+                const isCurrent = usage?.plan?.slug === plan.slug;
+                return (
+                  <div
+                    key={plan.slug}
+                    className={`p-4 rounded-xl border flex flex-col gap-2 ${
+                      isCurrent
+                        ? 'bg-mockbird-blue/10 border-mockbird-cyan'
+                        : 'bg-mockbird-surface border-mockbird-border'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-white text-sm">{plan.name}</span>
+                      {isCurrent && <Check size={14} className="text-mockbird-cyan" />}
+                    </div>
+                    <div className="text-[11px] text-slate-400">{plan.description}</div>
+                    <div className="text-xs text-slate-300 font-mono">
+                      {Number(plan.monthly_token_limit).toLocaleString('pt-BR')} tokens/mês
+                    </div>
+                    <div className="text-[11px] text-slate-500">
+                      {plan.price_cents ? `R$ ${(plan.price_cents / 100).toFixed(2)}/mês` : 'Grátis'}
+                    </div>
+                    <button
+                      type="button"
+                      disabled={isCurrent || assigningPlan !== null || (userRole !== 'owner' && !isCurrent)}
+                      onClick={() => handleAssignPlan(plan.slug)}
+                      className={`mt-auto text-xs font-semibold py-1.5 rounded-lg transition-all disabled:opacity-40 ${
+                        isCurrent
+                          ? 'bg-mockbird-card text-slate-300'
+                          : 'bg-mockbird-blue hover:bg-mockbird-bluedark text-white'
+                      }`}
+                    >
+                      {isCurrent ? 'Plano atual' : assigningPlan === plan.slug ? 'Aplicando…' : 'Usar este plano'}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+            {userRole && userRole !== 'owner' && (
+              <p className="text-[11px] text-slate-500">Apenas o owner da organização pode trocar de plano.</p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'email' && currentUser?.is_system_admin && (
+        <div className="space-y-6">
+          <EmailSettingsPanel />
+          <p className="text-[11px] text-slate-500 flex items-center gap-2">
+            <ShieldCheck size={13} />
+            Apenas o administrador do sistema (primeira conta criada) vê esta aba. As credenciais são cifradas no banco.
+          </p>
         </div>
       )}
     </div>

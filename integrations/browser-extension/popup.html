@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body {
+        width: 340px;
+        margin: 0;
+        padding: 14px;
+        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 12px;
+        background: #101014;
+        color: #f4f4f5;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      h1 { margin: 0; font-size: 13px; font-weight: 600; }
+      p { margin: 0; color: #a1a1aa; line-height: 1.5; }
+      .actions { display: flex; gap: 8px; }
+      button {
+        flex: 1;
+        border: 0;
+        border-radius: 8px;
+        padding: 9px 10px;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        color: #04211e;
+        background: #2dd4bf;
+      }
+      button.secondary {
+        color: #e4e4e7;
+        background: #27272a;
+        border: 1px solid #3f3f46;
+      }
+      button:disabled { opacity: 0.45; cursor: default; }
+      .status { min-height: 16px; color: #a1a1aa; line-height: 1.5; word-break: break-word; }
+      .status.error { color: #f87171; }
+      .status.ok { color: #4ade80; }
+      ul { margin: 0; padding-left: 16px; color: #a1a1aa; line-height: 1.6; }
+    </style>
+  </head>
+  <body>
+    <h1>Capturar página para o Mockbird</h1>
+    <p>Transforma a página atual em camadas editáveis para importar no Figma ou Penpot.</p>
+
+    <button id="capture">Capturar página</button>
+    <div class="actions">
+      <button id="download" class="secondary" disabled>Baixar .mockbird.json</button>
+      <button id="copy" class="secondary" disabled>Copiar JSON</button>
+    </div>
+    <div class="status" id="status"></div>
+    <ul>
+      <li>Retângulos com fundo/borda e textos viram camadas.</li>
+      <li>Imagens entram por URL (podem falhar se exigirem login).</li>
+      <li>Sombras, gradientes e filtros não são reproduzidos.</li>
+    </ul>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

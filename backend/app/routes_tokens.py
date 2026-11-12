@@ -1,11 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from pydantic import BaseModel
 from typing import Dict, Any
 
 from app.database import get_db
-from app.models import User, DesignTokens, Project, Workspace
+from app.models import User, DesignTokens, Project
 from app.routes_auth import get_current_user, require_editor
 from app.authz import authorize_project
 

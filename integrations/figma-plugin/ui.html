@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <title>Mockbird Import</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #ffffff;
+        --surface: #f4f4f5;
+        --border: #e4e4e7;
+        --text: #18181b;
+        --muted: #71717a;
+        --accent: #2563eb;
+        --danger: #dc2626;
+        --ok: #16a34a;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #18181b;
+          --surface: #232326;
+          --border: #3f3f46;
+          --text: #f4f4f5;
+          --muted: #a1a1aa;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 16px;
+        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 12px;
+        background: var(--bg);
+        color: var(--text);
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        height: 100vh;
+      }
+      h1 { margin: 0; font-size: 13px; font-weight: 600; }
+      p { margin: 0; color: var(--muted); line-height: 1.5; }
+      .drop {
+        border: 1px dashed var(--border);
+        border-radius: 8px;
+        padding: 14px;
+        text-align: center;
+        background: var(--surface);
+        cursor: pointer;
+        transition: border-color 0.15s, background 0.15s;
+      }
+      .drop:hover, .drop.over { border-color: var(--accent); }
+      .drop strong { display: block; margin-bottom: 2px; font-size: 12px; }
+      textarea {
+        flex: 1;
+        min-height: 110px;
+        width: 100%;
+        resize: none;
+        padding: 8px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: var(--surface);
+        color: var(--text);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 11px;
+        line-height: 1.5;
+      }
+      textarea:focus { outline: 1px solid var(--accent); }
+      button {
+        border: 0;
+        border-radius: 8px;
+        padding: 10px 12px;
+        font-size: 12px;
+        font-weight: 600;
+        color: #fff;
+        background: var(--accent);
+        cursor: pointer;
+      }
+      button:disabled { opacity: 0.6; cursor: default; }
+      .status { min-height: 16px; font-size: 11px; line-height: 1.5; }
+      .status.error { color: var(--danger); }
+      .status.ok { color: var(--ok); }
+      .warnings { margin: 0; padding-left: 16px; color: var(--muted); max-height: 72px; overflow: auto; }
+      .hidden { display: none; }
+    </style>
+  </head>
+  <body>
+    <h1>Importar telas do Mockbird</h1>
+    <p>
+      No Mockbird, abra o projeto e clique em <strong>Figma/Penpot</strong> para baixar o
+      arquivo <code>.mockbird.json</code>.
+    </p>
+
+    <label class="drop" id="drop">
+      <input type="file" id="file" accept=".json,application/json" class="hidden" />
+      <strong>Escolher arquivo</strong>
+      <span>ou arraste o .mockbird.json aqui</span>
+    </label>
+
+    <textarea id="json" spellcheck="false" placeholder="…ou cole o conteúdo do bundle aqui"></textarea>
+
+    <button id="run" disabled>Importar para o Figma</button>
+    <div class="status" id="status"></div>
+    <ul class="warnings hidden" id="warnings"></ul>
+
+    <script>
+      const drop = document.getElementById('drop');
+      const fileInput = document.getElementById('file');
+      const jsonInput = document.getElementById('json');
+      const runButton = document.getElementById('run');
+      const statusEl = document.getElementById('status');
+      const warningsEl = document.getElementById('warnings');
+
+      function setStatus(text, kind) {
+        statusEl.textContent = text || '';
+        statusEl.className = 'status' + (kind ? ' ' + kind : '');
+      }
+
+      function refreshButton() {
+        runButton.disabled = !jsonInput.value.trim();
+      }
+
+      async function readFile(file) {
+        if (!file) return;
+        const text = await file.text();
+        jsonInput.value = text;
+        refreshButton();
+        try {
+          const parsed = JSON.parse(text);
+          const screens = Array.isArray(parsed.screens) ? parsed.screens.length : 0;
+          setStatus(screens ? `${screens} tela(s) no arquivo.` : 'Arquivo sem telas.', screens ? 'ok' : 'error');
+        } catch (error) {
+          setStatus('JSON inválido: ' + error.message, 'error');
+        }
+      }
+
+      drop.addEventListener('click', () => fileInput.click());
+      fileInput.addEventListener('change', () => readFile(fileInput.files && fileInput.files[0]));
+      jsonInput.addEventListener('input', refreshButton);
+
+      ['dragenter', 'dragover'].forEach((eventName) => {
+        drop.addEventListener(eventName, (event) => {
+          event.preventDefault();
+          drop.classList.add('over');
+        });
+      });
+      ['dragleave', 'drop'].forEach((eventName) => {
+        drop.addEventListener(eventName, (event) => {
+          event.preventDefault();
+          drop.classList.remove('over');
+        });
+      });
+      drop.addEventListener('drop', (event) => {
+        const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
+        readFile(file);
+      });
+
+      runButton.addEventListener('click', () => {
+        const raw = jsonInput.value.trim();
+        if (!raw) return;
+        runButton.disabled = true;
+        warningsEl.classList.add('hidden');
+        warningsEl.innerHTML = '';
+        setStatus('Importando…');
+        parent.postMessage({ pluginMessage: { type: 'import', json: raw } }, '*');
+      });
+
+      window.addEventListener('message', (event) => {
+        const message = event.data && event.data.pluginMessage;
+        if (!message) return;
+        if (message.type === 'progress') {
+          setStatus(`Importando tela ${message.done} de ${message.total}…`);
+          return;
+        }
+        if (message.type === 'done') {
+          const skipped = message.skipped ? ` (${message.skipped} camada(s) ignorada(s))` : '';
+          setStatus(`${message.screens} tela(s) e ${message.layers} camada(s) importadas${skipped}.`, 'ok');
+          if (Array.isArray(message.warnings) && message.warnings.length) {
+            warningsEl.classList.remove('hidden');
+            message.warnings.forEach((text) => {
+              const item = document.createElement('li');
+              item.textContent = text;
+              warningsEl.appendChild(item);
+            });
+          }
+          runButton.disabled = false;
+          return;
+        }
+        if (message.type === 'error') {
+          setStatus(message.message, 'error');
+          runButton.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

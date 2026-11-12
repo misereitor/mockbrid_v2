@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useRef, useState, useMemo } from 'react';
 import {
   Plus,
   Search,
@@ -13,7 +13,9 @@ import {
   FolderKanban,
   Plug,
   Trash2,
+  Upload,
 } from 'lucide-react';
+import { copyPresentationLink, openPresentation } from '../lib/presentation';
 
 export interface ProjectSummary {
   id: string;
@@ -29,6 +31,7 @@ interface DashboardPageProps {
   projects: ProjectSummary[];
   onSelectProject: (projectId: string) => void;
   onCreateProject: (name: string, description: string) => Promise<void>;
+  onImportDesign?: (file: File, name: string) => Promise<void>;
   onDeleteProject?: (projectId: string) => Promise<void> | void;
   onDuplicateProject?: (projectId: string) => Promise<void> | void;
   onNavigate: (view: 'dashboard' | 'editor' | 'team' | 'settings' | 'presentation') => void;
@@ -46,6 +49,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   projects,
   onSelectProject,
   onCreateProject,
+  onImportDesign,
   onDeleteProject,
   onDuplicateProject,
   onNavigate,
@@ -57,6 +61,23 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   const [creating, setCreating] = useState(false);
   const [copiedSlug, setCopiedSlug] = useState<string | null>(null);
   const [query, setQuery] = useState('');
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+  const importInputRef = useRef<HTMLInputElement>(null);
+
+  const handleImport = async (file?: File) => {
+    if (!file || !onImportDesign) return;
+    setImporting(true);
+    setImportError(null);
+    try {
+      await onImportDesign(file, file.name.replace(/\.zip$/i, ''));
+    } catch (err: any) {
+      setImportError(err.message || 'Falha ao importar o corpus design/.');
+    } finally {
+      setImporting(false);
+      if (importInputRef.current) importInputRef.current.value = '';
+    }
+  };
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -72,10 +93,14 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     }
   };
 
-  const copyPresentationLink = (slug: string) => {
-    navigator.clipboard.writeText(`${window.location.origin}/p/${slug}`);
-    setCopiedSlug(slug);
-    setTimeout(() => setCopiedSlug(null), 2000);
+  const handleCopyPresentation = async (projectId: string, slug: string) => {
+    try {
+      await copyPresentationLink(projectId);
+      setCopiedSlug(slug);
+      setTimeout(() => setCopiedSlug(null), 2000);
+    } catch {
+      setCopiedSlug(null);
+    }
   };
 
   const filtered = useMemo(() => {
@@ -106,6 +131,27 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
           <button onClick={() => onNavigate('settings')} className="mb-btn-outline">
             <Plug size={14} /> IA &amp; MCP
           </button>
+          {onImportDesign && (
+            <>
+              <input
+                ref={importInputRef}
+                type="file"
+                accept=".zip,application/zip"
+                className="hidden"
+                aria-label="Importar corpus design"
+                onChange={(e) => handleImport(e.target.files?.[0])}
+              />
+              <button
+                type="button"
+                onClick={() => importInputRef.current?.click()}
+                disabled={importing}
+                className="mb-btn-outline"
+                title="Importa um ZIP com a pasta design/ (canvas.json + telas HTML + tokens.json) do Mockbird v1"
+              >
+                <Upload size={14} /> {importing ? 'Importando…' : 'Importar design/'}
+              </button>
+            </>
+          )}
           <button onClick={() => setShowCreateForm(true)} className="mb-btn-primary">
             <Plus size={14} /> Novo projeto
           </button>
@@ -124,6 +170,15 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
           </div>
         ))}
       </div>
+
+      {importError && (
+        <div className="mb-panel !border-red-500/40 bg-red-500/10 px-4 py-3 text-xs text-red-300 flex items-start justify-between gap-3">
+          <span>{importError}</span>
+          <button type="button" onClick={() => setImportError(null)} className="mb-btn-ghost !p-1" aria-label="Fechar erro">
+            <X size={14} />
+          </button>
+        </div>
+      )}
 
       {/* Criação */}
       {showCreateForm && (
@@ -222,18 +277,16 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                     <div className="flex items-center justify-between pt-3 border-t border-mockbird-border">
                       <span className="text-[11px] text-slate-500">{count} {count === 1 ? 'tela' : 'telas'}</span>
                       <div className="flex items-center gap-0.5">
-                        <a
-                          href={`/p/${proj.slug}`}
-                          target="_blank"
-                          rel="noreferrer"
+                        <button
+                          onClick={() => { openPresentation(proj.id).catch(() => {}); }}
                           className="mb-btn-ghost !p-1.5"
                           title="Abrir apresentação"
                           aria-label="Abrir apresentação"
                         >
                           <MonitorPlay size={14} />
-                        </a>
+                        </button>
                         <button
-                          onClick={() => copyPresentationLink(proj.slug)}
+                          onClick={() => handleCopyPresentation(proj.id, proj.slug)}
                           className="mb-btn-ghost !p-1.5"
                           title="Copiar link de apresentação"
                           aria-label="Copiar link de apresentação"

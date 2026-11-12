@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from pydantic import BaseModel, EmailStr
@@ -6,12 +6,24 @@ from typing import List, Optional
 from datetime import datetime, timedelta
 import secrets
 
+import logging
+
 from app.database import get_db
-from app.models import User, Organization, Workspace, Project, OrganizationInvite
+from app.mailer import (
+    EmailDeliveryError,
+    EmailNotConfigured,
+    build_link,
+    get_email_settings,
+    provider_ready,
+    send_invite_email,
+)
+from app.models import User, Workspace, Organization, OrganizationInvite
 from app.routes_auth import get_current_user, require_admin
-from app.auth import hash_password, create_access_token
+from app.auth import hash_password
+from app.timeutils import utcnow
 
 router = APIRouter(prefix="/api/org", tags=["organization"])
+logger = logging.getLogger(__name__)
 
 
 class MemberInvite(BaseModel):
@@ -34,6 +46,7 @@ class MemberOut(BaseModel):
     created_at: datetime
     invite_token: Optional[str] = None
     invite_url: Optional[str] = None
+    email_sent: Optional[bool] = None
 
     class Config:
         from_attributes = True
@@ -90,7 +103,10 @@ async def invite_member(
         email=payload.email,
         name=resolved_name,
         role=payload.role,
-        password_hash=hash_password(initial_password)
+        password_hash=hash_password(initial_password),
+        # O convite chega no e-mail; a posse da caixa já foi comprovada.
+        email_verified=True,
+        email_verified_at=utcnow(),
     )
     db.add(new_user)
     await db.flush()
@@ -101,7 +117,7 @@ async def invite_member(
         email=payload.email,
         role=payload.role,
         token=invite_token,
-        expires_at=datetime.utcnow() + timedelta(hours=48)
+        expires_at=utcnow() + timedelta(hours=48)
     )
     db.add(invite)
     await db.commit()
@@ -110,6 +126,27 @@ async def invite_member(
     out = MemberOut.model_validate(new_user)
     out.invite_token = invite_token
     out.invite_url = f"/accept-invite?token={invite_token}"
+    out.email_sent = False
+
+    # Envio best-effort: se o e-mail falhar, o admin ainda recebe o link.
+    try:
+        email_settings = await get_email_settings(db)
+        if provider_ready(email_settings):
+            org = await db.get(Organization, current_user.organization_id)
+            await send_invite_email(
+                db,
+                to=payload.email,
+                inviter_name=current_user.name,
+                organization_name=org.name if org else "sua organização",
+                role=payload.role,
+                url=build_link(email_settings, f"/accept-invite?token={invite_token}"),
+            )
+            out.email_sent = True
+    except (EmailNotConfigured, EmailDeliveryError) as exc:
+        logger.warning("Convite para %s não enviado por e-mail: %s", payload.email, exc)
+    except Exception:
+        logger.exception("Convite para %s: falha inesperada no envio", payload.email)
+
     return out
 
 
@@ -125,7 +162,7 @@ async def accept_invite(
         )
     )
     invite = res.scalars().first()
-    if not invite or invite.expires_at < datetime.utcnow():
+    if not invite or invite.expires_at < utcnow():
         raise HTTPException(status_code=400, detail="Convite inválido ou expirado")
 
     user_res = await db.execute(select(User).where(User.email == invite.email))
@@ -144,7 +181,7 @@ async def accept_invite(
         if payload.name:
             user.name = payload.name.strip()
 
-    invite.used_at = datetime.utcnow()
+    invite.used_at = utcnow()
     await db.commit()
     return {"status": "success", "message": "Convite aceito com sucesso", "email": invite.email}
 

@@ -9,6 +9,7 @@ import {
   PanelLeftOpen,
   ExternalLink,
 } from 'lucide-react';
+import { openPresentation } from '../lib/presentation';
 
 type View = 'dashboard' | 'editor' | 'team' | 'settings' | 'presentation';
 
@@ -18,7 +19,7 @@ interface SidebarProps {
   user: { email: string; name?: string; full_name?: string; role?: string } | null;
   onLogout: () => void;
   activeProjectName?: string;
-  activeProjectSlug?: string;
+  activeProjectId?: string;
   collapsed: boolean;
   onToggleCollapsed: () => void;
 }
@@ -36,7 +37,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   user,
   onLogout,
   activeProjectName,
-  activeProjectSlug,
+  activeProjectId,
   collapsed,
   onToggleCollapsed,
 }) => {
@@ -93,15 +94,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <div className="px-2.5 text-[10px] font-medium uppercase tracking-wider text-slate-500 mb-1.5">Projeto ativo</div>
             <div className="px-2.5 py-2 rounded-md bg-mockbird-bg border border-mockbird-border">
               <div className="text-xs font-medium text-slate-200 truncate">{activeProjectName}</div>
-              {activeProjectSlug && (
-                <a
-                  href={`/p/${activeProjectSlug}`}
-                  target="_blank"
-                  rel="noreferrer"
+              {activeProjectId && (
+                <button
+                  onClick={() => { openPresentation(activeProjectId).catch(() => {}); }}
                   className="mt-1 inline-flex items-center gap-1 text-[11px] text-slate-500 hover:text-mockbird-cyan transition-colors"
+                  title={`Abrir apresentação de ${activeProjectName || ''}`}
                 >
                   Apresentação <ExternalLink size={10} />
-                </a>
+                </button>
               )}
             </div>
           </div>

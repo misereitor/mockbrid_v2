@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Mockbird — Capturar página",
+  "version": "1.0.0",
+  "description": "Captura a página atual como camadas editáveis no formato de bundle do Mockbird (Figma/Penpot).",
+  "action": {
+    "default_title": "Capturar página para o Mockbird",
+    "default_popup": "popup.html"
+  },
+  "permissions": ["activeTab", "scripting"]
+}

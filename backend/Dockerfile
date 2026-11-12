@@ -15,5 +15,7 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# Aplica migrações pendentes antes de subir a API: um volume novo (ou um deploy
+# em ambiente limpo) passa a ter esquema sem intervenção manual.
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"]
 

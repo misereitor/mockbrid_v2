@@ -1,7 +1,7 @@
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from typing import Optional, List
+from typing import Optional
 
 from app.models import User, Project, Workspace, Canvas, Screen, ProjectMember
 

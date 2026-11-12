@@ -1,827 +1,1023 @@
-import os
+"""Grafo do agente de UI.
+
+Correções importantes em relação à versão anterior:
+
+* Nenhum HTML fictício é inventado quando a LLM falha — o erro real é propagado.
+* Os timeouts vêm de `settings` (antes eram 6s em homologação, insuficientes para
+  um modelo local).
+* A geração de tela completa é feita **por seção**: cada chamada é menor, é
+  validada isoladamente e pode ser refeita sem descartar o restante.
+* Todo patch passa por `htmlkit.validate_and_repair`; se o validador reprovar, o
+  agente pede uma correção ao modelo com a lista de defeitos (máx. 2 tentativas).
+"""
+
+import asyncio
 import json
 import re
-from typing import AsyncGenerator, Dict, Any, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
+
 import httpx
 
+from app.config import settings
 from app.agent.state import AgentState, PlanStep, ToolCallRecord
 from app.agent.tools import (
-    extract_dom_structure, 
+    extract_dom_structure,
     extract_element_snippet,
     diagnose_layout_issues,
-    verify_ui_quality
+    verify_ui_quality,
+)
+from app.agent.htmlkit import (
+    PatchValidation,
+    assemble_sections,
+    extract_html,
+    rebuild_html,
+    strip_thinking,
+    validate_and_repair,
+    validate_section,
 )
 
 
-HTML_CANVAS_TEMPLATE = """<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Mockbird Interface</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Bebas+Neue&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
-  <style>
-    body { font-family: 'Plus Jakarta Sans', sans-serif; }
-    .font-display { font-family: 'Bebas Neue', sans-serif; }
-    .font-mono-accent { font-family: 'Space Grotesk', sans-serif; }
-  </style>
-</head>
-<body class="bg-[#09090b] text-slate-100 antialiased min-h-screen">
-__BODY_CONTENT__
-</body>
-</html>"""
-
-
 def balance_html_tags(html: str) -> str:
-    """Detecta tags estruturais abertas e fecha na ordem inversa se o modelo foi truncado."""
-    if not html:
-        return ""
-
-    # Se houver tag <style aberta sem fechamento, descarta o estilo inacabado
-    if "<style" in html.lower() and "</style>" not in html.lower():
-        html = re.sub(r"<style[\s\S]*$", "", html, flags=re.IGNORECASE).strip()
-
-    # Se estiver truncado no meio de uma tag incompleta (ex: <div class="card), remove o fragmento inacabado
-    html = re.sub(r"<[a-zA-Z0-9_-]+(?:\s+[^>]*)?$", "", html).strip()
-
-    # Tags estruturais que devem ser balanceadas
-    struct_tags = [
-        "div", "section", "main", "header", "footer", "nav", "article",
-        "aside", "ul", "ol", "form", "button", "p", "a"
-    ]
-    stack = []
-
-    tokens = re.finditer(r"<\s*(/)?\s*([a-zA-Z0-9_-]+)(?:\s+[^>]*)?>", html)
-    for t in tokens:
-        is_closing = bool(t.group(1))
-        tag_name = t.group(2).lower()
-        if tag_name not in struct_tags:
-            continue
-        if is_closing:
-            if stack and stack[-1] == tag_name:
-                stack.pop()
-        else:
-            if not t.group(0).endswith("/>"):
-                stack.append(tag_name)
-
-    closing_tags = "".join(f"</{tag}>" for tag in reversed(stack))
-    return html + closing_tags
+    rebuilt, _, _ = rebuild_html(html or "")
+    return rebuilt
 
 
 def heal_and_wrap_html(raw_html: str) -> str:
-    """Valida, repara e envelopa o HTML para garantir renderização perfeita no Canvas."""
-    if not raw_html:
-        return ""
-
-    # Descarta se terminou travado dentro de uma folha de estilo manual sem body
-    if "<style" in raw_html.lower() and ("</style>" not in raw_html.lower() or ("<body" not in raw_html.lower() and "<div" not in raw_html.lower())):
-        cleaned = re.sub(r"<style[\s\S]*?(?:</style>|$)", "", raw_html, flags=re.IGNORECASE).strip()
-        if not cleaned:
-            return ""
-        raw_html = cleaned
-
-    balanced = balance_html_tags(raw_html)
-
-    # Se já é um documento completo com <!DOCTYPE html> ou <html>
-    if "<!DOCTYPE" in balanced.upper() or "<html" in balanced.lower():
-        # Assegura fechamento de body e html se faltarem
-        if "</body" not in balanced.lower():
-            balanced += "\n</body>"
-        if "</html" not in balanced.lower():
-            balanced += "\n</html>"
-        # Injeta Tailwind CDN se o modelo esqueceu
-        if "tailwindcss.com" not in balanced:
-            balanced = re.sub(
-                r"(<head[^>]*>)",
-                r"\1\n  <script src=\"https://cdn.tailwindcss.com\"></script>",
-                balanced,
-                flags=re.IGNORECASE
-            )
-        return balanced
-
-    # Se for um fragmento de seções (<header>, <section>, <div id="app-root">), envelopa no template completo
-    return HTML_CANVAS_TEMPLATE.format(body_content=balanced)
-
-
-HTML_CANVAS_TEMPLATE = """<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Mockbird Interface</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Bebas+Neue&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
-  <style>
-    body { font-family: 'Plus Jakarta Sans', sans-serif; }
-    .font-display { font-family: 'Bebas Neue', sans-serif; }
-    .font-mono-accent { font-family: 'Space Grotesk', sans-serif; }
-  </style>
-</head>
-<body class="bg-[#09090b] text-slate-100 antialiased min-h-screen">
-__BODY_CONTENT__
-</body>
-</html>"""
-
-
-def balance_html_tags(html: str) -> str:
-    """Detecta tags estruturais abertas e fecha na ordem inversa se o modelo foi truncado."""
-    if not html:
-        return ""
-
-    # Se houver tag <style aberta sem fechamento, descarta o estilo inacabado
-    if "<style" in html.lower() and "</style>" not in html.lower():
-        html = re.sub(r"<style[\s\S]*$", "", html, flags=re.IGNORECASE).strip()
-
-    # Se estiver truncado no meio de uma tag incompleta (ex: <div class="card), remove o fragmento inacabado
-    html = re.sub(r"<[a-zA-Z0-9_-]+(?:\s+[^>]*)?$", "", html).strip()
-
-    # Tags estruturais que devem ser balanceadas
-    struct_tags = [
-        "div", "section", "main", "header", "footer", "nav", "article",
-        "aside", "ul", "ol", "form", "button", "p", "a"
-    ]
-    stack = []
-
-    tokens = re.finditer(r"<\s*(/)?\s*([a-zA-Z0-9_-]+)(?:\s+[^>]*)?>", html)
-    for t in tokens:
-        is_closing = bool(t.group(1))
-        tag_name = t.group(2).lower()
-        if tag_name not in struct_tags:
-            continue
-        if is_closing:
-            if stack and stack[-1] == tag_name:
-                stack.pop()
-        else:
-            if not t.group(0).endswith("/>"):
-                stack.append(tag_name)
-
-    closing_tags = "".join(f"</{tag}>" for tag in reversed(stack))
-    return html + closing_tags
-
-
-def heal_and_wrap_html(raw_html: str) -> str:
-    """Valida, repara e envelopa o HTML para garantir renderização perfeita no Canvas."""
-    if not raw_html:
-        return ""
-
-    # Descarta se terminou travado dentro de uma folha de estilo manual sem body
-    if "<style" in raw_html.lower() and ("</style>" not in raw_html.lower() or ("<body" not in raw_html.lower() and "<div" not in raw_html.lower())):
-        cleaned = re.sub(r"<style[\s\S]*?(?:</style>|$)", "", raw_html, flags=re.IGNORECASE).strip()
-        if not cleaned:
-            return ""
-        raw_html = cleaned
-
-    balanced = balance_html_tags(raw_html)
-
-    # Se já é um documento completo com <!DOCTYPE html> ou <html>
-    if "<!DOCTYPE" in balanced.upper() or "<html" in balanced.lower():
-        # Assegura fechamento de body e html se faltarem
-        if "</body" not in balanced.lower():
-            balanced += "\n</body>"
-        if "</html" not in balanced.lower():
-            balanced += "\n</html>"
-        # Injeta Tailwind CDN se o modelo esqueceu
-        if "tailwindcss.com" not in balanced:
-            balanced = re.sub(
-                r"(<head[^>]*>)",
-                r"\1\n  <script src=\"https://cdn.tailwindcss.com\"></script>",
-                balanced,
-                flags=re.IGNORECASE
-            )
-        return balanced
-
-    # Se for um fragmento de seções (<header>, <section>, <div id="app-root">), envelopa no template completo
-    return HTML_CANVAS_TEMPLATE.replace("__BODY_CONTENT__", balanced)
+    validation = validate_and_repair(raw_html or "", mode="full")
+    return validation.html
 
 
 def clean_extracted_html(text: str, is_full_page: bool = True) -> str:
-    """Extrai bloco HTML limpo defensivamente e aplica auto-recuperação (Self-Healing)."""
-    if not text:
-        return ""
-
-    extracted = ""
-
-    # 1. Procura bloco de código fechado ```html ... ```
-    m = re.search(r"```(?:html)?\s*(<[\s\S]+?>[\s\S]*?)```", text, re.IGNORECASE)
-    if m:
-        candidate = m.group(1).strip()
-        if "<" in candidate and ">" in candidate:
-            extracted = candidate
-
-    # 1b. Procura bloco de código iniciado com ```html que não fechou com ``` (corte por length)
-    if not extracted:
-        m_open = re.search(r"```(?:html)?\s*(<!DOCTYPE[\s\S]+|<html[\s\S]+|<(?:div|section|main|header|footer)[\s\S]+)", text, re.IGNORECASE)
-        if m_open:
-            candidate = m_open.group(1).strip()
-            candidate = re.sub(r"```+$", "", candidate).strip()
-            if "<" in candidate and ">" in candidate:
-                extracted = candidate
-
-    # 2. Procura documento completo <!DOCTYPE html> ... </html> ou <html ... </html>
-    if not extracted:
-        m_doc = re.search(r"(<!DOCTYPE\s+html[\s\S]+?</html>|<html[\s\S]+?</html>)", text, re.IGNORECASE)
-        if m_doc:
-            extracted = m_doc.group(1).strip()
-
-    # 3. Procura tags estruturais com fechamento (div, section, main, header, footer, etc.)
-    if not extracted:
-        m_tag = re.search(r"(<(?:div|section|main|header|footer|aside|article|form|nav|button|ul|ol|table|dialog|p|span|a|h[1-6])\b[\s\S]+?</(?:div|section|main|header|footer|aside|article|form|nav|button|ul|ol|table|dialog|p|span|a|h[1-6])>)", text, re.IGNORECASE)
-        if m_tag:
-            extracted = m_tag.group(1).strip()
-
-    # 4. Procura tags autocontidas válidas (img, input)
-    if not extracted:
-        m_self = re.search(r"(<(?:img|input|hr|br)\b[^>]*\/?>)", text, re.IGNORECASE)
-        if m_self:
-            extracted = m_self.group(1).strip()
-
+    extracted = extract_html(text)
     if not extracted:
         return ""
+    return heal_and_wrap_html(extracted) if is_full_page else balance_html_tags(extracted)
 
-    if is_full_page:
-        return heal_and_wrap_html(extracted)
-    else:
-        return balance_html_tags(extracted)
+
+PLANNER_FALLBACK = [
+    PlanStep(id=1, title="Estrutura & Hero", description="Cabeçalho, navegação e seção de destaque com CTA"),
+    PlanStep(id=2, title="Grid de Conteúdo", description="Cards/seções que expõem recursos, produtos ou dados principais"),
+    PlanStep(id=3, title="Conversão & Rodapé", description="Chamada final para ação e rodapé com links"),
+]
+
+DESIGN_SYSTEM = (
+    "DESIGN SYSTEM (obrigatório): fundo #09090b, superfícies #121215, bordas border-white/10, "
+    "texto branco/slate-300, cantos rounded-2xl, badges bg-white/5 backdrop-blur-md, "
+    "tipografia sans-serif com tracking-tight nos títulos, espaçamento generoso (py-16/py-24), "
+    "responsivo (grid-cols-1 md:grid-cols-2 lg:grid-cols-3). "
+    "Use SOMENTE classes utilitárias do Tailwind (o CDN já está ativo). É PROIBIDO <style>, "
+    "<script>, <html>, <head> ou <body>. Não use Lorem ipsum, placeholders cinzas nem comentários de TODO. "
+    "Imagens sempre com <img> de URLs reais do Unsplash (auto=format&fit=crop&w=1200&q=80). "
+    "Todo container, card, botão, link, imagem e título precisa de data-mb-id único e descritivo."
+)
+
+
+def _normalize_html(html: str) -> str:
+    """Compara HTML ignorando espaços, aspas e diferenças de envelope do documento."""
+    body = re.sub(r"<!DOCTYPE[\s\S]*?<body[^>]*>|</body>[\s\S]*$", "", html or "", flags=re.IGNORECASE)
+    return re.sub(r"[\s\"']+", "", body).lower()
+
+
+class _LLMError(RuntimeError):
+    def __init__(self, message: str, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class MockbirdAgentGraph:
-    """Grafo de execução autônoma inteligente com decisão dinâmica de intenção, ferramentas e edição cirúrgica."""
+    """Grafo de execução autônoma com decisão de intenção, ferramentas e validação."""
 
-    def __init__(self, base_url: str, headers: Dict[str, str]):
+    def __init__(
+        self,
+        base_url: str,
+        headers: Dict[str, str],
+        transport: Optional[httpx.AsyncBaseTransport] = None,
+        disable_thinking: bool = False,
+    ):
+        from app.ai_providers import is_local_endpoint
+
         self.base_url = base_url
         self.headers = headers
+        self.transport = transport
+        # Modelos de raciocínio (Qwen3/bonsai) gastam todo o `max_tokens` pensando
+        # antes de emitir o primeiro caractere de HTML. Em endpoints locais
+        # desligamos o thinking via chat template quando o servidor suportar.
+        self.disable_thinking = (
+            disable_thinking
+            and bool(getattr(settings, "AI_DISABLE_THINKING", True))
+            and is_local_endpoint(base_url)
+        )
+        self.read_timeout = float(getattr(settings, "AI_LLM_READ_TIMEOUT", 600.0))
+        self.connect_timeout = float(getattr(settings, "AI_LLM_CONNECT_TIMEOUT", 10.0))
+        self.max_tokens = int(getattr(settings, "AI_LLM_MAX_TOKENS", 8192))
+        self.section_max_tokens = int(getattr(settings, "AI_SECTION_MAX_TOKENS", 2600))
+        self.max_attempts = max(1, int(getattr(settings, "AI_LLM_MAX_ATTEMPTS", 2)))
+        self.max_repairs = max(0, int(getattr(settings, "AI_AGENT_MAX_REPAIRS", 1)))
+
+    # ------------------------------------------------------------------
+    # Camada de transporte / streaming
+    # ------------------------------------------------------------------
+    def _client(self) -> httpx.AsyncClient:
+        timeout = httpx.Timeout(
+            self.read_timeout,
+            connect=self.connect_timeout,
+            write=60.0,
+            pool=self.connect_timeout,
+        )
+        kwargs: Dict[str, Any] = {"timeout": timeout}
+        if self.transport is not None:
+            kwargs["transport"] = self.transport
+        return httpx.AsyncClient(**kwargs)
+
+    async def _stream_once(
+        self,
+        messages: List[Dict[str, str]],
+        model: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        body: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if self.disable_thinking:
+            # llamacpp/Qwen3: desativa o bloco de raciocínio no template de chat.
+            body["chat_template_kwargs"] = {"enable_thinking": False}
+        async with self._client() as client:
+            async with client.stream(
+                "POST",
+                f"{self.base_url.rstrip('/')}/chat/completions",
+                headers=self.headers,
+                json=body,
+            ) as response:
+                if response.status_code != 200:
+                    raw = (await response.aread()).decode(errors="replace")
+                    retryable = response.status_code in (408, 409, 425, 429) or response.status_code >= 500
+                    hint = ""
+                    if response.status_code == 401:
+                        hint = " Verifique a chave de API do provedor em Configurações → LLM."
+                    elif response.status_code == 404:
+                        hint = " Verifique a URL base e o nome do modelo configurado."
+                    raise _LLMError(
+                        f"Provedor retornou {response.status_code}: {raw[:300]}{hint}",
+                        retryable=retryable,
+                    )
+
+                accumulated_content: List[str] = []
+                accumulated_reasoning: List[str] = []
+                finish_reason: Optional[str] = None
+                total_chunks = 0
+
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if not data_str:
+                        continue
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        choice = (chunk.get("choices") or [{}])[0]
+                        delta = choice.get("delta") or {}
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+                        r_chunk = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                        c_chunk = delta.get("content") or ""
+                        if r_chunk:
+                            accumulated_reasoning.append(r_chunk)
+                            total_chunks += 1
+                            yield {"type": "thinking_chunk", "text": r_chunk}
+                        if c_chunk:
+                            accumulated_content.append(c_chunk)
+                            total_chunks += 1
+                            yield {"type": "content_chunk", "text": c_chunk}
+                        if total_chunks and total_chunks % 20 == 0:
+                            yield {
+                                "type": "heartbeat",
+                                "chars": sum(len(c) for c in accumulated_content),
+                                "reasoning_chars": sum(len(r) for r in accumulated_reasoning),
+                            }
+                    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                        continue
+
+                full_content = strip_thinking("".join(accumulated_content))
+                full_reasoning = "".join(accumulated_reasoning)
+
+                # Alguns modelos devolvem o HTML dentro do reasoning_content quando
+                # não têm canal de conteúdo separado. Só aceitamos se houver bloco.
+                if not extract_html(full_content) and "```" in full_reasoning:
+                    salvaged = extract_html(full_reasoning)
+                    if salvaged:
+                        yield {"type": "node_progress", "chars": len(salvaged), "detail": "HTML recuperado do raciocínio do modelo."}
+                        full_content = salvaged
+
+                # Alguns modelos (ex.: DeepSeek R1) embrulham <think>...</think> no content.
+                think_match = re.search(r"<think(?:ing)?>([\s\S]*?)</think(?:ing)?>", "".join(accumulated_content), re.IGNORECASE)
+                if think_match:
+                    full_reasoning += "\n" + think_match.group(1).strip()
+
+                yield {
+                    "type": "completed",
+                    "content": full_content,
+                    "reasoning": full_reasoning,
+                    "finish_reason": finish_reason,
+                }
 
     async def _call_llm_stream(
         self,
         messages: List[Dict[str, str]],
         model: str,
         temperature: float = 0.4,
-        max_tokens: int = 8192
+        max_tokens: int = 8192,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Chama a LLM com stream ativo, separando estritamente reasoning_content de content."""
-        is_homolog = os.getenv("ENVIRONMENT") == "homologation"
-        timeout_config = httpx.Timeout(10.0, read=6.0, write=5.0, connect=2.0) if is_homolog else httpx.Timeout(600.0, read=300.0, write=60.0, connect=10.0)
-        try:
-            async with httpx.AsyncClient(timeout=timeout_config) as client:
-                async with client.stream(
-                    "POST",
-                    f"{self.base_url.rstrip('/')}/chat/completions",
-                    headers=self.headers,
-                    json={
-                        "model": model,
-                        "messages": messages,
-                        "temperature": temperature,
-                        "frequency_penalty": 0.2,
-                        "presence_penalty": 0.1,
-                        "max_tokens": max_tokens,
-                        "stream": True
-                    }
-                ) as response:
-                    if response.status_code != 200:
-                        err = await response.aread()
-                        raise RuntimeError(f"LLM HTTP {response.status_code}: {err.decode()[:200]}")
+        """Chama a LLM com streaming, tentativas limitadas e erro explícito."""
+        last_error: Optional[str] = None
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                async for event in self._stream_once(messages, model, temperature, max_tokens):
+                    if event["type"] == "completed":
+                        yield event
+                        return
+                    yield event
+                # Stream terminou sem evento 'completed' (improvável)
+                last_error = "O provedor encerrou o stream sem conteúdo."
+            except _LLMError as exc:
+                last_error = str(exc)
+                if not exc.retryable or attempt == self.max_attempts:
+                    break
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_error = (
+                    f"Tempo esgotado/queda de conexão com o provedor após {int(self.read_timeout)}s: {exc.__class__.__name__}"
+                )
+                if attempt == self.max_attempts:
+                    break
+            except Exception as exc:  # nunca deixamos o gerador morrer sem diagnóstico
+                last_error = f"Falha inesperada na chamada da LLM: {exc}"
+                break
 
-                    accumulated_content = []
-                    accumulated_reasoning = []
-                    total_chunks = 0
+            if attempt < self.max_attempts:
+                yield {
+                    "type": "node_progress",
+                    "chars": 0,
+                    "detail": f"Instabilidade no provedor; tentativa {attempt + 1} de {self.max_attempts}...",
+                }
+                await asyncio.sleep(1.5 * attempt)
 
-                    async for line in response.aiter_lines():
-                        if not line or not line.startswith("data:"):
-                            continue
-                        data_str = line.replace("data:", "").strip()
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data_str)
-                            delta = chunk["choices"][0].get("delta", {})
+        yield {"type": "error", "detail": last_error or "Falha desconhecida ao chamar a LLM."}
 
-                            r_chunk = delta.get("reasoning_content") or ""
-                            c_chunk = delta.get("content") or ""
+    async def _collect(
+        self,
+        messages: List[Dict[str, str]],
+        out: Dict[str, Any],
+        *,
+        max_tokens: int,
+        temperature: float,
+        detail: str,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Executa a chamada emitindo progresso e preenche `out` com o resultado."""
+        out["content"] = ""
+        out["reasoning"] = ""
+        out["finish_reason"] = None
+        out["error"] = None
 
-                            if r_chunk:
-                                accumulated_reasoning.append(r_chunk)
-                                total_chunks += 1
-                                yield {
-                                    "type": "thinking_chunk",
-                                    "text": r_chunk
-                                }
+        async for event in self._call_llm_stream(messages, self.model, temperature, max_tokens):
+            if event["type"] == "completed":
+                out["content"] = event.get("content") or ""
+                out["reasoning"] = event.get("reasoning") or ""
+                out["finish_reason"] = event.get("finish_reason")
+            elif event["type"] == "heartbeat":
+                yield {
+                    "type": "node_progress",
+                    "chars": event.get("chars", 0),
+                    "detail": f"{detail} ({event.get('chars', 0)} caracteres)",
+                }
+            elif event["type"] == "error":
+                out["error"] = event.get("detail")
+            elif event["type"] == "node_progress":
+                yield event
 
-                            if c_chunk:
-                                accumulated_content.append(c_chunk)
-                                total_chunks += 1
-                                yield {
-                                    "type": "content_chunk",
-                                    "text": c_chunk
-                                }
+    async def _continue(
+        self,
+        messages: List[Dict[str, str]],
+        partial: str,
+        out: Dict[str, Any],
+        **kwargs,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Pede a continuação exata de uma geração truncada por limite de tokens."""
+        continued = dict(out)
+        yield {
+            "type": "node_progress",
+            "chars": len(partial),
+            "detail": "Resposta truncada pelo provedor; pedindo continuação...",
+        }
+        cont_messages = messages + [
+            {"role": "assistant", "content": partial},
+            {
+                "role": "user",
+                "content": (
+                    "Continue EXATAMENTE de onde o HTML parou. Não repita o que já foi escrito, "
+                    "não adicione explicações e feche todas as tags abertas."
+                ),
+            },
+        ]
+        async for event in self._collect(cont_messages, continued, **kwargs):
+            yield event
+        out["error"] = continued.get("error")
+        out["finish_reason"] = continued.get("finish_reason")
+        out["reasoning"] = (out.get("reasoning") or "") + (continued.get("reasoning") or "")
+        out["content"] = partial + (continued.get("content") or "")
 
-                            if total_chunks % 15 == 0:
-                                yield {
-                                    "type": "heartbeat",
-                                    "chars": sum(len(c) for c in accumulated_content) + sum(len(r) for r in accumulated_reasoning)
-                                }
-                        except Exception:
-                            continue
-
-                    full_c = "".join(accumulated_content)
-                    full_r = "".join(accumulated_reasoning)
-
-                    # Extrai tag <think>...</think> se vier dentro de content
-                    if "<think>" in full_c:
-                        if "</think>" in full_c:
-                            think_part = re.search(r"<think>([\s\S]*?)</think>", full_c)
-                            if think_part:
-                                full_r += ("\n" if full_r else "") + think_part.group(1).strip()
-                                full_c = re.sub(r"<think>[\s\S]*?</think>", "", full_c).strip()
-                        else:
-                            # Tag think aberta mas não fechada: todo o texto é raciocínio
-                            open_think = re.search(r"<think>([\s\S]*)", full_c)
-                            if open_think:
-                                full_r += ("\n" if full_r else "") + open_think.group(1).strip()
-                                full_c = ""
-
-                    yield {
-                        "type": "completed",
-                        "content": full_c,
-                        "reasoning": full_r
-                    }
-        except Exception as exc:
-            # Fallback resiliente para timeout, desconexão ou indisponibilidade de LLM
-            yield {
-                "type": "thinking_chunk",
-                "text": "Modo de contingência autônomo acionado."
-            }
-            yield {
-                "type": "completed",
-                "content": "```html\n<div class='p-6 bg-slate-900 text-white rounded-lg'><h2 class='text-xl font-bold'>Interface Atualizada</h2><p class='text-slate-400'>Layout ajustado com sucesso.</p></div>\n```",
-                "reasoning": f"Resposta sintetizada pelo motor autônomo (resiliência de conexão: {str(exc)[:60]})."
-            }
-
+    # ------------------------------------------------------------------
+    # Intenção
+    # ------------------------------------------------------------------
     def _determine_intent(self, state: AgentState) -> str:
-        """Determina a intenção real do usuário para não executar ferramentas desnecessárias."""
-        # Se um elemento alvo foi expressamente selecionado, é edição cirúrgica
-        if state.target_element and (state.target_element.mbId or state.target_element.selector or state.target_element.outerHtml):
+        if state.target_element and (
+            state.target_element.mbId or state.target_element.selector or state.target_element.outerHtml
+        ):
             return "surgical_edit"
 
         p_lower = state.prompt.lower().strip()
 
-        # Pergunta / Discussão / Explicação conceitual
         explanation_keywords = [
-            "o que você acha", "o que acha", "como funciona", "por que", "explique", 
+            "o que você acha", "o que acha", "como funciona", "por que", "explique",
             "quais cores", "dúvida", "ajuda com conceito", "qual é a melhor", "me dê dicas",
-            "dicas de design", "como posso melhorar"
+            "dicas de design", "como posso melhorar",
         ]
-        if any(kw in p_lower for kw in explanation_keywords) and not any(kw in p_lower for kw in ["consert", "mud", "cri", "alter"]):
+        if any(kw in p_lower for kw in explanation_keywords) and not any(
+            kw in p_lower for kw in ["consert", "mud", "cri", "alter"]
+        ):
             return "explanation"
 
-        # Conserto ou reparo de layout quebrado
         repair_keywords = [
-            "quebrado", "quebrada", "consertar", "concertar", "arrumar", "alinhar", 
-            "corrigir", "ajustar", "bug", "erro no layout", "layout tá", "layout ta"
+            "quebrado", "quebrada", "consertar", "concertar", "arrumar", "alinhar",
+            "corrigir", "ajustar", "bug", "erro no layout", "layout tá", "layout ta",
         ]
         if any(kw in p_lower for kw in repair_keywords):
             return "layout_repair"
 
-        # Criação de nova página ou tela completa do zero
         full_keywords = [
             "crie uma landing page", "cria uma landing page", "nova página", "nova tela",
-            "crie um site", "cria um site", "dashboard", "gerar tela", "gerar página", "landing page para"
+            "crie um site", "cria um site", "dashboard", "gerar tela", "gerar página", "landing page para",
         ]
         if any(kw in p_lower for kw in full_keywords):
             return "full_page"
 
-        # Se já existe HTML na tela e o prompt é curto/específico (ex: "mude o botão", "troque a foto")
         if state.current_html and len(state.current_html) > 100:
             return "surgical_edit"
 
         return "full_page"
 
+    # ------------------------------------------------------------------
+    # Execução
+    # ------------------------------------------------------------------
     async def run(self, state: AgentState) -> AsyncGenerator[Dict[str, Any], None]:
-        """Executa o Grafo do Agente Autônomo emitindo eventos em tempo real via SSE."""
         intent = self._determine_intent(state)
         state.intent = intent
+        self.model = state.model_name
 
-        # =========================================================================
-        # FLUXO 1: RESPOSTA / CONSULTORIA / EXPLICAÇÃO (Sem gerar patch vazio)
-        # =========================================================================
         if intent == "explanation":
-            yield {
-                "type": "node_start",
-                "node": "analyst",
-                "title": "Analisando Pergunta e Estrutura",
-                "detail": "Avaliando contexto de UI/UX e formulando resposta técnica em Português..."
-            }
-
-            dom_summary = extract_dom_structure(state.current_html) if state.current_html else "Tela em branco."
-            state.dom_summary = dom_summary
-
-            prompt_analyst = (
-                "Você é o Especialista Sênior de UI/UX e Frontend do Mockbird v2.\n"
-                "Responda à pergunta do usuário de forma clara, prestativa e técnica em Português do Brasil.\n"
-                "NÃO gere blocos de código completos a menos que o usuário peça exemplos curtos.\n\n"
-                f"PERGUNTA DO USUÁRIO: {state.prompt}\n"
-                f"DOM ATUAL DA TELA:\n{dom_summary}\n"
-            )
-
-            assistant_text = ""
-            assistant_reasoning = ""
-
-            async for chunk in self._call_llm_stream(
-                [{"role": "user", "content": prompt_analyst}],
-                state.model_name,
-                temperature=0.4,
-                max_tokens=1000
-            ):
-                if chunk["type"] == "completed":
-                    assistant_text = chunk["content"]
-                    assistant_reasoning = chunk["reasoning"]
-
-            state.is_complete = True
-            state.final_summary = assistant_text or "Aqui está a análise solicitada."
-            state.reasoning = assistant_reasoning
-            state.accumulated_patch = None
-            state.patch_type = "none"
-
-            yield {
-                "type": "agent_done",
-                "patch": None,
-                "patch_type": "none",
-                "summary": state.final_summary,
-                "reasoning": state.reasoning,
-                "plan": [],
-                "audit": None
-            }
+            async for event in self._run_explanation(state):
+                yield event
             return
-
-        # =========================================================================
-        # FLUXO 2: EDIÇÃO CIRÚRGICA DE ELEMENTO ALVO
-        # =========================================================================
         if intent == "surgical_edit":
-            target = state.target_element
-            target_mb_id = target.mbId if target else None
-            target_tag = target.tag if target else "elemento"
-            target_selector = target.selector if target else (f"#{target_mb_id}" if target_mb_id else "")
-            
-            target_snippet = target.outerHtml if (target and target.outerHtml) else ""
-            if not target_snippet and target_mb_id and state.current_html:
-                target_snippet = extract_element_snippet(state.current_html, target_mb_id) or ""
-
-            yield {
-                "type": "node_start",
-                "node": "inspector",
-                "title": f"Inspecionando Elemento Alvo <{target_tag}>",
-                "detail": f"Analisando estrutura, classes CSS e contexto do seletor '{target_selector or target_mb_id}'..."
-            }
-
-            state.tools_history.append(ToolCallRecord(
-                tool="inspect_element",
-                args={"selector": target_selector, "mbId": target_mb_id},
-                result=f"Elemento <{target_tag}> inspecionado com sucesso."
-            ))
-
-            yield {
-                "type": "tool_call",
-                "tool": "inspect_element",
-                "summary": f"Alvo <{target_tag}> localizado no DOM."
-            }
-
-            yield {
-                "type": "node_start",
-                "node": "executor",
-                "title": f"Gerando Modificação Cirúrgica de <{target_tag}>",
-                "detail": "Alterando exclusivamente o componente solicitado sem tocar no restante da tela..."
-            }
-
-            element_prompt = (
-                "Você é o Engenheiro Frontend do Mockbird v2 especializado em refatoração cirúrgica de componentes.\n"
-                f"PEDIDO DO USUÁRIO: {state.prompt}\n\n"
-                f"ELEMENTO ALVO: <{target_tag}>\n"
-                f"IDENTIFICADOR data-mb-id: {target_mb_id or 'alvo'}\n"
-                f"SELETOR: {target_selector}\n"
-                f"CÓDIGO ATUAL DO ELEMENTO:\n{target_snippet or 'Elemento no Canvas'}\n\n"
-                "REGRAS ESTRITAS:\n"
-                "0. Raciocínio conciso (máximo 3 a 5 linhas). Inicie imediatamente a geração do código do elemento dentro de ```html ... ```.\n"
-                "1. Retorne APENAS o código HTML atualizado deste elemento específico dentro do bloco ```html ... ```.\n"
-                "2. PRESERVE o atributo data-mb-id no elemento modificado.\n"
-                "3. NUNCA gere o documento HTML inteiro ou tags <html>/<body>. Apenas o elemento modificado!\n"
-                "4. Use Tailwind CSS moderno para o estilo.\n"
-                "5. Explique resumidamente em Português o que foi alterado antes ou depois do código."
-            )
-
-            raw_code = ""
-            assistant_reasoning = ""
-
-            async for chunk in self._call_llm_stream(
-                [{"role": "user", "content": element_prompt}],
-                state.model_name,
-                temperature=0.3,
-                max_tokens=4096
-            ):
-                if chunk["type"] == "heartbeat":
-                    yield {
-                        "type": "node_progress",
-                        "chars": chunk["chars"],
-                        "detail": f"Gerando alteração do elemento ({chunk['chars']} caracteres)..."
-                    }
-                elif chunk["type"] == "completed":
-                    raw_code = chunk["content"]
-                    assistant_reasoning = chunk["reasoning"]
-
-            extracted_snippet = clean_extracted_html(raw_code, is_full_page=False)
-            
-            # Se a LLM não colocou data-mb-id e tínhamos um, garante que o elemento mantenha
-            if extracted_snippet and target_mb_id and "data-mb-id" not in extracted_snippet:
-                extracted_snippet = re.sub(r"^<([a-zA-Z0-9\-]+)", rf'<\1 data-mb-id="{target_mb_id}"', extracted_snippet, count=1)
-
-            state.accumulated_patch = extracted_snippet if extracted_snippet else None
-            state.patch_type = "element" if state.accumulated_patch else "none"
-            state.target_selector = target_selector
-            state.target_mb_id = target_mb_id
-            state.reasoning = assistant_reasoning
-
-            # Mensagem explicativa em português (remove bloco de código para a resposta de texto)
-            explanation = re.sub(r"```(?:html)?[\s\S]*?```", "", raw_code).strip()
-            if state.accumulated_patch:
-                state.final_summary = explanation or f"Elemento <{target_tag}> atualizado cirurgicamente com sucesso."
-            else:
-                state.final_summary = "Aviso: Não foi possível gerar a modificação cirúrgica do elemento. Tente novamente."
-
-            yield {
-                "type": "tool_call",
-                "tool": "patch_element",
-                "summary": f"Fragmento do elemento <{target_tag}> pronto para aplicação."
-            }
-
-            yield {
-                "type": "agent_done",
-                "patch": state.accumulated_patch,
-                "patch_type": state.patch_type,
-                "target_selector": state.target_selector,
-                "target_mb_id": state.target_mb_id,
-                "target_tag": target_tag,
-                "summary": state.final_summary,
-                "reasoning": state.reasoning,
-                "plan": [],
-                "audit": None
-            }
+            async for event in self._run_surgical(state):
+                yield event
             return
-
-        # =========================================================================
-        # FLUXO 3: REPARO DE LAYOUT QUEBRADO (Preservando conteúdo existente)
-        # =========================================================================
         if intent == "layout_repair":
-            yield {
-                "type": "node_start",
-                "node": "inspector",
-                "title": "Diagnosticando Quebras no Layout",
-                "detail": "Inspecionando hierarquia DOM, tags desbalanceadas e regras de layout..."
-            }
+            async for event in self._run_layout_repair(state):
+                yield event
+            return
+        async for event in self._run_full_page(state):
+            yield event
 
-            dom_summary = extract_dom_structure(state.current_html)
-            detected_issues = diagnose_layout_issues(state.current_html)
-            state.dom_summary = dom_summary
+    # -- Fluxo 1: consultoria -------------------------------------------
+    async def _run_explanation(self, state: AgentState) -> AsyncGenerator[Dict[str, Any], None]:
+        yield {
+            "type": "node_start",
+            "node": "analyst",
+            "title": "Analisando Pergunta e Estrutura",
+            "detail": "Avaliando contexto de UI/UX e formulando resposta técnica em Português...",
+        }
 
-            yield {
-                "type": "tool_call",
-                "tool": "get_canvas_dom",
-                "summary": f"DOM inspecionado: {len(detected_issues)} anomalias estruturais detectadas."
-            }
+        dom_summary = extract_dom_structure(state.current_html) if state.current_html else "Tela em branco."
+        state.dom_summary = dom_summary
 
-            yield {
-                "type": "node_start",
-                "node": "executor",
-                "title": "Corrigindo Estrutura e Estilos de Layout",
-                "detail": "Ajustando containers, classes de alinhamento e preservando o conteúdo original..."
-            }
+        prompt = (
+            "Você é o Especialista Sênior de UI/UX e Frontend do Mockbird v2.\n"
+            "Responda à pergunta do usuário de forma clara, prestativa e técnica em Português do Brasil.\n"
+            "NÃO gere blocos de código completos a menos que o usuário peça exemplos curtos.\n\n"
+            f"PERGUNTA DO USUÁRIO: {state.prompt}\n"
+            f"DOM ATUAL DA TELA:\n{dom_summary}\n"
+        )
 
-            issues_prompt = "\n".join([f"- {iss}" for iss in detected_issues]) if detected_issues else "- Layout visual desalinhado conforme apontado pelo usuário."
+        out: Dict[str, Any] = {}
+        async for event in self._collect(
+            [{"role": "user", "content": prompt}],
+            out,
+            max_tokens=1200,
+            temperature=0.4,
+            detail="Redigindo análise",
+        ):
+            yield event
 
-            repair_prompt = (
-                "Você é o Especialista Frontend Sênior do Mockbird v2.\n"
-                f"SOLICITAÇÃO DO USUÁRIO: {state.prompt}\n\n"
-                f"DIAGNÓSTICO TÉCNICO INICIAL:\n{issues_prompt}\n\n"
-                f"HTML ATUAL DA TELA:\n{state.current_html}\n\n"
-                "INSTRUÇÕES CRUCIAIS:\n"
-                "1. Seja extremamente conciso no raciocínio preliminar (máximo 5 linhas). Inicie imediatamente a geração do código HTML dentro do bloco ```html ... ```.\n"
-                "2. Corrija o layout quebradiço (alinhe containers com flex/grid adequados, garanta overflow correto, feche tags e garanta responsividade).\n"
-                "3. PRESERVE a identidade, os textos e o propósito da tela existente. NUNCA substitua a tela por um template aleatório!\n"
-                "4. Emita o código HTML corrigido completo dentro de ```html ... ```.\n"
-                "5. Explique em uma frase inicial o que você corrigiu."
-            )
-
-            raw_code = ""
-            assistant_reasoning = ""
-
-            async for chunk in self._call_llm_stream(
-                [{"role": "user", "content": repair_prompt}],
-                state.model_name,
-                temperature=0.3,
-                max_tokens=8192
-            ):
-                if chunk["type"] == "heartbeat":
-                    yield {
-                        "type": "node_progress",
-                        "chars": chunk["chars"],
-                        "detail": f"Construindo correção de layout ({chunk['chars']} caracteres)..."
-                    }
-                elif chunk["type"] == "completed":
-                    raw_code = chunk["content"]
-                    assistant_reasoning = chunk["reasoning"]
-
-            extracted_html = clean_extracted_html(raw_code)
-            state.accumulated_patch = extracted_html if extracted_html else None
-            state.patch_type = "full" if state.accumulated_patch else "none"
-            state.reasoning = assistant_reasoning
-
-            # Avalia qualidade
-            if state.accumulated_patch:
-                state.audit = verify_ui_quality(state.accumulated_patch)
-                yield {
-                    "type": "audit_result",
-                    "passed": state.audit.passed,
-                    "score": state.audit.score,
-                    "issues": state.audit.issues,
-                    "suggestions": state.audit.suggestions
-                }
-                explanation = re.sub(r"```(?:html)?[\s\S]*?```", "", raw_code).strip()
-                state.final_summary = explanation or "Layout corrigido: ajustadas estruturas de container, alinhamentos e tags."
-            else:
-                state.audit = None
-                state.final_summary = "Aviso: A correção de layout não pôde ser concluída integralmente nesta execução. Tente selecionar o elemento específico para edição cirúrgica."
-
-            yield {
-                "type": "agent_done",
-                "patch": state.accumulated_patch,
-                "patch_type": state.patch_type,
-                "summary": state.final_summary,
-                "reasoning": state.reasoning,
-                "audit": state.audit.model_dump() if state.audit else None,
-                "plan": []
-            }
+        if out["error"]:
+            state.error = out["error"]
+            yield {"type": "error", "detail": out["error"]}
             return
 
-        # =========================================================================
-        # FLUXO 4: GERAÇÃO DE TELA COMPLETA (Planejamento + Execução + Auditoria)
-        # =========================================================================
+        state.is_complete = True
+        state.final_summary = (out["content"] or "").strip() or "Não foi possível produzir a análise solicitada."
+        state.reasoning = out["reasoning"]
+        state.accumulated_patch = None
+        state.patch_type = "none"
+
+        yield {
+            "type": "agent_done",
+            "patch": None,
+            "patch_type": "none",
+            "summary": state.final_summary,
+            "reasoning": state.reasoning,
+            "plan": [],
+            "audit": None,
+        }
+
+    # -- Fluxo 2: edição cirúrgica --------------------------------------
+    async def _run_surgical(self, state: AgentState) -> AsyncGenerator[Dict[str, Any], None]:
+        target = state.target_element
+        target_mb_id = target.mbId if target else None
+        target_tag = target.tag if target else "elemento"
+        target_selector = target.selector if target else (f"#{target_mb_id}" if target_mb_id else "")
+
+        target_snippet = target.outerHtml if (target and target.outerHtml) else ""
+        if not target_snippet and target_mb_id and state.current_html:
+            target_snippet = extract_element_snippet(state.current_html, target_mb_id) or ""
+
         yield {
             "type": "node_start",
             "node": "inspector",
-            "title": "Inspecionando Contexto do Projeto",
-            "detail": "Analisando referências de design e tokens visuais..."
+            "title": f"Inspecionando Elemento Alvo <{target_tag}>",
+            "detail": f"Analisando estrutura, classes CSS e contexto do seletor '{target_selector or target_mb_id}'...",
         }
 
-        dom_summary = extract_dom_structure(state.current_html) if state.current_html else "Documento vazio."
+        state.tools_history.append(ToolCallRecord(
+            tool="inspect_element",
+            args={"selector": target_selector, "mbId": target_mb_id},
+            result=f"Elemento <{target_tag}> inspecionado com sucesso.",
+        ))
+        yield {
+            "type": "tool_call",
+            "tool": "inspect_element",
+            "summary": f"Alvo <{target_tag}> localizado no DOM.",
+        }
+
+        yield {
+            "type": "node_start",
+            "node": "executor",
+            "title": f"Gerando Modificação Cirúrgica de <{target_tag}>",
+            "detail": "Alterando exclusivamente o componente solicitado sem tocar no restante da tela...",
+        }
+
+        base_prompt = (
+            "Você é o Engenheiro Frontend do Mockbird v2 especializado em refatoração cirúrgica.\n"
+            f"PEDIDO DO USUÁRIO: {state.prompt}\n\n"
+            f"ELEMENTO ALVO: <{target_tag}>\n"
+            f"IDENTIFICADOR data-mb-id: {target_mb_id or 'alvo'}\n"
+            f"SELETOR: {target_selector}\n"
+            f"CÓDIGO ATUAL DO ELEMENTO:\n{target_snippet or 'Elemento no Canvas'}\n\n"
+            "REGRAS ESTRITAS:\n"
+            "0. Raciocínio curto (máx. 3 linhas) e código imediatamente dentro de ```html ... ```.\n"
+            "1. Devolva UM único elemento HTML atualizado (o próprio elemento alvo), nada mais.\n"
+            f"2. PRESERVE data-mb-id=\"{target_mb_id or 'alvo'}\" no elemento raiz.\n"
+            "3. NUNCA devolva o documento inteiro nem <html>/<body>.\n"
+            "4. Use Tailwind CSS; mantenha classes existentes que não conflitem com o pedido.\n"
+            "5. Explique em 1 frase, em Português, o que mudou (fora do bloco de código)."
+        )
+
+        messages = [{"role": "user", "content": base_prompt}]
+        validation: Optional[PatchValidation] = None
+        out: Dict[str, Any] = {}
+        attempts = self.max_repairs + 1
+
+        for attempt in range(1, attempts + 1):
+            async for event in self._collect(
+                messages,
+                out,
+                max_tokens=min(self.max_tokens, 3072),
+                temperature=0.3,
+                detail="Gerando alteração do elemento",
+            ):
+                yield event
+
+            if out["error"]:
+                state.error = out["error"]
+                yield {"type": "error", "detail": out["error"]}
+                return
+
+            validation = validate_and_repair(out["content"], mode="element", mb_id=target_mb_id)
+            unchanged = bool(
+                target_snippet
+                and validation.html
+                and _normalize_html(validation.html) == _normalize_html(target_snippet)
+            )
+            problem = None
+            if not validation.ok:
+                problem = "; ".join(validation.errors)
+            elif unchanged:
+                problem = "O elemento devolvido é idêntico ao atual (a alteração não foi aplicada)."
+
+            yield {"type": "validation_result", "scope": "element", **validation.to_event()}
+
+            if problem is None:
+                break
+            if attempt == attempts:
+                state.error = f"Validação da edição falhou: {problem}"
+                yield {
+                    "type": "error",
+                    "detail": (
+                        f"A edição não pôde ser aplicada: {problem}. "
+                        "Tente descrever a mudança com mais detalhes ou selecionar outro elemento."
+                    ),
+                }
+                return
+
+            yield {
+                "type": "node_progress",
+                "chars": len(validation.html or ""),
+                "detail": f"Ajustando a edição ({problem[:120]}). Tentativa {attempt + 1}/{attempts}...",
+            }
+            messages = [
+                {"role": "user", "content": base_prompt},
+                {"role": "assistant", "content": "```html\n" + (out["content"] or "")[:6000] + "\n```"},
+                {"role": "user", "content": validation.repair_prompt()},
+            ]
+
+        assert validation is not None
+        if not validation.ok:
+            yield {"type": "error", "detail": "Edição inválida após as tentativas de correção."}
+            return
+
+        state.accumulated_patch = validation.html
+        state.patch_type = "element"
+        state.target_selector = target_selector
+        state.target_mb_id = target_mb_id
+        state.reasoning = out["reasoning"]
+
+        explanation = re.sub(r"```(?:html)?[\s\S]*?```", "", out["content"]).strip()
+        state.final_summary = explanation or f"Elemento <{target_tag}> atualizado cirurgicamente com sucesso."
+        state.is_complete = True
+
+        yield {
+            "type": "tool_call",
+            "tool": "patch_element",
+            "summary": f"Fragmento de <{target_tag}> validado ({validation.score}/100) e pronto para aplicação.",
+        }
+        yield {
+            "type": "agent_done",
+            "patch": state.accumulated_patch,
+            "patch_type": "element",
+            "target_selector": state.target_selector,
+            "target_mb_id": state.target_mb_id,
+            "target_tag": target_tag,
+            "summary": state.final_summary,
+            "reasoning": state.reasoning,
+            "plan": [],
+            "audit": {
+                "passed": True,
+                "score": validation.score,
+                "issues": validation.errors,
+                "suggestions": validation.warnings,
+            },
+        }
+
+    # -- Fluxo 3: reparo de layout --------------------------------------
+    async def _run_layout_repair(self, state: AgentState) -> AsyncGenerator[Dict[str, Any], None]:
+        yield {
+            "type": "node_start",
+            "node": "inspector",
+            "title": "Diagnosticando Quebras no Layout",
+            "detail": "Inspecionando hierarquia DOM, tags desbalanceadas e regras de layout...",
+        }
+
+        dom_summary = extract_dom_structure(state.current_html)
+        detected_issues = diagnose_layout_issues(state.current_html)
         state.dom_summary = dom_summary
 
         yield {
             "type": "tool_call",
             "tool": "get_canvas_dom",
-            "summary": "Contexto do Canvas inspecionado."
+            "summary": f"DOM inspecionado: {len(detected_issues)} anomalias estruturais detectadas.",
         }
 
-        # Planejador
+        yield {
+            "type": "node_start",
+            "node": "executor",
+            "title": "Corrigindo Estrutura e Estilos de Layout",
+            "detail": "Ajustando containers, alinhamento e responsividade preservando o conteúdo original...",
+        }
+
+        issues_prompt = (
+            "\n".join(f"- {iss}" for iss in detected_issues)
+            if detected_issues
+            else "- Layout visual desalinhado conforme apontado pelo usuário."
+        )
+        base_prompt = (
+            "Você é o Especialista Frontend Sênior do Mockbird v2.\n"
+            f"SOLICITAÇÃO DO USUÁRIO: {state.prompt}\n\n"
+            f"DIAGNÓSTICO TÉCNICO INICIAL:\n{issues_prompt}\n\n"
+            "HTML ATUAL (pode estar truncado/quebrado):\n"
+            f"```html\n{state.current_html[:24000]}\n```\n\n"
+            "INSTRUÇÕES CRUCIAIS:\n"
+            "1. Corrija o layout (flex/grid, overflow, responsividade) e feche todas as tags.\n"
+            "2. PRESERVE textos, imagens e o propósito da tela. NÃO substitua por um template genérico.\n"
+            "3. Devolva o HTML COMPLETO corrigido dentro de ```html ... ``` (sem <html>/<body>).\n"
+            "4. Preserve/crie data-mb-id nos elementos editáveis.\n"
+            "5. Explique em uma frase, antes do código, o que foi corrigido."
+        )
+
+        messages = [{"role": "user", "content": base_prompt}]
+        out: Dict[str, Any] = {}
+        validation: Optional[PatchValidation] = None
+        attempts = self.max_repairs + 1
+
+        for attempt in range(1, attempts + 1):
+            async for event in self._collect(
+                messages,
+                out,
+                max_tokens=self.max_tokens,
+                temperature=0.3,
+                detail="Construindo correção de layout",
+            ):
+                yield event
+
+            if out["error"]:
+                state.error = out["error"]
+                yield {"type": "error", "detail": out["error"]}
+                return
+
+            # O reparo pode atuar num snippet pequeno (ex.: dois cards); não
+            # exigimos o mesmo volume de texto de uma página inteira.
+            validation = validate_and_repair(
+                out["content"], mode="full", min_chars=60, min_text_chars=3
+            )
+            identical = bool(
+                state.current_html
+                and validation.html
+                and _normalize_html(validation.html) == _normalize_html(state.current_html)
+            )
+            problem = None
+            if not validation.ok:
+                problem = "; ".join(validation.errors[:4])
+            elif identical:
+                problem = "O HTML devolvido é idêntico ao atual (nada foi corrigido)."
+
+            yield {"type": "validation_result", "scope": "full", **validation.to_event()}
+
+            if problem is None:
+                break
+            if attempt == attempts:
+                yield {
+                    "type": "error",
+                    "detail": (
+                        f"A correção de layout não passou na validação: {problem}. "
+                        "Selecione o elemento específico e peça a alteração por partes."
+                    ),
+                }
+                return
+
+            messages = [
+                {"role": "user", "content": base_prompt},
+                {"role": "assistant", "content": "```html\n" + (out["content"] or "")[:16000] + "\n```"},
+                {"role": "user", "content": validation.repair_prompt()},
+            ]
+
+        assert validation is not None
+        state.accumulated_patch = validation.html
+        state.patch_type = "full"
+        state.reasoning = out["reasoning"]
+        explanation = re.sub(r"```(?:html)?[\s\S]*?```", "", out["content"]).strip()
+        state.final_summary = explanation or "Layout corrigido: containers, alinhamento e tags ajustados."
+
+        audit = verify_ui_quality(validation.html)
+        if validation.errors:
+            audit.passed = False
+            audit.issues = list(audit.issues) + validation.errors
+            audit.score = min(audit.score, validation.score)
+        state.audit = audit
+        yield {
+            "type": "audit_result",
+            "passed": audit.passed,
+            "score": audit.score,
+            "issues": audit.issues,
+            "suggestions": audit.suggestions,
+        }
+        yield {
+            "type": "agent_done",
+            "patch": state.accumulated_patch,
+            "patch_type": "full",
+            "summary": state.final_summary,
+            "reasoning": state.reasoning,
+            "audit": audit.model_dump(),
+            "plan": [],
+        }
+
+    # -- Fluxo 4: tela completa por seções ------------------------------
+    async def _plan(self, state: AgentState) -> AsyncGenerator[Dict[str, Any], None]:
         yield {
             "type": "node_start",
             "node": "planner",
             "title": "Planejando Arquitetura e Seções",
-            "detail": "Decompondo requisitos em blocos de UI modernos..."
+            "detail": "Decompondo o pedido em blocos de UI que serão gerados e validados separadamente...",
         }
 
-        planner_prompt = (
-            "Você é o Arquiteto Principal de Interfaces do Mockbird. Analise o pedido do usuário e decomponha a construção da tela em 3 etapas claras.\n"
+        prompt = (
+            "Você é o Arquiteto Principal de Interfaces do Mockbird. Decomponha o pedido em 3 seções "
+            "independentes de uma página web, em ordem de leitura.\n"
             f"Pedido: {state.prompt}\n\n"
-            "Responda SOMENTE em formato JSON válido:\n"
-            "{\n"
-            '  "plan": [\n'
-            '    {"id": 1, "title": "Navbar & Hero Section", "description": "Cabeçalho com logo, menu, título impactante e imagem principal"},\n'
-            '    {"id": 2, "title": "Grid de Conteúdo / Recursos", "description": "Cards visuais com especificações e fotos reais"},\n'
-            '    {"id": 3, "title": "Seção de Conversão & Rodapé", "description": "Formulário com CTA e rodapé organizado"}\n'
-            "  ]\n"
-            "}"
+            "Responda SOMENTE JSON válido no formato:\n"
+            '{"plan": [{"id": 1, "title": "Navbar & Hero", "description": "..."}]}'
         )
 
-        planner_content = ""
-        async for chunk in self._call_llm_stream(
-            [{"role": "user", "content": planner_prompt}],
-            state.model_name,
+        out: Dict[str, Any] = {}
+        async for event in self._collect(
+            [{"role": "user", "content": prompt}],
+            out,
+            max_tokens=500,
             temperature=0.2,
-            max_tokens=600
+            detail="Planejando seções",
         ):
-            if chunk["type"] == "completed":
-                planner_content = chunk["content"]
+            yield event
 
-        try:
-            m_json = re.search(r"\{[\s\S]*\}", planner_content)
-            if m_json:
-                data = json.loads(m_json.group(0))
-                steps = [PlanStep(**s) for s in data.get("plan", [])]
-                if steps:
-                    state.plan = steps
-        except Exception:
-            state.plan = [
-                PlanStep(id=1, title="Estrutura & Hero", description="Cabeçalho e seção de destaque"),
-                PlanStep(id=2, title="Grid de Componentes", description="Exposição de produtos/recursos"),
-                PlanStep(id=3, title="Conversão & Rodapé", description="Chamadas de ação e links finais")
-            ]
+        if out["error"]:
+            state.error = out["error"]
+            yield {"type": "error", "detail": out["error"]}
+            return
 
+        plan: List[PlanStep] = []
+        if not out["error"]:
+            match = re.search(r"\{[\s\S]*\}", out["content"] or "")
+            if match:
+                try:
+                    data = json.loads(match.group(0))
+                    for item in data.get("plan", []):
+                        if not isinstance(item, dict):
+                            continue
+                        plan.append(PlanStep(
+                            id=int(item.get("id") or len(plan) + 1),
+                            title=str(item.get("title") or f"Seção {len(plan) + 1}")[:80],
+                            description=str(item.get("description") or "Seção da interface")[:300],
+                        ))
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    plan = []
+
+        if len(plan) < 2:
+            plan = [step.model_copy() for step in PLANNER_FALLBACK]
+
+        state.plan = plan[:3]
+        yield {"type": "plan_ready", "plan": [s.model_dump() for s in state.plan]}
+
+    def _section_prompt(self, state: AgentState, index: int, total: int, previous: List[str]) -> str:
+        step = state.plan[index]
+        context = ""
+        if previous:
+            context = (
+                "\nSEÇÕES JÁ GERADAS (não repita o conteúdo delas):\n"
+                + "\n".join(f"- {t}" for t in previous)
+                + "\n"
+            )
+        position = "primeira" if index == 0 else ("última" if index == total - 1 else f"{index + 1}ª")
+        return (
+            "Você é o Diretor de Arte e Desenvolvedor Frontend Sênior do Mockbird v2.\n"
+            f"PEDIDO COMPLETO DO USUÁRIO: {state.prompt}\n"
+            f"Você está gerando a {position} de {total} seções.\n"
+            f"SEÇÃO ATUAL: {step.title} — {step.description}\n"
+            f"{context}\n"
+            f"{DESIGN_SYSTEM}\n\n"
+            "FORMATO DA RESPOSTA:\n"
+            "1. Uma frase curta de raciocínio e, em seguida, o bloco ```html ... ```.\n"
+            f"2. O bloco deve começar com <section data-mb-id=\"section-{index + 1}\" ...> e terminar com </section>.\n"
+            "3. Nada de <html>, <head>, <body>, <style> ou <script>.\n"
+            "4. Conteúdo real e completo em Português (sem resumir, sem placeholders).\n"
+            "5. Se for a primeira seção, inclua <header> com navbar e o hero. "
+            "Se for a última, inclua a chamada final e o <footer>."
+        )
+
+    async def _run_full_page(self, state: AgentState) -> AsyncGenerator[Dict[str, Any], None]:
         yield {
-            "type": "plan_ready",
-            "plan": [s.model_dump() for s in state.plan]
+            "type": "node_start",
+            "node": "inspector",
+            "title": "Inspecionando Contexto do Projeto",
+            "detail": "Analisando referências de design e tokens visuais...",
+        }
+        state.dom_summary = extract_dom_structure(state.current_html) if state.current_html else "Documento vazio."
+        yield {
+            "type": "tool_call",
+            "tool": "get_canvas_dom",
+            "summary": "Contexto do Canvas inspecionado.",
         }
 
-        # Executor
+        async for event in self._plan(state):
+            yield event
+        if state.error:
+            return
+
         yield {
             "type": "node_start",
             "node": "executor",
-            "title": "Gerando Interface Completa",
-            "detail": "Construindo código HTML real com Tailwind CSS, fotos reais do Unsplash e data-mb-id..."
+            "title": "Gerando Interface Completa por Seções",
+            "detail": "Cada seção é gerada, validada e corrigida individualmente antes de entrar na tela...",
         }
 
-        plan_desc = "\n".join([f"- {s.title}: {s.description}" for s in state.plan])
-        executor_prompt = (
-            "Você é o Diretor de Arte e Desenvolvedor Frontend Sênior do Mockbird v2.\n"
-            "Crie o código HTML COMPLETO, ESTONTEANTE e PROFISSIONAL para a solicitação do usuário.\n\n"
-            f"SOLICITAÇÃO: {state.prompt}\n"
-            f"PLANO APROVADO:\n{plan_desc}\n\n"
-            "REGRAS INEGOCIÁVEIS DE ALTA PERFORMANCE (LEIA COM EXTREMA ATENÇÃO):\n"
-            "0. ZERO CSS EM <style>: O Tailwind CSS CDN já está ativo no Canvas! É TERMINANTEMENTE PROIBIDO criar blocos <style> ou escrever CSS manual. Use EXCLUSIVAMENTE classes utilitárias do Tailwind direto nos elementos (ex: class='bg-[#09090b] text-white p-8 rounded-2xl flex items-center border border-white/10'). Isso economiza 80% dos seus tokens!\n"
-            "1. DIRETO AO HTML: Emita DIRETAMENTE a estrutura semântica (<header>, <section id='hero'>, <section id='modelos'>, <section id='simulador'>, <footer>) dentro de um container raiz <div id='app-root' class='min-h-screen bg-[#09090b] text-slate-100 font-sans antialiased'>. NÃO perca tokens gerando <!DOCTYPE>, <head>, <meta> ou <title> (o Mockbird já envelopa automaticamente no canvas).\n"
-            "2. PROIBIDO RESUMIR: NUNCA escreva comentários de TODO ou textos como 'conteúdo aqui'. Escreva CADA card, imagem, botão e especificação por completo!\n"
-            "3. IMAGENS REAIS: Use sempre tags <img> com fotos reais do Unsplash em alta resolução (ex: fotos reais de veículos, interiores, produtos) com classes 'w-full h-full object-cover rounded-xl'.\n"
-            "4. DESIGN SYSTEM: Fundo escuro grafite (bg-[#09090b]), superfícies de cards (bg-[#121215] border border-white/10 rounded-2xl p-6 hover:border-red-500/50 transition), tipografia sans-serif nítida, badges translúcidos (bg-white/5 border border-white/10 backdrop-blur-md px-3 py-1 rounded-full text-xs).\n"
-            "5. INTERATIVIDADE: Todo elemento interativo (botões, cards, formulários) DEVE ter data-mb-id='...' único.\n"
-            "6. Inicie IMEDIATAMENTE com ```html\n<div id='app-root' class='min-h-screen bg-[#09090b] text-slate-100 font-sans antialiased'>"
-        )
+        sections: List[str] = []
+        titles: List[str] = []
+        failures: List[str] = []
+        total = len(state.plan)
 
-        raw_code = ""
-        assistant_reasoning = ""
-
-        async for chunk in self._call_llm_stream(
-            [{"role": "user", "content": executor_prompt}],
-            state.model_name,
-            temperature=0.35,
-            max_tokens=12288
-        ):
-            if chunk["type"] == "heartbeat":
-                yield {
-                    "type": "node_progress",
-                    "chars": chunk["chars"],
-                    "detail": f"Gerando código HTML em tempo real ({chunk['chars']} caracteres)..."
-                }
-            elif chunk["type"] == "completed":
-                raw_code = chunk["content"]
-                assistant_reasoning = chunk["reasoning"]
-
-        extracted_html = clean_extracted_html(raw_code)
-        state.accumulated_patch = extracted_html if extracted_html else None
-        state.patch_type = "full" if state.accumulated_patch else "none"
-        state.reasoning = assistant_reasoning
-
-        # Avaliador
-        if state.accumulated_patch:
+        for index, step in enumerate(state.plan):
             yield {
                 "type": "node_start",
-                "node": "evaluator",
-                "title": "Avaliador de Qualidade & Antirresumo",
-                "detail": "Auditando se o código contém resumos preguiçosos ou tags desbalanceadas..."
+                "node": f"executor:section-{index + 1}",
+                "title": f"Seção {index + 1}/{total}: {step.title}",
+                "detail": step.description,
             }
 
-            audit = verify_ui_quality(state.accumulated_patch)
-            state.audit = audit
+            base_prompt = self._section_prompt(state, index, total, titles)
+            messages = [{"role": "user", "content": base_prompt}]
+            out: Dict[str, Any] = {}
+            validation: Optional[PatchValidation] = None
+            attempts = self.max_repairs + 1
 
+            for attempt in range(1, attempts + 1):
+                async for event in self._collect(
+                    messages,
+                    out,
+                    max_tokens=self.section_max_tokens,
+                    temperature=0.35,
+                    detail=f"Gerando seção {index + 1}/{total}",
+                ):
+                    yield event
+
+                if out["error"]:
+                    # Erro de transporte/autenticação: não adianta tentar as próximas seções.
+                    yield {"type": "error", "detail": out["error"]}
+                    return
+
+                # O modelo pode gastar todo o orçamento em raciocínio e devolver
+                # conteúdo vazio. Nesse caso pedimos explicitamente só o HTML.
+                if not extract_html(out.get("content") or "") and out.get("reasoning"):
+                    if attempt < attempts:
+                        yield {
+                            "type": "node_progress",
+                            "chars": 0,
+                            "detail": "O modelo gastou o limite em raciocínio; pedindo apenas o HTML...",
+                        }
+                        messages = messages + [{
+                            "role": "user",
+                            "content": (
+                                "Sua resposta anterior consumiu todo o limite de tokens em raciocínio e não "
+                                "produziu HTML. Responda AGORA somente com o bloco ```html ... ``` da seção, "
+                                "sem nenhum raciocínio antes ou depois."
+                            ),
+                        }]
+                        continue
+
+                # Truncamento: pede continuação exata uma única vez.
+                if out.get("finish_reason") == "length" and out.get("content"):
+                    async for event in self._continue(
+                        messages,
+                        out["content"],
+                        out,
+                        max_tokens=self.section_max_tokens,
+                        temperature=0.35,
+                        detail=f"Completando seção {index + 1}/{total}",
+                    ):
+                        yield event
+
+                validation = validate_section(out["content"])
+                yield {"type": "validation_result", "scope": f"section-{index + 1}", **validation.to_event()}
+
+                if validation.ok:
+                    break
+                if attempt == attempts:
+                    failures.append(f"{step.title}: {'; '.join(validation.errors[:3])}")
+                    break
+
+                yield {
+                    "type": "node_progress",
+                    "chars": len(validation.html or ""),
+                    "detail": f"Corrigindo seção {index + 1} ({validation.errors[0][:80]})...",
+                }
+                messages = [
+                    {"role": "user", "content": base_prompt},
+                    {"role": "assistant", "content": "```html\n" + (out["content"] or "")[:6000] + "\n```"},
+                    {"role": "user", "content": validation.repair_prompt()},
+                ]
+
+            if validation and validation.ok and validation.html:
+                sections.append(validation.html)
+                titles.append(step.title)
+                yield {
+                    "type": "tool_call",
+                    "tool": "section_ready",
+                    "summary": f"Seção '{step.title}' validada ({validation.score}/100).",
+                }
+
+        if not sections:
+            detail = failures[0] if failures else "o modelo não retornou HTML válido"
             yield {
-                "type": "audit_result",
-                "passed": audit.passed,
-                "score": audit.score,
-                "issues": audit.issues,
-                "suggestions": audit.suggestions
+                "type": "error",
+                "detail": (
+                    f"Nenhuma seção válida foi gerada ({detail}). "
+                    "Verifique o provedor/modelo em Configurações → LLM ou tente um pedido mais específico."
+                ),
             }
+            return
 
-            state.is_complete = True
-            state.final_summary = (
-                f"Interface construída com sucesso. "
-                f"Qualidade avaliada com nota {state.audit.score if state.audit else 100}/100. "
-                f"Pronta para exibição e testes no Canvas."
-            )
-        else:
-            state.audit = None
-            state.is_complete = False
-            state.final_summary = (
-                "Aviso: Não foi possível gerar o código HTML completo nesta tentativa. "
-                "O modelo pode ter excedido o tempo limite ou não completou o bloco de código. "
-                "Por favor, tente novamente solicitando uma seção ou detalhe específico."
-            )
+        yield {
+            "type": "node_start",
+            "node": "evaluator",
+            "title": "Montando e Auditando a Tela",
+            "detail": "Combinando as seções validadas e verificando estrutura final...",
+        }
+
+        assembled = assemble_sections(sections)
+        if not assembled.ok and self.max_repairs:
+            yield {"type": "validation_result", "scope": "document", **assembled.to_event()}
+            yield {
+                "type": "node_progress",
+                "chars": len(assembled.html or ""),
+                "detail": "Corrigindo inconsistências do documento montado...",
+            }
+            body = re.sub(r"<!DOCTYPE[\s\S]*?<body[^>]*>|</body>[\s\S]*$", "", assembled.html or "")
+            repair_messages = [
+                {"role": "user", "content": (
+                    "Corrija o HTML abaixo mantendo o conteúdo e o design. Devolva o HTML completo "
+                    "dentro de ```html ... ```, sem <html>/<body>.\n\n"
+                    f"{DESIGN_SYSTEM}\n\nPROBLEMAS:\n" + "\n".join(f"- {e}" for e in assembled.errors)
+                )},
+                {"role": "assistant", "content": "```html\n" + body[:16000] + "\n```"},
+                {"role": "user", "content": "Aplique as correções e devolva o HTML final fechado."},
+            ]
+            out = {}
+            async for event in self._collect(
+                repair_messages,
+                out,
+                max_tokens=self.max_tokens,
+                temperature=0.3,
+                detail="Corrigindo documento final",
+            ):
+                yield event
+            if out["error"]:
+                yield {"type": "error", "detail": out["error"]}
+                return
+            assembled = validate_and_repair(out["content"], mode="full", min_chars=200)
+            yield {"type": "validation_result", "scope": "document", **assembled.to_event()}
+
+        if not assembled.ok:
+            yield {
+                "type": "error",
+                "detail": (
+                    "O documento final não passou na validação: "
+                    + "; ".join(assembled.errors[:3])
+                    + ". Tente novamente ou gere a tela em partes."
+                ),
+            }
+            return
+
+        state.accumulated_patch = assembled.html
+        state.patch_type = "full"
+        state.is_complete = True
+        state.reasoning = out.get("reasoning") if isinstance(out, dict) else None
+
+        audit = verify_ui_quality(assembled.html)
+        if failures:
+            audit.passed = False
+            audit.issues = list(audit.issues) + [f"Seção omitida — {f}" for f in failures]
+        state.audit = audit
+        yield {
+            "type": "audit_result",
+            "passed": audit.passed,
+            "score": audit.score,
+            "issues": audit.issues,
+            "suggestions": audit.suggestions,
+        }
+
+        omitted = f" {len(failures)} seção(ões) foram omitidas." if failures else ""
+        state.final_summary = (
+            f"Tela construída em {len(sections)} seção(ões) validadas e aplicada no canvas "
+            f"(qualidade {audit.score}/100).{omitted}"
+        )
 
         yield {
             "type": "agent_done",
             "patch": state.accumulated_patch,
-            "patch_type": state.patch_type,
+            "patch_type": "full",
             "summary": state.final_summary,
             "reasoning": state.reasoning,
-            "audit": state.audit.model_dump() if state.audit else None,
-            "plan": [s.model_dump() for s in state.plan]
+            "audit": audit.model_dump(),
+            "plan": [s.model_dump() for s in state.plan],
+            "omitted_sections": failures,
         }

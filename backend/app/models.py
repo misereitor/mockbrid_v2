@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from app.timeutils import utcnow
 from sqlalchemy import (
     Column,
     String,
@@ -9,11 +9,10 @@ from sqlalchemy import (
     Float,
     DateTime,
     ForeignKey,
-    JSON,
     BigInteger,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -28,8 +27,12 @@ class Organization(Base):
     id = Column(String(36), primary_key=True, default=generate_uuid)
     name = Column(String(255), nullable=False)
     slug = Column(String(255), unique=True, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    ai_plan_id = Column(
+        String(36), ForeignKey("ai_plans.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at = Column(DateTime, default=utcnow, nullable=False)
 
+    ai_plan = relationship("AIPlan")
     users = relationship(
         "User", back_populates="organization", cascade="all, delete-orphan"
     )
@@ -55,13 +58,21 @@ class User(Base):
         String(50), default="editor", nullable=False
     )  # owner, admin, editor, viewer
     is_active = Column(Boolean, default=True, nullable=False)
+    # Administrador do sistema (o primeiro usuário criado). Pode configurar
+    # e-mail, provedores e demais ajustes globais da instância.
+    is_system_admin = Column(Boolean, default=False, nullable=False)
+    email_verified = Column(Boolean, default=False, nullable=False)
+    email_verified_at = Column(DateTime, nullable=True)
     monthly_token_limit = Column(BigInteger, default=200000, nullable=False)
     tokens_used_month = Column(BigInteger, default=0, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
 
     organization = relationship("Organization", back_populates="users")
     sessions = relationship(
         "Session", back_populates="user", cascade="all, delete-orphan"
+    )
+    auth_tokens = relationship(
+        "AuthToken", back_populates="user", cascade="all, delete-orphan"
     )
 
 
@@ -78,7 +89,7 @@ class Session(Base):
     token = Column(Text, unique=True, nullable=False, index=True)
     csrf_token = Column(String(255), nullable=False)
     expires_at = Column(DateTime, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
 
     user = relationship("User", back_populates="sessions")
 
@@ -98,7 +109,7 @@ class OrganizationInvite(Base):
     token = Column(String(100), unique=True, nullable=False, index=True)
     expires_at = Column(DateTime, nullable=False)
     used_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
 
     organization = relationship("Organization")
 
@@ -118,7 +129,7 @@ class ShareLink(Base):
     allow_comments = Column(Boolean, default=False, nullable=False)
     expires_at = Column(DateTime, nullable=True)
     view_count = Column(Integer, default=0, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
 
     project = relationship("Project")
 
@@ -132,7 +143,7 @@ class Workspace(Base):
     )
     name = Column(String(255), nullable=False)
     slug = Column(String(255), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
 
     organization = relationship("Organization", back_populates="workspaces")
     projects = relationship(
@@ -171,9 +182,12 @@ class Project(Base):
         String(36), nullable=True
     )  # Referência da tela principal para o CEO/Apresentação
     is_archived = Column(Boolean, default=False, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    # Apresentação pública (/p/<slug>) só responde quando o projeto é publicado
+    # ou quando existe um ShareLink válido e não revogado.
+    is_published = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
     updated_at = Column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+        DateTime, default=utcnow, onupdate=utcnow, nullable=False
     )
 
     workspace = relationship("Workspace", back_populates="projects")
@@ -214,7 +228,7 @@ class ProjectMember(Base):
     role = Column(
         String(50), default="editor", nullable=False
     )  # viewer, commenter, editor, admin
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
 
     project = relationship("Project", back_populates="members")
     user = relationship("User")
@@ -237,9 +251,9 @@ class DesignTokens(Base):
     light_tokens = Column(JSONB, default=dict, nullable=False)
     dark_tokens = Column(JSONB, default=dict, nullable=False)
     shared_tokens = Column(JSONB, default=dict, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
     updated_at = Column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+        DateTime, default=utcnow, onupdate=utcnow, nullable=False
     )
 
     project = relationship("Project", back_populates="tokens")
@@ -258,7 +272,7 @@ class Canvas(Base):
     name = Column(String(255), nullable=False)
     sort_order = Column(Integer, default=0, nullable=False)
     entry_screen_id = Column(String(36), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
 
     project = relationship("Project", back_populates="canvases")
     screens = relationship(
@@ -298,9 +312,9 @@ class Screen(Base):
         String(50), default="none", nullable=False
     )  # none, fade, slide-left
     current_revision = Column(Integer, default=1, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
     updated_at = Column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+        DateTime, default=utcnow, onupdate=utcnow, nullable=False
     )
 
     canvas = relationship("Canvas", back_populates="screens")
@@ -328,7 +342,7 @@ class ScreenRevision(Base):
     js_content = Column(Text, nullable=False)
     change_summary = Column(String(255), default="", nullable=False)
     actor = Column(String(255), default="user", nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
 
     screen = relationship("Screen", back_populates="revisions")
 
@@ -345,7 +359,7 @@ class DataScenario(Base):
     )
     name = Column(String(255), nullable=False)  # default, vazio, erro, critico
     mock_data = Column(JSONB, default=dict, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
 
     canvas = relationship("Canvas", back_populates="scenarios")
 
@@ -373,7 +387,7 @@ class Comment(Base):
     body = Column(Text, nullable=False)
     status = Column(String(50), default="open", nullable=False)  # open, resolved
     replies = Column(JSONB, default=list, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
     resolved_at = Column(DateTime, nullable=True)
 
     screen = relationship("Screen", back_populates="comments")
@@ -399,7 +413,7 @@ class AIProvider(Base):
     is_active = Column(Boolean, default=True, nullable=False)
     monthly_token_limit = Column(BigInteger, default=1000000, nullable=False)
     tokens_used_month = Column(BigInteger, default=0, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
 
     organization = relationship("Organization", back_populates="ai_providers")
 
@@ -433,11 +447,110 @@ class MCPApiKey(Base):
     last_used_at = Column(DateTime, nullable=True)
     expires_at = Column(DateTime, nullable=True)
     revoked_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
 
     user = relationship("User")
     organization = relationship("Organization")
     project = relationship("Project")
+
+
+class AIPlan(Base):
+    """Plano comercial de IA aplicado a uma organização.
+
+    Quando a organização tem plano, o limite mensal de tokens do plano
+    substitui o limite individual do usuário em `enforce_ai_quota`.
+    """
+
+    __tablename__ = "ai_plans"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    slug = Column(String(50), unique=True, nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(Text, default="", nullable=False)
+    monthly_token_limit = Column(BigInteger, nullable=False)
+    price_cents = Column(Integer, default=0, nullable=False)
+    features = Column(JSONB, default=list, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    sort_order = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+
+class Asset(Base):
+    """Arquivo enviado pelo usuário (imagem) servido pelo próprio backend."""
+
+    __tablename__ = "assets"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(
+        String(36),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    uploaded_by = Column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    filename = Column(String(255), nullable=False)  # nome no disco
+    original_name = Column(String(255), nullable=False)
+    content_type = Column(String(100), nullable=False)
+    size_bytes = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+    __table_args__ = (UniqueConstraint("project_id", "filename", name="uq_asset_project_filename"),)
+
+    project = relationship("Project")
+
+
+class EmailSettings(Base):
+    """Configuração global de envio de e-mail (linha única, editável pelo admin)."""
+
+    __tablename__ = "email_settings"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    provider = Column(String(20), default="disabled", nullable=False)  # disabled, smtp, resend
+    from_email = Column(String(255), default="", nullable=False)
+    from_name = Column(String(120), default="Mockbird", nullable=False)
+    reply_to = Column(String(255), default="", nullable=False)
+    app_base_url = Column(String(255), default="", nullable=False)
+    require_verification = Column(Boolean, default=False, nullable=False)
+
+    smtp_host = Column(String(255), default="", nullable=False)
+    smtp_port = Column(Integer, default=587, nullable=False)
+    smtp_username = Column(String(255), default="", nullable=False)
+    encrypted_smtp_password = Column(Text, default="", nullable=False)
+    smtp_security = Column(String(20), default="starttls", nullable=False)  # starttls, ssl, none
+
+    encrypted_resend_api_key = Column(Text, default="", nullable=False)
+
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+    updated_by = Column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+
+class AuthToken(Base):
+    """Token de uso único para verificação de e-mail e redefinição de senha.
+
+    O banco guarda apenas o hash SHA-256; o token em claro só existe no link
+    enviado por e-mail.
+    """
+
+    __tablename__ = "auth_tokens"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    user_id = Column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    kind = Column(String(30), nullable=False, index=True)  # verify_email, reset_password
+    token_hash = Column(String(128), unique=True, nullable=False, index=True)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+    user = relationship("User", back_populates="auth_tokens")
 
 
 class AIConversation(Base):
@@ -469,9 +582,9 @@ class AIConversation(Base):
         index=True,
     )
     title = Column(String(255), default="Nova Conversa", nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
     updated_at = Column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+        DateTime, default=utcnow, onupdate=utcnow, nullable=False
     )
 
     user = relationship("User")
@@ -500,7 +613,7 @@ class AIMessage(Base):
         String(50), default="none", nullable=False
     )  # none, element, full
     tokens_used = Column(Integer, default=0, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
 
     conversation = relationship("AIConversation", back_populates="messages")
 
@@ -530,7 +643,7 @@ class AIGenerationLog(Base):
     finish_reason = Column(String(50), nullable=True)
     raw_snippet = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False, index=True)
 
     user = relationship("User")
     screen = relationship("Screen")

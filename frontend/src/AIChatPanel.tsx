@@ -1,16 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Sparkles, 
-  Send, 
   Loader2, 
-  Check, 
   AlertCircle, 
   ChevronDown, 
   ChevronUp, 
   Brain, 
   Plus, 
   Trash2, 
-  Copy, 
   History, 
   MessageSquare, 
   CheckCircle2, 
@@ -19,63 +16,46 @@ import {
   Wrench, 
   Zap, 
   ListTodo,
-  Target,
-  X,
   RotateCcw,
   Undo2,
-  Redo2,
-  GitCompare,
-  FileCode
+  Redo2
 } from 'lucide-react';
 import { SelectedElementInfo } from './CanvasEditor';
+import {
+  cleanAndExtractHtml,
+  computeDiffLines,
+  isRenderableHtml,
+  type ChatMessage,
+  type ChatSession,
+  type DiffLine,
+  type PlanItem,
+  type QualityAuditInfo,
+} from './lib/chat';
+import { DiffViewer } from './components/chat/DiffViewer';
+import { ChatComposer } from './components/chat/ChatComposer';
+import { RewindModal, type RewindTarget } from './components/chat/RewindModal';
 
-export interface PlanItem {
-  id: number;
-  title: string;
-  description: string;
-}
+export type { ChatMessage, ChatSession, DiffLine, PlanItem, QualityAuditInfo };
+export { cleanAndExtractHtml, computeDiffLines };
 
-export interface QualityAuditInfo {
-  score: number;
-  passed: boolean;
-  issues: string[];
-  suggestions: string[];
-}
+const createDefaultSession = (): ChatSession => ({
+  id: `sess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+  title: 'Conversa Inicial',
+  createdAt: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+  messages: []
+});
 
-export interface DiffLine {
-  type: 'added' | 'removed' | 'unchanged';
-  text: string;
-}
-
-export interface ChatMessage {
-  id: string;
-  role: 'user' | 'assistant';
-  content: string;
-  reasoning?: string;
-  patch?: string;
-  patchType?: 'element' | 'full' | 'none';
-  targetSelector?: string;
-  targetMbId?: string;
-  targetTag?: string;
-  timestamp: string;
-  mode?: 'agent' | 'chat';
-  plan?: PlanItem[];
-  audit?: QualityAuditInfo;
-  
-  // Snapshots de estado para rastreabilidade e reversão
-  htmlSnapshotBefore?: string;
-  htmlSnapshotAfter?: string;
-  elementSnapshotBefore?: string;
-  isApplied?: boolean;
-  appliedAt?: string;
-}
-
-export interface ChatSession {
-  id: string;
-  title: string;
-  createdAt: string;
-  messages: ChatMessage[];
-}
+const readStoredSessions = (key: string): ChatSession[] | null => {
+  try {
+    const saved = localStorage.getItem(key);
+    if (!saved) return null;
+    const parsed = JSON.parse(saved);
+    if (Array.isArray(parsed) && parsed.length > 0) return parsed as ChatSession[];
+  } catch (e) {
+    console.error('Falha ao carregar sessões de chat:', e);
+  }
+  return null;
+};
 
 interface AIChatPanelProps {
   currentHtml: string;
@@ -89,88 +69,6 @@ interface AIChatPanelProps {
   onCaptureScreenshot?: () => Promise<string>;
 }
 
-export function cleanAndExtractHtml(text: string): string {
-  if (!text) return '';
-  
-  // 1. Bloco de código com crases fechadas ```html ... ```
-  const fenceMatch = text.match(/```(?:html)?\s*(<[\s\S]+?>[\s\S]*?)```/i);
-  if (fenceMatch) {
-    const inside = fenceMatch[1].trim();
-    if (inside.includes('<') && inside.includes('>')) {
-      return inside;
-    }
-  }
-
-  // 1b. Bloco de código iniciado com ```html que não fechou com crases (corte por length)
-  const openFenceMatch = text.match(/```(?:html)?\s*(<!DOCTYPE[\s\S]+|<html[\s\S]+|<(?:div|section|main|header|footer)[\s\S]+)/i);
-  if (openFenceMatch) {
-    let inside = openFenceMatch[1].trim();
-    inside = inside.replace(/```+$/, '').trim();
-    if (inside.includes('<') && inside.includes('>')) {
-      return inside;
-    }
-  }
-
-  // 2. Documento completo HTML
-  const docMatch = text.match(/(<!DOCTYPE\s+html[\s\S]+?<\/html>|<html[\s\S]+?<\/html>)/i);
-  if (docMatch) return docMatch[1].trim();
-
-  // 2b. Documento iniciado com <!DOCTYPE ou <html>
-  const openDocMatch = text.match(/(<!DOCTYPE\s+html[\s\S]+|<html\b[\s\S]+)/i);
-  if (openDocMatch) {
-    let inside = openDocMatch[1].trim();
-    inside = inside.replace(/```+$/, '').trim();
-    if (inside.includes('<') && inside.includes('>')) {
-      return inside;
-    }
-  }
-
-  // 3. Tags HTML estruturais comuns
-  const tagMatch = text.match(/(<(?:div|section|main|header|footer|aside|article|form|nav|button|ul|ol|table|dialog|p|span|a|h[1-6])\b[\s\S]+?<\/(?:div|section|main|header|footer|aside|article|form|nav|button|ul|ol|table|dialog|p|span|a|h[1-6])>)/i);
-  if (tagMatch) return tagMatch[1].trim();
-
-  // 4. Tags autocontidas (img, input)
-  const selfMatch = text.match(/(<(?:img|input|hr|br)\b[^>]*\/?>)/i);
-  if (selfMatch) return selfMatch[1].trim();
-
-  return '';
-}
-
-export function computeDiffLines(oldText: string, newText: string): DiffLine[] {
-  if (!oldText) {
-    return newText.split('\n').map(line => ({ type: 'added', text: line }));
-  }
-  const oldLines = oldText.split('\n');
-  const newLines = newText.split('\n');
-  
-  const diff: DiffLine[] = [];
-  const oldSet = new Set(oldLines.map(l => l.trim()));
-  const newSet = new Set(newLines.map(l => l.trim()));
-
-  let i = 0;
-  let j = 0;
-  while (i < oldLines.length || j < newLines.length) {
-    if (i < oldLines.length && j < newLines.length && oldLines[i].trim() === newLines[j].trim()) {
-      diff.push({ type: 'unchanged', text: oldLines[i] });
-      i++;
-      j++;
-    } else if (i < oldLines.length && !newSet.has(oldLines[i].trim())) {
-      diff.push({ type: 'removed', text: oldLines[i] });
-      i++;
-    } else if (j < newLines.length && !oldSet.has(newLines[j].trim())) {
-      diff.push({ type: 'added', text: newLines[j] });
-      j++;
-    } else if (j < newLines.length) {
-      diff.push({ type: 'added', text: newLines[j] });
-      j++;
-    } else if (i < oldLines.length) {
-      diff.push({ type: 'removed', text: oldLines[i] });
-      i++;
-    }
-  }
-  return diff;
-}
-
 export function AIChatPanel({ 
   currentHtml, 
   onApplyHtml, 
@@ -180,15 +78,12 @@ export function AIChatPanel({
   initialPrompt, 
   projectId = 'default'
 }: AIChatPanelProps) {
-  const [sessions, setSessions] = useState<ChatSession[]>([
-    {
-      id: 'sess_default',
-      title: 'Conversa Inicial',
-      createdAt: '',
-      messages: []
-    }
-  ]);
-  const [currentSessionId, setCurrentSessionId] = useState<string>('sess_default');
+  const storageKey = `mockbird_chat_sessions_${projectId}`;
+  // Hidrata direto do localStorage no primeiro render: se um efeito fizesse
+  // isso depois, o efeito de persistência gravaria o estado vazio por cima do
+  // histórico salvo (o StrictMode monta os efeitos duas vezes).
+  const [sessions, setSessions] = useState<ChatSession[]>(() => readStoredSessions(storageKey) || [createDefaultSession()]);
+  const [currentSessionId, setCurrentSessionId] = useState<string>(() => sessions[0]?.id || 'sess_default');
   const [prompt, setPrompt] = useState(initialPrompt || '');
   const [loading, setLoading] = useState(false);
   const [executionMode, setExecutionMode] = useState<'agent' | 'chat'>('agent');
@@ -209,17 +104,12 @@ export function AIChatPanel({
   const [diffTabs, setDiffTabs] = useState<Record<string, 'unified' | 'split'>>({});
   
   // Modal de Rollback / Voltar Mensagem (estilo Antigravity)
-  const [rewindTarget, setRewindTarget] = useState<{
-    msgId: string;
-    index: number;
-    isUser: boolean;
-    content: string;
-    snapshotHtml?: string;
-  } | null>(null);
+  const [rewindTarget, setRewindTarget] = useState<RewindTarget | null>(null);
   const [revertCodeOnRewind, setRevertCodeOnRewind] = useState<boolean>(true);
   const [reloadPromptOnRewind, setReloadPromptOnRewind] = useState<boolean>(true);
 
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const lastPromptRef = useRef<string>('');
   const [appliedId, setAppliedId] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [showSessionsDrawer, setShowSessionsDrawer] = useState(false);
@@ -235,42 +125,33 @@ export function AIChatPanel({
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const thoughtEndRef = useRef<HTMLDivElement>(null);
-  const storageKey = `mockbird_chat_sessions_${projectId}`;
+  const hydratedKeyRef = useRef(storageKey);
 
-  // Carrega sessões salvas do localStorage
+  // Troca de projeto no mesmo painel: recarrega a conversa daquela chave.
   useEffect(() => {
+    if (hydratedKeyRef.current === storageKey) return;
+    hydratedKeyRef.current = storageKey;
+    const stored = readStoredSessions(storageKey);
+    const next = stored || [createDefaultSession()];
+    setSessions(next);
+    setCurrentSessionId(next[0].id);
+    setStreamingContent('');
+    setStreamingThought('');
+    setAgentStep(null);
+    setAgentPlan([]);
+    setAgentAudit(null);
+    setErrorMessage(null);
+  }, [storageKey]);
+
+  // Persiste sessões no localStorage, mas nunca antes de a chave atual estar
+  // hidratada — assim o estado vazio inicial não apaga o histórico.
+  useEffect(() => {
+    if (hydratedKeyRef.current !== storageKey) return;
+    if (sessions.length === 0) return;
     try {
-      const saved = localStorage.getItem(storageKey);
-      if (saved) {
-        const parsed: ChatSession[] = JSON.parse(saved);
-        if (parsed.length > 0) {
-          setSessions(parsed);
-          setCurrentSessionId(parsed[0].id);
-          return;
-        }
-      }
+      localStorage.setItem(storageKey, JSON.stringify(sessions));
     } catch (e) {
-      console.error('Falha ao carregar sessões de chat:', e);
-    }
-
-    const defaultSession: ChatSession = {
-      id: `sess_${Date.now()}`,
-      title: 'Conversa Inicial',
-      createdAt: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
-      messages: []
-    };
-    setSessions([defaultSession]);
-    setCurrentSessionId(defaultSession.id);
-  }, [projectId, storageKey]);
-
-  // Persiste sessões no localStorage
-  useEffect(() => {
-    if (sessions.length > 0) {
-      try {
-        localStorage.setItem(storageKey, JSON.stringify(sessions));
-      } catch (e) {
-        console.error('Erro ao persistir sessões:', e);
-      }
+      console.error('Erro ao persistir sessões:', e);
     }
   }, [sessions, storageKey]);
 
@@ -355,10 +236,11 @@ export function AIChatPanel({
   };
 
   // Envio de instrução (Agente Autônomo ou Chat Rápido)
-  const handleSendMessage = async (e?: React.FormEvent) => {
+  const handleSendMessage = async (e?: React.FormEvent, overridePrompt?: string) => {
     if (e) e.preventDefault();
-    const cleanPrompt = prompt.trim();
+    const cleanPrompt = (overridePrompt ?? prompt).trim();
     if (!cleanPrompt || loading) return;
+    lastPromptRef.current = cleanPrompt;
 
     // Snapshot do estado do HTML no momento do envio
     const currentSnapshot = currentHtml;
@@ -434,6 +316,7 @@ export function AIChatPanel({
         let finalReasoning = '';
         let collectedPlan: PlanItem[] = [];
         let collectedAudit: QualityAuditInfo | null = null;
+        let validationFailure = '';
 
         while (true) {
           const { value, done } = await reader.read();
@@ -471,6 +354,10 @@ export function AIChatPanel({
                   suggestions: ev.suggestions || []
                 };
                 setAgentAudit(collectedAudit);
+              } else if (ev.type === 'validation_result') {
+                if (!ev.ok && ev.errors && ev.errors.length > 0) {
+                  validationFailure = `Validação (${ev.scope || 'patch'}): ${ev.errors.slice(0, 3).join('; ')}`;
+                }
               } else if (ev.type === 'agent_done') {
                 finalPatch = ev.patch || '';
                 finalPatchType = ev.patch_type || (finalPatch ? (selectedElement ? 'element' : 'full') : 'none');
@@ -491,7 +378,10 @@ export function AIChatPanel({
         }
 
         const effectivePatch = cleanAndExtractHtml(finalPatch);
-        const hasValidPatch = Boolean(effectivePatch && effectivePatch.trim().length > 0);
+        const hasValidPatch = isRenderableHtml(effectivePatch);
+        if (!hasValidPatch && validationFailure) {
+          setErrorMessage(prev => prev || validationFailure);
+        }
         const nowTime = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
 
         // Auto-aplicação imediata no Canvas quando o Agente produz um patch de código válido
@@ -558,6 +448,7 @@ export function AIChatPanel({
     let accumulatedReasoning = '';
     let accumulatedContent = '';
     let finalPatchFromServer = '';
+    let chatValidationFailure = '';
 
     try {
       const response = await fetch('/api/ai/chat/stream', {
@@ -608,6 +499,10 @@ export function AIChatPanel({
               setStreamingContent(prev => prev + ev.text);
             } else if (ev.type === 'done') {
               finalPatchFromServer = ev.patch || '';
+            } else if (ev.type === 'validation_result') {
+              if (!ev.ok && ev.errors && ev.errors.length > 0) {
+                chatValidationFailure = `Validação: ${ev.errors.slice(0, 3).join('; ')}`;
+              }
             } else if (ev.type === 'error') {
               setErrorMessage(ev.detail || 'Ocorreu um erro durante a inferência.');
             }
@@ -617,7 +512,11 @@ export function AIChatPanel({
         }
       }
 
-      const effectivePatch = cleanAndExtractHtml(finalPatchFromServer || accumulatedContent);
+      const extracted = cleanAndExtractHtml(finalPatchFromServer || accumulatedContent);
+      const effectivePatch = isRenderableHtml(extracted) ? extracted : '';
+      if (!effectivePatch && chatValidationFailure) {
+        setErrorMessage(prev => prev || chatValidationFailure);
+      }
       const assistantMessage: ChatMessage = {
         id: `msg_asst_${Date.now()}`,
         role: 'assistant',
@@ -1132,41 +1031,13 @@ export function AIChatPanel({
               {/* Card de Código Gerado com Visualizador de Alterações (Diff) e Reversão */}
               {msg.patch && msg.patch.trim().length > 0 && (
                 <div className="p-3.5 rounded-xl bg-mockbird-card border border-mockbird-border shadow-panel space-y-2.5">
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-start justify-between gap-2">
                     <span className="text-xs font-bold text-white flex items-center gap-1.5">
-                      <Sparkles size={14} className="text-mockbird-cyan" />
-                      {msg.patchType === 'element' 
+                      <Sparkles size={14} className="text-mockbird-cyan shrink-0" />
+                      {msg.patchType === 'element'
                         ? `Alteração Cirúrgica <${msg.targetTag || 'alvo'}>`
                         : `Versão da Tela (${msg.timestamp})`}
                     </span>
-                    <div className="flex items-center gap-2">
-                      {/* Botão de Diff / Mostrar Alterações */}
-                      <button
-                        type="button"
-                        onClick={() => setOpenDiffMsgId(isDiffOpen ? null : msg.id)}
-                        className={`text-[11px] px-2 py-0.5 rounded-md border flex items-center gap-1 font-semibold transition ${
-                          isDiffOpen
-                            ? 'bg-mockbird-blue/20 border-mockbird-blue text-white'
-                            : 'bg-[#0a0a0c] border-mockbird-border text-slate-300 hover:text-white'
-                        }`}
-                        title="Ver alterações em formato diff"
-                      >
-                        <GitCompare size={12} className={isDiffOpen ? 'text-mockbird-cyan' : 'text-slate-400'} />
-                        <span>{isDiffOpen ? 'Fechar Diff' : 'Ver Alterações'}</span>
-                        {addedCount > 0 && <span className="text-emerald-400 font-mono text-[10px]">+{addedCount}</span>}
-                        {removedCount > 0 && <span className="text-rose-400 font-mono text-[10px]">-{removedCount}</span>}
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => handleCopyCode(msg.id, msg.patch || '')}
-                        className="text-[11px] text-mockbird-cyan hover:underline flex items-center gap-1 font-semibold"
-                        title="Copiar HTML"
-                      >
-                        {copiedId === msg.id ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
-                        <span>{copiedId === msg.id ? 'Copiado!' : 'Copiar'}</span>
-                      </button>
-                    </div>
                   </div>
 
                   {msg.patchType === 'element' && (msg.targetSelector || msg.targetMbId) && (
@@ -1176,83 +1047,18 @@ export function AIChatPanel({
                     </div>
                   )}
 
-                  {/* Visualizador de Diff (Expansível) */}
-                  {isDiffOpen ? (
-                    <div className="rounded-xl border border-mockbird-border bg-[#08080a] overflow-hidden space-y-1.5 animate-in fade-in duration-150">
-                      <div className="px-3 py-1.5 bg-[#0e0e12] border-b border-mockbird-border/60 flex items-center justify-between text-[10px]">
-                        <div className="flex items-center gap-2">
-                          <span className="font-semibold text-slate-300 flex items-center gap-1">
-                            <FileCode size={12} className="text-mockbird-cyan" />
-                            Comparação de Código
-                          </span>
-                          <span className="text-emerald-400 font-mono">+{addedCount} adicionadas</span>
-                          <span className="text-rose-400 font-mono">-{removedCount} removidas</span>
-                        </div>
-                        <div className="flex items-center gap-1">
-                          <button
-                            type="button"
-                            onClick={() => setDiffTabs(prev => ({ ...prev, [msg.id]: 'unified' }))}
-                            className={`px-2 py-0.5 rounded text-[10px] font-medium transition ${
-                              currentDiffTab === 'unified' ? 'bg-mockbird-blue text-white' : 'text-slate-400 hover:text-white'
-                            }`}
-                          >
-                            Diff Colorido
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setDiffTabs(prev => ({ ...prev, [msg.id]: 'split' }))}
-                            className={`px-2 py-0.5 rounded text-[10px] font-medium transition ${
-                              currentDiffTab === 'split' ? 'bg-mockbird-blue text-white' : 'text-slate-400 hover:text-white'
-                            }`}
-                          >
-                            Antes vs Depois
-                          </button>
-                        </div>
-                      </div>
-
-                      {currentDiffTab === 'unified' ? (
-                        <div className="p-2 font-mono text-[10px] max-h-48 overflow-y-auto space-y-0.5 select-text">
-                          {diffLines.map((d, i) => (
-                            <div 
-                              key={i} 
-                              className={`px-1.5 py-0.5 rounded flex items-start gap-2 leading-tight ${
-                                d.type === 'added'
-                                  ? 'bg-emerald-950/40 text-emerald-300 border-l-2 border-emerald-500'
-                                  : d.type === 'removed'
-                                  ? 'bg-rose-950/40 text-rose-300 border-l-2 border-rose-500'
-                                  : 'text-slate-400'
-                              }`}
-                            >
-                              <span className="font-bold select-none w-3 text-center shrink-0">
-                                {d.type === 'added' ? '+' : d.type === 'removed' ? '-' : ' '}
-                              </span>
-                              <span className="whitespace-pre-wrap break-all">{d.text}</span>
-                            </div>
-                          ))}
-                        </div>
-                      ) : (
-                        <div className="grid grid-cols-2 gap-1 p-2 font-mono text-[9px] max-h-48 overflow-y-auto">
-                          <div className="p-2 rounded bg-rose-950/20 border border-rose-500/20 text-rose-200 space-y-1">
-                            <span className="text-[10px] font-bold text-rose-400 block pb-1 border-b border-rose-500/20">Original (Antes)</span>
-                            <pre className="whitespace-pre-wrap break-all select-text">
-                              {msg.patchType === 'element' ? (msg.elementSnapshotBefore || '(sem snapshot)') : (msg.htmlSnapshotBefore?.slice(0, 400) || '(sem snapshot)')}
-                            </pre>
-                          </div>
-                          <div className="p-2 rounded bg-emerald-950/20 border border-emerald-500/20 text-emerald-200 space-y-1">
-                            <span className="text-[10px] font-bold text-emerald-400 block pb-1 border-b border-emerald-500/20">Novo (Depois)</span>
-                            <pre className="whitespace-pre-wrap break-all select-text">
-                              {msg.patch.slice(0, 400)}...
-                            </pre>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  ) : (
-                    /* Preview Compacto */
-                    <div className="p-2 rounded-lg bg-[#0a0a0c] border border-mockbird-border/60 text-[10px] font-mono text-slate-400 max-h-24 overflow-y-auto whitespace-pre-wrap select-text">
-                      {msg.patch.slice(0, 260)}...
-                    </div>
-                  )}
+                  <DiffViewer
+                    message={msg}
+                    diffLines={diffLines}
+                    addedCount={addedCount}
+                    removedCount={removedCount}
+                    isOpen={isDiffOpen}
+                    tab={currentDiffTab}
+                    onTabChange={(tab) => setDiffTabs(prev => ({ ...prev, [msg.id]: tab }))}
+                    onToggle={() => setOpenDiffMsgId(isDiffOpen ? null : msg.id)}
+                    onCopy={handleCopyCode}
+                    copiedId={copiedId}
+                  />
 
                   {/* Botões de Ação com Suporte a Reversão (Undo) e Reaplicação (Redo) */}
                   {msg.isApplied ? (
@@ -1417,6 +1223,16 @@ export function AIChatPanel({
             <div className="space-y-1">
               <span className="font-semibold block">Erro na inferência:</span>
               <p className="text-[11px] leading-relaxed">{errorMessage}</p>
+              {lastPromptRef.current && (
+                <button
+                  type="button"
+                  onClick={() => handleSendMessage(undefined, lastPromptRef.current)}
+                  disabled={loading}
+                  className="mt-1 inline-flex items-center gap-1 text-[11px] font-semibold text-rose-200 hover:text-white underline underline-offset-2 disabled:opacity-50"
+                >
+                  <RotateCcw size={11} /> Tentar novamente
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -1424,156 +1240,26 @@ export function AIChatPanel({
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Input de Prompt no Rodapé com Badge de Alvo Cirúrgico */}
-      <form onSubmit={handleSendMessage} className="p-3 border-t border-mockbird-border bg-mockbird-card/40 space-y-2 shrink-0">
-        {/* Badge de Alvo Selecionado */}
-        {selectedElement && (
-          <div className="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-indigo-500/15 border border-indigo-500/30 text-[11px] text-indigo-300 animate-in fade-in">
-            <div className="flex items-center gap-1.5 truncate">
-              <Target size={13} className="text-mockbird-cyan shrink-0" />
-              <span className="font-semibold text-white">&lt;{selectedElement.tag}&gt;</span>
-              <span className="font-mono text-slate-300 truncate">
-                {selectedElement.selector || (selectedElement.mbId ? `#${selectedElement.mbId}` : '')}
-              </span>
-              {selectedElement.snippet && (
-                <span className="text-slate-400 truncate italic">“{selectedElement.snippet}”</span>
-              )}
-            </div>
-            {onClearSelectedElement && (
-              <button
-                type="button"
-                onClick={onClearSelectedElement}
-                className="p-0.5 rounded hover:bg-indigo-500/20 text-slate-400 hover:text-white transition shrink-0 ml-1"
-                title="Desmarcar elemento (voltar para a tela inteira)"
-              >
-                <X size={12} />
-              </button>
-            )}
-          </div>
-        )}
+      <ChatComposer
+        prompt={prompt}
+        onPromptChange={setPrompt}
+        onSubmit={handleSendMessage}
+        loading={loading}
+        executionMode={executionMode}
+        selectedElement={selectedElement}
+        onClearSelectedElement={onClearSelectedElement}
+      />
 
-        <div className="relative">
-          <textarea
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-                e.preventDefault();
-                handleSendMessage();
-              }
-            }}
-            placeholder={
-              selectedElement
-                ? `Descreva o que alterar no elemento <${selectedElement.tag}> (ex: trocar texto, mudar cor)...`
-                : executionMode === 'agent'
-                ? 'Instrua o Agente (ele analisa a intenção, inspeciona e valida o código)...'
-                : 'Ex: Cria uma landing page para concessionária Honda com hero e grid...'
-            }
-            rows={3}
-            disabled={loading}
-            className="w-full bg-mockbird-bg border border-mockbird-border focus:border-mockbird-blue rounded-xl p-2.5 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none resize-none transition leading-relaxed disabled:opacity-60"
-          />
-        </div>
-
-        <button
-          type="submit"
-          disabled={loading || !prompt.trim()}
-          className="w-full py-2.5 bg-mockbird-blue hover:bg-mockbird-bluedark disabled:opacity-50 text-white rounded-xl text-xs font-semibold flex items-center justify-center gap-2 transition-all shadow-md"
-        >
-          {loading ? (
-            <>
-              <Loader2 className="h-4 w-4 animate-spin text-mockbird-cyan" />
-              <span>{executionMode === 'agent' ? 'Agente em Execução...' : 'Gerando Código...'}</span>
-            </>
-          ) : (
-            <>
-              {selectedElement ? (
-                <>
-                  <Target size={14} className="text-mockbird-cyan" />
-                  <span>Modificar Elemento Selecionado</span>
-                </>
-              ) : executionMode === 'agent' ? (
-                <>
-                  <Workflow size={14} />
-                  <span>Executar Agente Autônomo</span>
-                </>
-              ) : (
-                <>
-                  <Send size={14} />
-                  <span>Enviar Instrução</span>
-                </>
-              )}
-            </>
-          )}
-        </button>
-      </form>
-
-      {/* Modal de Confirmação de Rollback / Voltar Mensagem (Estilo Antigravity) */}
       {rewindTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4 animate-in fade-in duration-150">
-          <div className="bg-mockbird-surface border border-mockbird-border rounded-2xl p-4 max-w-sm w-full space-y-4 shadow-2xl animate-in zoom-in-95 duration-150 text-slate-200">
-            <div className="flex items-center gap-2 text-mockbird-cyan font-bold text-xs">
-              <RotateCcw size={16} />
-              <span>Voltar histórico até esta mensagem?</span>
-            </div>
-
-            <p className="text-[11px] text-slate-400 leading-relaxed">
-              Você está retrocedendo a conversa. As mensagens enviadas após este ponto serão descartadas do histórico.
-            </p>
-
-            <div className="p-2.5 rounded-lg bg-[#0a0a0c] border border-mockbird-border/60 text-[11px] text-slate-300 font-mono line-clamp-3 select-text">
-              “{rewindTarget.content}”
-            </div>
-
-            <div className="space-y-2 pt-1 border-t border-mockbird-border/60">
-              <label className="flex items-start gap-2.5 text-[11px] text-slate-300 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={revertCodeOnRewind}
-                  onChange={(e) => setRevertCodeOnRewind(e.target.checked)}
-                  className="mt-0.5 rounded border-mockbird-border text-mockbird-blue focus:ring-0 cursor-pointer"
-                />
-                <div>
-                  <span className="font-semibold text-white block">Reverter também o código da tela</span>
-                  <span className="text-[10px] text-slate-400">Restaura o Canvas para o estado visual correspondente a este momento</span>
-                </div>
-              </label>
-
-              {rewindTarget.isUser && (
-                <label className="flex items-start gap-2.5 text-[11px] text-slate-300 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={reloadPromptOnRewind}
-                    onChange={(e) => setReloadPromptOnRewind(e.target.checked)}
-                    className="mt-0.5 rounded border-mockbird-border text-mockbird-blue focus:ring-0 cursor-pointer"
-                  />
-                  <div>
-                    <span className="font-semibold text-white block">Carregar prompt para edição</span>
-                    <span className="text-[10px] text-slate-400">Coloca o texto da mensagem na caixa de prompt para reenviar com ajustes</span>
-                  </div>
-                </label>
-              )}
-            </div>
-
-            <div className="flex items-center justify-end gap-2 pt-2 border-t border-mockbird-border/60">
-              <button
-                type="button"
-                onClick={() => setRewindTarget(null)}
-                className="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white hover:bg-mockbird-card transition"
-              >
-                Cancelar
-              </button>
-              <button
-                type="button"
-                onClick={handleConfirmRewind}
-                className="px-3.5 py-1.5 rounded-lg text-xs font-bold bg-mockbird-blue hover:bg-mockbird-bluedark text-white flex items-center gap-1.5 transition shadow-md"
-              >
-                <RotateCcw size={13} />
-                <span>Confirmar e Voltar</span>
-              </button>
-            </div>
-          </div>
-        </div>
+        <RewindModal
+          target={rewindTarget}
+          revertCode={revertCodeOnRewind}
+          onRevertCodeChange={setRevertCodeOnRewind}
+          reloadPrompt={reloadPromptOnRewind}
+          onReloadPromptChange={setReloadPromptOnRewind}
+          onCancel={() => setRewindTarget(null)}
+          onConfirm={handleConfirmRewind}
+        />
       )}
     </div>
   );

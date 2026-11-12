@@ -1,7 +1,8 @@
 # 🦅 Mockbird v2 — Arquitetura & Plano Mestre (Clean-Room SaaS)
 
 > **Licença Inicial:** MIT (Open Source, pronto para Self-Hosted e evolução futura para Cloud SaaS com assinatura de IA)  
-> **Stack Oficial:** Backend em **Python 3.12 (FastAPI + SQLAlchemy 2.0 + PostgreSQL 16 + WebSockets + MCP)** · Frontend em **React 19 + Vite + TypeScript + Tailwind CSS**  
+> **Stack Oficial:** Backend em **Python 3.12 (FastAPI + SQLAlchemy 2.0 + PostgreSQL 16 + MCP)** · Frontend em **React 19 + Vite + TypeScript + Tailwind CSS**  
+> **Nota:** colaboração em tempo real via WebSocket, storage de assets e planos/quotas de IA SaaS são **roadmap** — ver "Status real" no fim deste documento.
 > **Filosofia:** Zero código copiado do sistema antigo. Resgatamos apenas as melhores ideias do Mockbird original em uma arquitetura limpa, sem arquivos locais e sem burocracias que travem o fluxo.
 
 ---
@@ -265,3 +266,45 @@ Para entregarmos com qualidade máxima e validando cada etapa no ambiente de hom
 1. **Dev Mode & Handoff**: Inspecionar qualquer elemento/tela e exportar código limpo (React `.tsx`, HTML/CSS/Tailwind e bundle de especificação para implantação).
 2. **Testes Automatizados E2E (Playwright)** no ambiente de homologação validando todo o fluxo de ponta a ponta.
 
+
+---
+
+## ✅ Status real (o que está implementado hoje)
+
+Esta seção existe para manter o plano honesto em relação ao código. O que está em produção de homologação:
+
+| Área | Status | Onde |
+| :--- | :--- | :--- |
+| Auth, sessões revogáveis, CSRF, multi-tenancy | ✅ implementado | `backend/app/routes_auth.py`, `authz.py` |
+| Projetos, canvases, telas, revisões e revert | ✅ implementado | `routes_projects.py`, `routes_screens.py` |
+| Design tokens, cenários de dados, comentários pinados | ✅ implementado | `routes_tokens.py`, `routes_comments.py` |
+| IA BYOK multi-provider (OpenAI, Anthropic, Gemini, OpenRouter, Ollama) | ✅ implementado | `routes_ai.py`, `ai_providers.py` |
+| Agente com intenção cirúrgica + auditoria de HTML | ✅ implementado | `agent/graph.py`, `agent/tools.py` |
+| Pipeline de validação/reparo do HTML gerado (extração, sanitização, `data-mb-id`, geração por seções, truncamento) | ✅ implementado | `agent/htmlkit.py`, `agent/graph.py` |
+| E-mail transacional configurável (SMTP/Resend), reset de senha, verificação e convites por e-mail | ✅ implementado | `mailer.py`, `routes_admin.py`, `routes_auth.py` |
+| Administrador do sistema (primeira conta) para configurações globais | ✅ implementado | `routes_auth.py`, `routes_admin.py` |
+| Cotas de IA por usuário e por provedor + rate limit | ✅ implementado | `quotas.py`, `rate_limit.py` |
+| Apresentação pública com publicação explícita e share links (senha/expiração/revogação) | ✅ implementado | `routes_public.py`, `routes_share.py` |
+| MCP JSON-RPC com chaves escopadas | ✅ implementado | `routes_mcp.py` |
+| Export React JSX válido (handoff) | ✅ implementado | `jsx.py` |
+| Migrações de esquema | ✅ Alembic | `backend/migrations/` |
+| Storage de assets (upload de imagens validado por magic bytes) | ✅ implementado | `storage.py`, `routes_assets.py` |
+| Colaboração em tempo real (presença, cursor, sync de tela, comentários ao vivo) | ✅ implementado | `ws.py`, `routes_ws.py`, `lib/realtime.ts` |
+| Planos de IA da organização (`ai_plans`) integrados às cotas | ✅ implementado | `routes_plans.py`, `quotas.py` |
+| Comentários de visitantes em share links (`allow_comments`) | ✅ implementado | `routes_public.py`, `PresentationPage.tsx` |
+| E2E de navegador (Playwright) | ✅ implementado | `frontend/e2e/`, job `e2e` no CI |
+| CI (lint + testes unitários + build + E2E) | ✅ implementado | `.github/workflows/ci.yml` |
+
+### Roadmap (planejado, **não** implementado)
+
+- **Sincronização multiusuário concorrente (CRDT/OT)**: hoje o WebSocket propaga o último save
+  (last-write-wins) e sinaliza presença/cursor; edição simultânea no mesmo elemento ainda pode
+  sobrescrever trabalho.
+- **Fan-out multi-réplica do WebSocket/rate limit**: ambas as estruturas são em memória e assumem
+  uma instância; o próximo passo é Redis (pub/sub e contadores compartilhados).
+- **Storage de assets em object storage (S3/GCS)**: o backend atual grava em disco local, o que
+  não sobrevive a um deploy sem volume persistente.
+- **Cobrança dos planos de IA**: o catálogo e a atribuição por organização existem, mas não há
+  gateway de pagamento/assinatura.
+- **Upload de assets que não imagem** (ícones SVG saneados, fontes): SVG é bloqueado por design.
+- **Editor de código estilo Monaco**; hoje o painel de código é um textarea sincronizado.

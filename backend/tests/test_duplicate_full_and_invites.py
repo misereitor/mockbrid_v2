@@ -79,8 +79,6 @@ async def test_full_project_duplication_and_secure_invites():
             "password": invitee_pwd
         })
         assert login_res.status_code == 200, login_res.text
-        guest_csrf = guest_client.cookies.get("mockbird_csrf")
-        guest_headers = {"X-CSRF-Token": guest_csrf} if guest_csrf else {}
 
         # 8. Como editor, convidado pode listar e ler o projeto
         guest_projs = await guest_client.get("/api/projects")

@@ -6,23 +6,31 @@ interface LoginPageProps {
 }
 
 export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
-  const [mode, setMode] = useState<'login' | 'register'>('login');
+  const [mode, setMode] = useState<'login' | 'register' | 'forgot'>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [fullName, setFullName] = useState('');
   const [orgName, setOrgName] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setInfo(null);
     setLoading(true);
 
-    const endpoint = mode === 'login' ? '/api/auth/login' : '/api/auth/register';
+    const endpoint = mode === 'login'
+      ? '/api/auth/login'
+      : mode === 'register'
+        ? '/api/auth/register'
+        : '/api/auth/forgot-password';
     const payload = mode === 'login'
       ? { email, password }
-      : { email, password, name: fullName, organization_name: orgName };
+      : mode === 'register'
+        ? { email, password, name: fullName, organization_name: orgName }
+        : { email };
 
     try {
       const res = await fetch(endpoint, {
@@ -34,6 +42,11 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data.detail || 'Ocorreu uma falha na autenticação.');
+      }
+
+      if (mode === 'forgot') {
+        setInfo(data.message || 'Se este e-mail estiver cadastrado, enviaremos as instruções em instantes.');
+        return;
       }
 
       onLoginSuccess(data.user ?? data);
@@ -55,13 +68,22 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
 
         <div className="w-full max-w-sm mx-auto py-10">
           <h1 className="text-2xl font-semibold tracking-tight text-white">
-            {mode === 'login' ? 'Bem-vindo de volta' : 'Crie sua organização'}
+            {mode === 'login' ? 'Bem-vindo de volta' : mode === 'register' ? 'Crie sua organização' : 'Recuperar acesso'}
           </h1>
           <p className="text-sm text-slate-400 mt-1.5">
             {mode === 'login'
               ? 'Entre para continuar seus projetos e protótipos.'
-              : 'Comece a desenhar com sua equipe em poucos segundos.'}
+              : mode === 'register'
+                ? 'Comece a desenhar com sua equipe em poucos segundos.'
+                : 'Informe seu e-mail e enviaremos um link para criar uma nova senha.'}
           </p>
+
+          {info && (
+            <div className="mt-5 bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 px-3.5 py-2.5 rounded-md text-xs flex items-start gap-2.5" role="status">
+              <ShieldCheck size={15} className="shrink-0 mt-px text-emerald-400" />
+              <span>{info}</span>
+            </div>
+          )}
 
           {error && (
             <div className="mt-5 bg-rose-500/10 border border-rose-500/30 text-rose-300 px-3.5 py-2.5 rounded-md text-xs flex items-start gap-2.5" role="alert">
@@ -87,20 +109,33 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
               <label htmlFor="email" className="mb-label">E-mail</label>
               <input id="email" type="email" required value={email} onChange={(e) => setEmail(e.target.value)} placeholder="voce@empresa.com" className="mb-input" />
             </div>
-            <div className="space-y-1.5">
-              <label htmlFor="password" className="mb-label">Senha</label>
-              <input id="password" type="password" required value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" className="mb-input" />
-            </div>
+            {mode !== 'forgot' && (
+              <div className="space-y-1.5">
+                <label htmlFor="password" className="mb-label">Senha</label>
+                <input id="password" type="password" required value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" className="mb-input" />
+              </div>
+            )}
+            {mode === 'login' && (
+              <div className="flex justify-end -mt-1">
+                <button
+                  type="button"
+                  onClick={() => { setMode('forgot'); setError(null); setInfo(null); }}
+                  className="text-xs text-slate-400 hover:text-mockbird-cyan transition-colors"
+                >
+                  Esqueci minha senha
+                </button>
+              </div>
+            )}
             <button type="submit" disabled={loading} className="mb-btn-primary w-full !py-2.5 !text-sm">
-              {loading ? 'Processando…' : mode === 'login' ? 'Entrar' : 'Criar conta'}
+              {loading ? 'Processando…' : mode === 'login' ? 'Entrar' : mode === 'register' ? 'Criar conta' : 'Enviar link de redefinição'}
             </button>
           </form>
 
           <p className="mt-6 text-sm text-slate-400 text-center">
-            {mode === 'login' ? 'Ainda não tem conta?' : 'Já tem uma conta?'}{' '}
+            {mode === 'login' ? 'Ainda não tem conta?' : mode === 'register' ? 'Já tem uma conta?' : 'Lembrou a senha?'}{' '}
             <button
               type="button"
-              onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(null); }}
+              onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(null); setInfo(null); }}
               className="text-mockbird-cyan hover:text-white font-medium transition-colors"
             >
               {mode === 'login' ? 'Criar conta' : 'Entrar'}

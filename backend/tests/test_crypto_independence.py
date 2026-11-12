@@ -2,8 +2,7 @@ import os
 import pytest
 import httpx
 import secrets
-from app.crypto import encrypt_secret, decrypt_secret, get_active_fernet_key
-from cryptography.fernet import Fernet
+from app.crypto import encrypt_secret, decrypt_secret
 
 
 def test_encryption_key_independence_and_fallback():

@@ -9,9 +9,11 @@ import secrets
 import re
 
 from app.database import get_db
-from app.models import Project, Canvas, Screen, DesignTokens, Workspace, User, MCPApiKey, ScreenRevision
+from app.models import Canvas, Screen, DesignTokens, User, MCPApiKey, ScreenRevision
 from app.routes_auth import get_current_user, require_editor
+from app.timeutils import utcnow
 from app.authz import authorize_project, authorize_screen
+from app.jsx import html_to_jsx
 
 router = APIRouter(tags=["mcp"])
 
@@ -87,11 +89,11 @@ async def get_mcp_auth(request: Request, db: AsyncSession = Depends(get_db)) -> 
     if mcp_key.revoked_at is not None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Chave MCP revogada")
 
-    if mcp_key.expires_at and mcp_key.expires_at < datetime.utcnow():
+    if mcp_key.expires_at and mcp_key.expires_at < utcnow():
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Chave MCP expirada")
 
     # Atualiza timestamp de último uso
-    mcp_key.last_used_at = datetime.utcnow()
+    mcp_key.last_used_at = utcnow()
     await db.commit()
 
     return {
@@ -141,7 +143,7 @@ async def create_mcp_key(
     prefix = f"mb_live_{random_secret[:6]}..."
     key_hash = hash_mcp_key(raw_key)
 
-    expires_at = datetime.utcnow() + timedelta(days=payload.expires_in_days or 90)
+    expires_at = utcnow() + timedelta(days=payload.expires_in_days or 90)
 
     mcp_key = MCPApiKey(
         user_id=current_user.id,
@@ -179,7 +181,7 @@ async def revoke_mcp_key(
     if not mcp_key:
         raise HTTPException(status_code=404, detail="Chave MCP não encontrada")
 
-    mcp_key.revoked_at = datetime.utcnow()
+    mcp_key.revoked_at = utcnow()
     await db.commit()
     return {"message": "Chave MCP revogada com sucesso", "key_id": key_id}
 
@@ -350,23 +352,12 @@ async def mcp_get_implementation_bundle(
     user = auth["user"]
     screen = await authorize_screen(screen_id, user, "read", db)
 
-    # Sanitiza o nome do componente para identificador React válido
-    safe_name = re.sub(r'[^a-zA-Z0-9]+', '', "".join(w.capitalize() for w in screen.name.split())) or "Screen"
-    clean_html = screen.html_content.replace('class="', 'className="')
-    jsx_component = (
-        f"export function {safe_name}Component() {{\n"
-        f"  return (\n"
-        f"    {clean_html}\n"
-        f"  );\n"
-        f"}}"
-    )
-
     return {
         "screen_id": screen.id,
         "screen_name": screen.name,
         "html": screen.html_content,
         "css": screen.css_content,
-        "react_jsx": jsx_component
+        "react_jsx": html_to_jsx(screen.html_content, screen.name),
     }
 
 

@@ -1,12 +1,14 @@
 from pydantic import BaseModel, EmailStr, Field
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any, List, Literal
 from datetime import datetime
+
+ProjectRole = Literal["viewer", "commenter", "editor", "admin"]
 
 
 class UserRegister(BaseModel):
     name: str = Field(..., min_length=2)
     email: EmailStr
-    password: str = Field(..., min_length=6)
+    password: str = Field(..., min_length=8)
     organization_name: Optional[str] = "Minha Organização"
 
 
@@ -21,6 +23,8 @@ class UserOut(BaseModel):
     name: str
     role: str
     organization_id: str
+    is_system_admin: bool = False
+    email_verified: bool = False
     created_at: datetime
 
     class Config:
@@ -66,6 +70,7 @@ class ProjectOut(BaseModel):
     design_dials: Dict[str, Any]
     entry_screen_id: Optional[str]
     is_archived: bool
+    is_published: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -73,9 +78,16 @@ class ProjectOut(BaseModel):
         from_attributes = True
 
 
+class DesignImportOut(BaseModel):
+    project: ProjectOut
+    canvases: int
+    screens: int
+    warnings: List[str] = []
+
+
 class ProjectMemberCreate(BaseModel):
     user_id: str
-    role: str = "editor"  # viewer, commenter, editor, admin
+    role: ProjectRole = "editor"
 
 
 class ProjectMemberOut(BaseModel):
@@ -93,6 +105,26 @@ class ProjectMemberOut(BaseModel):
 
 class ProjectVisibilityUpdate(BaseModel):
     visibility: str  # private, org
+
+
+class ShareLinkCreate(BaseModel):
+    expires_in_days: Optional[int] = Field(default=90, ge=0, le=3650)
+    password: Optional[str] = Field(default="", max_length=128)
+    allow_comments: bool = False
+
+
+class ShareLinkOut(BaseModel):
+    id: str
+    project_id: str
+    slug: str
+    allow_comments: bool
+    expires_at: Optional[datetime]
+    view_count: int
+    has_password: bool = False
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 class ScreenCreate(BaseModel):
@@ -153,6 +185,19 @@ class UserProfileUpdate(BaseModel):
 class UserPasswordChange(BaseModel):
     current_password: str
     new_password: str = Field(..., min_length=8)
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(..., min_length=10)
+    new_password: str = Field(..., min_length=8)
+
+
+class VerifyEmailRequest(BaseModel):
+    token: str = Field(..., min_length=10)
 
 
 class ScreenRevisionOut(BaseModel):
