@@ -9,6 +9,7 @@ import {
   Search,
   User as UserIcon
 } from 'lucide-react';
+import { withBasePath } from '../lib/basePath';
 
 interface Member {
   id: string;
@@ -78,7 +79,7 @@ export const TeamPage: React.FC<TeamPageProps> = () => {
       }
       // O backend tenta enviar por e-mail; se o transporte não estiver pronto,
       // o admin ainda recebe o link para repassar manualmente.
-      const link = data.invite_url ? `${window.location.origin}${data.invite_url}` : null;
+      const link = data.invite_url ? `${window.location.origin}${withBasePath(data.invite_url)}` : null;
       setInviteLink(data.email_sent ? null : link);
       setMsg({
         type: 'ok',

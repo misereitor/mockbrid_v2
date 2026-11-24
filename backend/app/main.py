@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 import logging
 import os
 
@@ -102,12 +102,20 @@ if os.path.exists(FRONTEND_DIST):
     )
 
     @app.get("/{full_path:path}")
-    async def serve_spa(full_path: str):
+    async def serve_spa(full_path: str, request: Request):
         if full_path == "mcp" or full_path.startswith("mcp/") or full_path == "api" or full_path.startswith("api/"):
             raise HTTPException(
                 status_code=404, detail="Endpoint de API não encontrado"
             )
         index_file = os.path.join(FRONTEND_DIST, "index.html")
         if os.path.exists(index_file):
+            prefix = request.headers.get("x-forwarded-prefix", "").rstrip("/")
+            if prefix:
+                with open(index_file, "r", encoding="utf-8") as f:
+                    html = f.read()
+                html = html.replace('src="/assets/', f'src="{prefix}/assets/').replace(
+                    'href="/assets/', f'href="{prefix}/assets/'
+                )
+                return HTMLResponse(content=html)
             return FileResponse(index_file)
         return {"error": "Frontend build não encontrado"}

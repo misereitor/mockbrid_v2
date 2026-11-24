@@ -10,6 +10,7 @@ import { ResetPasswordPage } from './views/ResetPasswordPage';
 import { VerifyEmailPage } from './views/VerifyEmailPage';
 import { AcceptInvitePage } from './views/AcceptInvitePage';
 import { NewProjectModal } from './components/NewProjectModal';
+import { stripBasePath, withBasePath } from './lib/basePath';
 
 type ViewMode = 'dashboard' | 'editor' | 'team' | 'settings' | 'presentation';
 
@@ -28,9 +29,9 @@ export function App() {
   const [resendMsg, setResendMsg] = useState<string | null>(null);
   const [showNewProjectModal, setShowNewProjectModal] = useState(false);
 
-  // Parseador de URL para rotas reais no navegador
+  // Parseador de URL para rotas reais no navegador (compatível com raiz e subpath /mockbrid)
   const parseRouteFromUrl = useCallback(() => {
-    const path = window.location.pathname;
+    const path = stripBasePath(window.location.pathname);
 
     // Rota pública de apresentação: /p/:slug
     if (path.startsWith('/p/')) {
@@ -77,8 +78,9 @@ export function App() {
 
   // Navegador canônico com History API (pushState)
   const navigateTo = useCallback((url: string, replace = false) => {
-    if (window.location.pathname !== url) {
-      window.history[replace ? 'replaceState' : 'pushState']({}, '', url);
+    const targetUrl = withBasePath(url);
+    if (window.location.pathname !== targetUrl) {
+      window.history[replace ? 'replaceState' : 'pushState']({}, '', targetUrl);
     }
     parseRouteFromUrl();
   }, [parseRouteFromUrl]);
@@ -291,7 +293,7 @@ export function App() {
   }
 
   // Páginas públicas de autenticação (funcionam com ou sem sessão)
-  const publicPath = window.location.pathname.replace(/\/+$/, '') || '/';
+  const publicPath = stripBasePath(window.location.pathname).replace(/\/+$/, '') || '/';
   if (publicPath === '/reset-password') return <ResetPasswordPage />;
   if (publicPath === '/verify-email') return <VerifyEmailPage />;
   if (publicPath === '/accept-invite') return <AcceptInvitePage />;

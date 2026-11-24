@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { ShieldCheck, AlertCircle, CheckCircle2, Loader2 } from 'lucide-react';
+import { withBasePath } from '../lib/basePath';
 
 export const VerifyEmailPage: React.FC = () => {
   const token = new URLSearchParams(window.location.search).get('token') || '';
@@ -50,7 +51,7 @@ export const VerifyEmailPage: React.FC = () => {
             <CheckCircle2 size={32} className="text-emerald-400 mx-auto" />
             <h1 className="text-xl font-semibold text-white mt-4">E-mail confirmado</h1>
             <p className="text-sm text-slate-400 mt-1.5">{message}</p>
-            <a href="/" className="mb-btn-primary w-full !py-2.5 !text-sm flex items-center justify-center mt-6">Ir para o Mockbird</a>
+            <a href={withBasePath('/')} className="mb-btn-primary w-full !py-2.5 !text-sm flex items-center justify-center mt-6">Ir para o Mockbird</a>
           </>
         )}
 
@@ -60,7 +61,7 @@ export const VerifyEmailPage: React.FC = () => {
             <h1 className="text-xl font-semibold text-white mt-4">Não foi possível confirmar</h1>
             <p className="text-sm text-slate-400 mt-1.5">{message}</p>
             <p className="text-xs text-slate-500 mt-4">Entre no app e peça um novo link na faixa de verificação.</p>
-            <a href="/" className="mb-btn-primary w-full !py-2.5 !text-sm flex items-center justify-center mt-6">Voltar ao login</a>
+            <a href={withBasePath('/')} className="mb-btn-primary w-full !py-2.5 !text-sm flex items-center justify-center mt-6">Voltar ao login</a>
           </>
         )}
 

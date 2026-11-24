@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { ShieldCheck, AlertCircle, CheckCircle2, UserPlus } from 'lucide-react';
+import { withBasePath } from '../lib/basePath';
 
 export const AcceptInvitePage: React.FC = () => {
   const token = new URLSearchParams(window.location.search).get('token') || '';
@@ -71,7 +72,7 @@ export const AcceptInvitePage: React.FC = () => {
               <CheckCircle2 size={15} className="shrink-0 mt-px" />
               <span>Convite aceito. Sua conta está pronta.</span>
             </div>
-            <a href="/" className="mb-btn-primary w-full !py-2.5 !text-sm flex items-center justify-center">Entrar no Mockbird</a>
+            <a href={withBasePath('/')} className="mb-btn-primary w-full !py-2.5 !text-sm flex items-center justify-center">Entrar no Mockbird</a>
           </div>
         ) : (
           <form onSubmit={handleSubmit} className="mt-6 space-y-4">

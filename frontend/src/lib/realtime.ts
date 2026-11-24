@@ -6,6 +6,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { withBasePath } from './basePath';
 
 export interface Participant {
   user_id: string;
@@ -36,7 +37,8 @@ export function useProjectSocket(
 
     const connect = () => {
       const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-      const ws = new WebSocket(`${protocol}://${window.location.host}/api/ws/projects/${projectId}`);
+      const wsPath = withBasePath(`/api/ws/projects/${projectId}`);
+      const ws = new WebSocket(`${protocol}://${window.location.host}${wsPath}`);
       socketRef.current = ws;
 
       ws.onopen = () => {

@@ -1,11 +1,15 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { App } from './App'
+import { withBasePath } from './lib/basePath'
 import './index.css'
 
-// Interceptor global para anexar X-CSRF-Token automaticamente em requisições de mutação
+// Interceptor global para anexar subpath (quando em proxy reverso) e X-CSRF-Token em mutações
 const originalFetch = window.fetch;
 window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+  if (typeof input === 'string' && input.startsWith('/') && !input.startsWith('//')) {
+    input = withBasePath(input);
+  }
   const method = (init?.method || 'GET').toUpperCase();
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
     const csrfMatch = document.cookie.match(/(^|;\s*)mockbird_csrf=([^;]+)/);

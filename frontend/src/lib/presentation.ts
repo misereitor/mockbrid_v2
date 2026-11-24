@@ -1,4 +1,5 @@
 /** Publica o projeto (idempotente) e devolve o slug público de apresentação. */
+import { withBasePath } from './basePath';
 
 function csrfHeader(): Record<string, string> {
   const match = document.cookie.split('; ').find((c) => c.startsWith('mockbird_csrf='));
@@ -20,12 +21,12 @@ export async function ensurePublished(projectId: string): Promise<string> {
 
 export async function openPresentation(projectId: string): Promise<void> {
   const slug = await ensurePublished(projectId);
-  window.open(`/p/${slug}`, '_blank', 'noreferrer');
+  window.open(withBasePath(`/p/${slug}`), '_blank', 'noreferrer');
 }
 
 export async function copyPresentationLink(projectId: string): Promise<string> {
   const slug = await ensurePublished(projectId);
-  const url = `${window.location.origin}/p/${slug}`;
+  const url = `${window.location.origin}${withBasePath(`/p/${slug}`)}`;
   await navigator.clipboard.writeText(url);
   return slug;
 }

@@ -23,6 +23,7 @@ import {
   FolderKanban
 } from 'lucide-react';
 import { EmailSettingsPanel } from '../components/EmailSettingsPanel';
+import { withBasePath } from '../lib/basePath';
 
 interface MCPKey {
   id: string;
@@ -319,10 +320,12 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
 
   const activeToken = createdKey?.raw_key || (mcpKeys.find(k => !k.revoked_at)?.prefix ? `${mcpKeys.find(k => !k.revoked_at)?.prefix} (use sua chave completa)` : 'mb_live_SEU_TOKEN_AQUI');
 
+  const mcpEndpointUrl = `${window.location.origin}${withBasePath('/mcp')}`;
+
   const mcpClaudeConfig = JSON.stringify({
     mcpServers: {
       mockbird: {
-        url: `${window.location.origin}/mcp`,
+        url: mcpEndpointUrl,
         headers: {
           Authorization: `Bearer ${activeToken}`
         }
@@ -333,7 +336,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
   const mcpCursorConfig = JSON.stringify({
     mcpServers: {
       mockbird: {
-        url: `${window.location.origin}/mcp`,
+        url: mcpEndpointUrl,
         headers: {
           Authorization: `Bearer ${activeToken}`
         }
@@ -345,7 +348,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
     mcpServers: {
       mockbird: {
         type: "http",
-        url: `${window.location.origin}/mcp`,
+        url: mcpEndpointUrl,
         headers: {
           Authorization: `Bearer ${activeToken}`
         }
@@ -695,7 +698,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
               <div>
                 <div className="inline-flex items-center gap-1.5 bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 px-2.5 py-0.5 rounded-full text-[11px] font-bold mb-2">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                  Endpoint Ativo: {window.location.origin}/mcp
+                  Endpoint Ativo: {mcpEndpointUrl}
                 </div>
                 <h2 className="text-lg font-bold text-white flex items-center gap-2">
                   <Key size={18} className="text-mockbird-cyan" />
