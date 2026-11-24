@@ -126,6 +126,7 @@ async def render_screen_screenshot(
     b64_image = base64.b64encode(screenshot_bytes).decode("ascii")
 
     return {
+        "screenshot_bytes": screenshot_bytes,
         "image_base64": b64_image,
         "image_data_uri": f"data:image/png;base64,{b64_image}",
         "width": width,
@@ -219,6 +220,7 @@ async def simulate_element_interaction(
         last_nav = await page.evaluate("() => window.__mockbird_last_navigation || null")
         body_classes = await page.evaluate("() => document.body.className")
 
+        shot_bytes = None
         screenshot_b64 = None
         if capture_screenshot:
             shot_bytes = await page.screenshot(type="png")
@@ -248,6 +250,7 @@ async def simulate_element_interaction(
             "navigation_triggered": bool(nav_dest or last_nav),
             "navigation_target": nav_dest or last_nav,
         },
+        "screenshot_bytes": shot_bytes,
         "screenshot_base64": screenshot_b64,
         "viewport": viewport_name,
         "theme": theme,

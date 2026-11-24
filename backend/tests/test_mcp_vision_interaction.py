@@ -84,7 +84,14 @@ async def test_mcp_render_screenshot_and_interaction():
         assert shot_data["width"] == 1440
         assert shot_data["size_bytes"] > 1000
         assert "image_base64" in shot_data
-        assert shot_data["image_data_uri"].startswith("data:image/png;base64,")
+        assert "screenshot_url" in shot_data
+        assert "/api/assets/" in shot_data["screenshot_url"]
+
+        # Valida que a URL da screenshot é acessível e entrega o PNG idêntico
+        asset_res = await client.get(shot_data["screenshot_url"])
+        assert asset_res.status_code == 200
+        assert asset_res.headers["content-type"] == "image/png"
+        assert len(asset_res.content) == shot_data["size_bytes"]
 
         # 5. Testar Endpoint REST de Interação Remota: POST /mcp/tools/interact_screen_element
         interact_res = await client.post(
@@ -107,6 +114,8 @@ async def test_mcp_render_screenshot_and_interaction():
         assert interact_data["dom_effects"]["navigation_target"] == "dashboard"
         assert "logged-in" in interact_data["dom_effects"]["body_classes"]
         assert interact_data["screenshot_base64"] is not None
+        assert "screenshot_url" in interact_data
+        assert "/api/assets/" in interact_data["screenshot_url"]
 
         # 6. Testar Protocolo JSON-RPC 2.0 padrão (/mcp) com render_screen_screenshot
         rpc_shot_payload = {

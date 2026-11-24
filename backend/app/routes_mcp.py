@@ -6,11 +6,13 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 import hashlib
 import json
+import logging
 import secrets
 import re
 from html.parser import HTMLParser
 
 from app.database import get_db
+from app.storage import save_asset
 from app.models import (
     Canvas,
     Screen,
@@ -35,6 +37,19 @@ from app.screen_renderer import (
 )
 
 router = APIRouter(tags=["mcp"])
+logger = logging.getLogger(__name__)
+
+
+def build_public_url(request: Optional[Request], path_with_query: str) -> str:
+    """Constrói URL pública acessível absoluta para assets e screenshots retornados ao agente MCP."""
+    if not request:
+        return f"https://tradit.ddns.net/mockbrid{path_with_query}"
+    prefix = request.headers.get("x-forwarded-prefix", "").rstrip("/")
+    if not prefix and "/mockbrid" in request.headers.get("referer", ""):
+        prefix = "/mockbrid"
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or "tradit.ddns.net"
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "https"
+    return f"{proto}://{host}{prefix}{path_with_query}"
 
 
 def hash_mcp_key(raw_key: str) -> str:
@@ -1720,6 +1735,7 @@ async def mcp_get_implementation_bundle(
 @router.post("/mcp/tools/render_screen_screenshot")
 async def mcp_render_screen_screenshot(
     payload: MCPRenderScreenshotRequest,
+    request: Request,
     auth: Dict[str, Any] = Depends(get_mcp_auth),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1765,7 +1781,29 @@ async def mcp_render_screen_screenshot(
             status_code=500, detail=f"Erro ao renderizar screenshot da tela: {str(e)}"
         )
 
+    raw_bytes = shot_res.get("screenshot_bytes")
+    asset_url = None
+    if raw_bytes:
+        try:
+            fn = save_asset(canvas.project_id, raw_bytes, "image/png")
+            clean_screen_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", screen.name or "screen")
+            asset_obj = Asset(
+                project_id=canvas.project_id,
+                filename=fn,
+                original_name=f"screenshot_{clean_screen_name}_{shot_res['viewport']}_{shot_res['theme']}.png",
+                content_type="image/png",
+                size_bytes=len(raw_bytes),
+            )
+            db.add(asset_obj)
+            await db.commit()
+            await db.refresh(asset_obj)
+            sig = generate_asset_signature(asset_obj.id)
+            asset_url = build_public_url(request, f"/api/assets/{asset_obj.id}?sig={sig}")
+        except Exception as asset_err:
+            logger.warning(f"Falha ao persistir asset da screenshot: {asset_err}")
+
     return {
+        "status": "success",
         "screen_id": screen.id,
         "screen_name": screen.name,
         "viewport": shot_res["viewport"],
@@ -1773,14 +1811,16 @@ async def mcp_render_screen_screenshot(
         "width": shot_res["width"],
         "height": shot_res["height"],
         "size_bytes": shot_res["size_bytes"],
+        "screenshot_url": asset_url,
+        "message": f"Screenshot da tela '{screen.name}' ({shot_res['viewport']}, tema {shot_res['theme']}) gerada com sucesso. Acesse a imagem diretamente em 'screenshot_url' ou visualize o bloco anexado.",
         "image_base64": shot_res["image_base64"],
-        "image_data_uri": shot_res["image_data_uri"],
     }
 
 
 @router.post("/mcp/tools/interact_screen_element")
 async def mcp_interact_screen_element(
     payload: MCPInteractElementRequest,
+    request: Request,
     auth: Dict[str, Any] = Depends(get_mcp_auth),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1832,8 +1872,30 @@ async def mcp_interact_screen_element(
             status_code=500, detail=f"Erro ao simular interação no elemento: {str(e)}"
         )
 
+    raw_bytes = interaction_res.pop("screenshot_bytes", None)
+    asset_url = None
+    if raw_bytes:
+        try:
+            fn = save_asset(canvas.project_id, raw_bytes, "image/png")
+            clean_screen_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", screen.name or "screen")
+            asset_obj = Asset(
+                project_id=canvas.project_id,
+                filename=fn,
+                original_name=f"interaction_{clean_screen_name}_{interaction_res['action']}.png",
+                content_type="image/png",
+                size_bytes=len(raw_bytes),
+            )
+            db.add(asset_obj)
+            await db.commit()
+            await db.refresh(asset_obj)
+            sig = generate_asset_signature(asset_obj.id)
+            asset_url = build_public_url(request, f"/api/assets/{asset_obj.id}?sig={sig}")
+        except Exception as asset_err:
+            logger.warning(f"Falha ao persistir asset pós-interação: {asset_err}")
+
     interaction_res["screen_id"] = screen.id
     interaction_res["screen_name"] = screen.name
+    interaction_res["screenshot_url"] = asset_url
     return interaction_res
 
 
@@ -1860,6 +1922,8 @@ async def mcp_jsonrpc_endpoint(
     method = body.get("method")
     msg_id = body.get("id")
     params = body.get("params", {})
+
+    logger.info(f"[MCP-JSONRPC] Chamada recebida: method={method}, tool={params.get('name') if isinstance(params, dict) else None}")
 
     if msg_id is None or (
         method and (method.startswith("notifications/") or method == "initialized")
@@ -1955,8 +2019,10 @@ async def mcp_jsonrpc_endpoint(
 
             elif tool_name == "render_screen_screenshot":
                 req_obj = MCPRenderScreenshotRequest(**arguments)
-                res = await mcp_render_screen_screenshot(req_obj, auth, db)
+                res = await mcp_render_screen_screenshot(req_obj, request, auth, db)
                 img_b64 = res.pop("image_base64", None)
+                res.pop("screenshot_bytes", None)
+                res.pop("image_data_uri", None)
                 res_text = json.dumps(res, ensure_ascii=False, indent=2, default=str)
                 content = [{"type": "text", "text": res_text}]
                 if img_b64:
@@ -1969,8 +2035,10 @@ async def mcp_jsonrpc_endpoint(
 
             elif tool_name == "interact_screen_element":
                 req_obj = MCPInteractElementRequest(**arguments)
-                res = await mcp_interact_screen_element(req_obj, auth, db)
+                res = await mcp_interact_screen_element(req_obj, request, auth, db)
                 img_b64 = res.pop("screenshot_base64", None)
+                res.pop("screenshot_bytes", None)
+                res.pop("image_data_uri", None)
                 res_text = json.dumps(res, ensure_ascii=False, indent=2, default=str)
                 content = [{"type": "text", "text": res_text}]
                 if img_b64:
