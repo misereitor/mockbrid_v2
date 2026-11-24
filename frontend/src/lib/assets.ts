@@ -28,6 +28,54 @@ export async function uploadProjectAsset(projectId: string, file: File): Promise
   return res.json();
 }
 
+export async function listProjectAssets(projectId: string): Promise<ProjectAsset[]> {
+  const res = await fetch(`/api/projects/${projectId}/assets`);
+  if (!res.ok) return [];
+  return res.json();
+}
+
+export async function deleteProjectAsset(projectId: string, assetId: string): Promise<void> {
+  const res = await fetch(`/api/projects/${projectId}/assets/${assetId}`, { method: 'DELETE' });
+  if (!res.ok) {
+    let detail = 'Falha ao remover asset';
+    try {
+      detail = (await res.json()).detail || detail;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+}
+
+export async function getBrokenImages(projectId: string): Promise<string[]> {
+  const res = await fetch(`/api/projects/${projectId}/broken-images`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.broken_urls || [];
+}
+
+export async function replaceAssetUrls(
+  projectId: string,
+  oldUrl: string,
+  assetId: string
+): Promise<{ replaced_screens: number; new_url: string; message?: string }> {
+  const res = await fetch(`/api/projects/${projectId}/replace-asset-urls`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ old_url: oldUrl, asset_id: assetId }),
+  });
+  if (!res.ok) {
+    let detail = 'Falha ao substituir caminho do asset';
+    try {
+      detail = (await res.json()).detail || detail;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
 export function imageHtml(asset: ProjectAsset): string {
   const safeName = asset.original_name.replace(/[^\w.\- ]/g, '');
   return `<img src="${asset.url}" alt="${safeName}" style="max-width:100%;height:auto;" />`;

@@ -5,7 +5,10 @@ A entrega é liberada para membros do projeto e, para visitantes, apenas quando
 o projeto está publicado ou possui share link ativo (URLs são UUIDs).
 """
 
+import hashlib
+import hmac
 import logging
+import re
 from datetime import datetime
 from typing import List, Optional
 
@@ -19,7 +22,7 @@ from app.auth import decode_access_token, hash_session_token
 from app.authz import authorize_project
 from app.config import settings
 from app.database import get_db
-from app.models import Asset, Project, Session, ShareLink, User
+from app.models import Asset, Canvas, Project, Screen, Session, ShareLink, User
 from app.routes_auth import get_current_user, require_editor
 from app.storage import ALLOWED_TYPES, asset_path, delete_asset, save_asset, sniff_image_type
 from app.timeutils import utcnow
@@ -29,6 +32,18 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["assets"])
 
 MAX_ASSET_BYTES = settings.MAX_ASSET_BYTES
+
+
+def generate_asset_signature(asset_id: str) -> str:
+    """Gera assinatura HMAC SHA-256 para permitir carregamento do asset em sandbox."""
+    return hmac.new(settings.SECRET_KEY.encode(), f"asset:{asset_id}".encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def verify_asset_signature(asset_id: str, sig: str) -> bool:
+    if not sig:
+        return False
+    expected = generate_asset_signature(asset_id)
+    return hmac.compare_digest(expected, sig)
 
 
 class AssetOut(BaseModel):
@@ -45,13 +60,14 @@ class AssetOut(BaseModel):
 
 
 def _to_out(asset: Asset) -> AssetOut:
+    sig = generate_asset_signature(asset.id)
     return AssetOut(
         id=asset.id,
         project_id=asset.project_id,
         original_name=asset.original_name,
         content_type=asset.content_type,
         size_bytes=asset.size_bytes,
-        url=f"/api/assets/{asset.id}",
+        url=f"/api/assets/{asset.id}?sig={sig}",
         created_at=asset.created_at,
     )
 
@@ -65,12 +81,12 @@ async def upload_asset(
 ):
     project = await authorize_project(project_id, current_user, "edit", db)
 
-    head = await file.read(32)
+    head = await file.read(512)
     content_type = sniff_image_type(head)
     if not content_type:
         raise HTTPException(
             status_code=415,
-            detail="Formato não suportado. Envie PNG, JPEG, GIF ou WebP.",
+            detail="Formato não suportado. Envie PNG, JPEG, GIF, WebP ou SVG.",
         )
 
     data = head + await file.read(MAX_ASSET_BYTES + 1 - len(head))
@@ -189,14 +205,16 @@ async def get_asset(
     if not asset:
         raise HTTPException(status_code=404, detail="Asset não encontrado")
 
-    user = await _optional_user(request, db)
-    allowed = False
-    if user:
-        try:
-            await authorize_project(asset.project_id, user, "read", db)
-            allowed = True
-        except HTTPException:
-            allowed = False
+    sig = request.query_params.get("sig", "")
+    allowed = verify_asset_signature(asset_id, sig)
+    if not allowed:
+        user = await _optional_user(request, db)
+        if user:
+            try:
+                await authorize_project(asset.project_id, user, "read", db)
+                allowed = True
+            except HTTPException:
+                allowed = False
     if not allowed:
         allowed = await _project_is_public(asset.project_id, db)
     if not allowed:
@@ -208,12 +226,81 @@ async def get_asset(
     if asset.content_type not in ALLOWED_TYPES:  # defesa em profundidade
         raise HTTPException(status_code=415, detail="Tipo de arquivo não permitido")
 
+    headers = {
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Content-Disposition": f'inline; filename="{asset.filename}"',
+        "X-Content-Type-Options": "nosniff",
+    }
+    if asset.content_type == "image/svg+xml":
+        headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'"
+
     return FileResponse(
         path,
         media_type=asset.content_type,
-        headers={
-            "Cache-Control": "public, max-age=31536000, immutable",
-            "Content-Disposition": f'inline; filename="{asset.filename}"',
-            "X-Content-Type-Options": "nosniff",
-        },
+        headers=headers,
     )
+
+
+class ReplaceAssetUrlIn(BaseModel):
+    old_url: str
+    asset_id: str
+
+
+@router.post("/api/projects/{project_id}/replace-asset-urls")
+async def replace_asset_urls(
+    project_id: str,
+    payload: ReplaceAssetUrlIn,
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await authorize_project(project_id, current_user, "edit", db)
+    res_asset = await db.execute(
+        select(Asset).where(Asset.id == payload.asset_id, Asset.project_id == project.id)
+    )
+    asset = res_asset.scalars().first()
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset não encontrado neste projeto")
+
+    sig = generate_asset_signature(asset.id)
+    new_url = f"/api/assets/{asset.id}?sig={sig}"
+
+    res_screens = await db.execute(
+        select(Screen).join(Canvas).where(Canvas.project_id == project.id)
+    )
+    screens = res_screens.scalars().all()
+    count = 0
+    old = payload.old_url.strip()
+    for screen in screens:
+        if old in screen.html_content:
+            screen.html_content = screen.html_content.replace(old, new_url)
+            count += 1
+
+    await db.commit()
+    logger.info("Substituído '%s' por '%s' em %d tela(s) do projeto %s", old, new_url, count, project.id)
+    return {
+        "message": f"URL substituída em {count} tela(s)",
+        "replaced_screens": count,
+        "new_url": new_url,
+    }
+
+
+@router.get("/api/projects/{project_id}/broken-images")
+async def find_broken_images(
+    project_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await authorize_project(project_id, current_user, "read", db)
+    res_screens = await db.execute(
+        select(Screen).join(Canvas).where(Canvas.project_id == project.id)
+    )
+    screens = res_screens.scalars().all()
+    broken_urls = set()
+    img_re = re.compile(r"""<img\b[^>]*src=["']([^"']+)["']""", re.IGNORECASE)
+    for screen in screens:
+        for match in img_re.finditer(screen.html_content or ""):
+            src = match.group(1).strip()
+            if not src.startswith(("/api/assets", "http://", "https://", "data:")):
+                broken_urls.add(src)
+
+    return {"broken_urls": sorted(list(broken_urls))}

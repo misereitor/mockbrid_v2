@@ -5,6 +5,7 @@ O diretório é configurável por `ASSETS_DIR`; para múltiplas réplicas troque
 """
 
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -17,7 +18,28 @@ ALLOWED_TYPES = {
     "image/jpeg": ".jpg",
     "image/gif": ".gif",
     "image/webp": ".webp",
+    "image/svg+xml": ".svg",
 }
+
+
+def sanitize_svg(data: bytes) -> bytes:
+    """Remove scripts, handlers on* e elementos perigosos de arquivos SVG contra XSS."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("latin1", errors="replace")
+
+    # Remove tags <script>...</script> e variantes
+    text = re.sub(r"(?is)<script\b[^>]*>.*?</script>", "", text)
+    text = re.sub(r"(?is)<script\b[^>]*/>", "", text)
+    # Remove tags <foreignObject>...</foreignObject>
+    text = re.sub(r"(?is)<foreignObject\b[^>]*>.*?</foreignObject>", "", text)
+    # Remove atributos de eventos on* (onload, onclick, onerror, etc.)
+    text = re.sub(r"""(?is)\bon[a-z0-9_-]+\s*=\s*(?:'[^']*'|"[^"]*"|[^\s>]+)""", "", text)
+    # Remove URIs javascript:
+    text = re.sub(r"""(?is)(?:href|src|xlink:href)\s*=\s*['"]\s*javascript:[^'"]*['"]""", 'href="#"', text)
+
+    return text.encode("utf-8")
 
 
 def sniff_image_type(head: bytes) -> Optional[str]:
@@ -30,6 +52,9 @@ def sniff_image_type(head: bytes) -> Optional[str]:
         return "image/gif"
     if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
         return "image/webp"
+    stripped = head.lstrip(b"\xef\xbb\xbf \t\r\n")
+    if stripped.startswith(b"<svg") or (stripped.startswith(b"<?xml") and b"<svg" in head[:512]):
+        return "image/svg+xml"
     return None
 
 
@@ -48,6 +73,8 @@ def project_dir(project_id: str) -> Path:
 
 
 def save_asset(project_id: str, data: bytes, content_type: str) -> str:
+    if content_type == "image/svg+xml":
+        data = sanitize_svg(data)
     filename = f"{uuid.uuid4().hex}{ALLOWED_TYPES[content_type]}"
     target = project_dir(project_id) / filename
     tmp = target.with_suffix(target.suffix + ".tmp")

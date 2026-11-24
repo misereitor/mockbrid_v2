@@ -49,6 +49,9 @@ _SCRIPT_SRC_RE = re.compile(
 )
 
 
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif")
+
+
 class DesignCorpusError(ValueError):
     """Arquivo de corpus inválido ou fora dos limites aceitos."""
 
@@ -330,9 +333,16 @@ def parse_design_corpus(blob: bytes) -> Dict[str, Any]:
     if not canvases:
         raise DesignCorpusError("O corpus não tem nenhuma tela importável.")
 
+    assets_map: Dict[str, bytes] = {}
+    for file_path, file_data in files.items():
+        lowered = file_path.lower()
+        if any(lowered.endswith(ext) for ext in IMAGE_EXTENSIONS) and not _is_ignored_path(file_path):
+            assets_map[file_path] = file_data
+
     return {
         "tokens": {"light": light, "dark": dark, "shared": shared},
         "canvases": canvases,
+        "assets": assets_map,
         "warnings": warnings,
         "screen_count": screen_count,
     }
