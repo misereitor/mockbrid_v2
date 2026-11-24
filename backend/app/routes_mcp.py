@@ -29,6 +29,10 @@ from app.authz import authorize_project, authorize_screen, get_effective_project
 from app.jsx import html_to_jsx
 from app.routes_assets import generate_asset_signature
 from app.ws import broadcaster
+from app.screen_renderer import (
+    render_screen_screenshot,
+    simulate_element_interaction,
+)
 
 router = APIRouter(tags=["mcp"])
 
@@ -149,6 +153,24 @@ class MCPSetScenarioRequest(BaseModel):
 
 class MCPValidateHTMLRequest(BaseModel):
     html_content: str
+
+
+class MCPRenderScreenshotRequest(BaseModel):
+    screen_id: str
+    viewport: Optional[str] = "desktop"
+    theme: Optional[str] = "light"
+    full_page: Optional[bool] = False
+
+
+class MCPInteractElementRequest(BaseModel):
+    screen_id: str
+    element_mb_id: Optional[str] = None
+    selector: Optional[str] = None
+    action: Optional[str] = "click"
+    input_value: Optional[str] = None
+    viewport: Optional[str] = "desktop"
+    theme: Optional[str] = "light"
+    capture_screenshot: Optional[bool] = True
 
 
 # ============================================================================
@@ -742,6 +764,73 @@ MCP_TOOLS_SPEC = [
             "type": "object",
             "properties": {
                 "screen_id": {"type": "string", "description": "ID da tela para exportação."}
+            },
+            "required": ["screen_id"],
+        },
+    },
+    {
+        "name": "render_screen_screenshot",
+        "description": "Renderiza visualmente a tela em navegador real headless (Chromium) aplicando tokens de design e CSS, retornando a screenshot da tela (PNG em base64 e imagem nativa MCP) para que a IA comprove a equivalência visual remotamente.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "screen_id": {"type": "string", "description": "ID da tela para captura visual."},
+                "viewport": {
+                    "type": "string",
+                    "enum": ["desktop", "tablet", "mobile"],
+                    "description": "Tamanho do viewport (desktop: 1440x900, tablet: 768x1024, mobile: 375x812). Padrão: desktop.",
+                },
+                "theme": {
+                    "type": "string",
+                    "enum": ["light", "dark"],
+                    "description": "Tema visual de design tokens a aplicar ('light' ou 'dark'). Padrão: light.",
+                },
+                "full_page": {
+                    "type": "boolean",
+                    "description": "Se verdadeiro, captura a página inteira com scroll.",
+                },
+            },
+            "required": ["screen_id"],
+        },
+    },
+    {
+        "name": "interact_screen_element",
+        "description": "Executa interações reais (clique, preenchimento de input, hover) em um elemento da tela via navegador headless, avalia execução de scripts, navegação mock (data-mb-nav) e mutações no DOM, retornando os efeitos colaterais e a screenshot pós-interação.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "screen_id": {"type": "string", "description": "ID da tela onde está o elemento."},
+                "element_mb_id": {
+                    "type": "string",
+                    "description": "Identificador único do elemento (ex: data-mb-id='btn-checkout' ou 'btn-checkout').",
+                },
+                "selector": {
+                    "type": "string",
+                    "description": "Seletor CSS alternativo do elemento (ex: 'button.primary', '#submit-btn').",
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["click", "input", "hover"],
+                    "description": "Tipo de interação a executar (padrão: 'click').",
+                },
+                "input_value": {
+                    "type": "string",
+                    "description": "Texto a preencher caso a ação seja 'input'.",
+                },
+                "viewport": {
+                    "type": "string",
+                    "enum": ["desktop", "tablet", "mobile"],
+                    "description": "Tamanho do viewport (desktop, tablet, mobile).",
+                },
+                "theme": {
+                    "type": "string",
+                    "enum": ["light", "dark"],
+                    "description": "Tema visual a aplicar.",
+                },
+                "capture_screenshot": {
+                    "type": "boolean",
+                    "description": "Se verdadeiro, captura e retorna a screenshot do resultado após a interação.",
+                },
             },
             "required": ["screen_id"],
         },
@@ -1628,6 +1717,126 @@ async def mcp_get_implementation_bundle(
     }
 
 
+@router.post("/mcp/tools/render_screen_screenshot")
+async def mcp_render_screen_screenshot(
+    payload: MCPRenderScreenshotRequest,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Renderiza a tela em navegador Chromium headless e gera screenshot fiel aos tokens e viewport."""
+    if "project:read" not in auth["scopes"] and "screen:read" not in auth["scopes"]:
+        raise HTTPException(
+            status_code=403, detail="Chave MCP sem escopo de leitura de telas/projetos"
+        )
+
+    user = auth["user"]
+    screen = await authorize_screen(payload.screen_id, user, "read", db)
+
+    canvas_res = await db.execute(
+        select(Canvas).where(Canvas.id == screen.canvas_id)
+    )
+    canvas = canvas_res.scalars().first()
+    if not canvas:
+        raise HTTPException(status_code=404, detail="Canvas não encontrado")
+    validate_mcp_project_access(auth, canvas.project_id)
+
+    tok_res = await db.execute(
+        select(DesignTokens).where(DesignTokens.project_id == canvas.project_id)
+    )
+    tokens_row = tok_res.scalars().first()
+    tokens = {
+        "light": tokens_row.light_tokens if tokens_row else {},
+        "dark": tokens_row.dark_tokens if tokens_row else {},
+        "shared": tokens_row.shared_tokens if tokens_row else {},
+    } if tokens_row else {}
+
+    try:
+        shot_res = await render_screen_screenshot(
+            html_content=screen.html_content or "",
+            css_content=screen.css_content or "",
+            js_content=screen.js_content or "",
+            tokens=tokens,
+            viewport_name=payload.viewport or "desktop",
+            theme=payload.theme or "light",
+            full_page=bool(payload.full_page),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Erro ao renderizar screenshot da tela: {str(e)}"
+        )
+
+    return {
+        "screen_id": screen.id,
+        "screen_name": screen.name,
+        "viewport": shot_res["viewport"],
+        "theme": shot_res["theme"],
+        "width": shot_res["width"],
+        "height": shot_res["height"],
+        "size_bytes": shot_res["size_bytes"],
+        "image_base64": shot_res["image_base64"],
+        "image_data_uri": shot_res["image_data_uri"],
+    }
+
+
+@router.post("/mcp/tools/interact_screen_element")
+async def mcp_interact_screen_element(
+    payload: MCPInteractElementRequest,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Executa interação remota (click, input, hover) em um elemento da tela e analisa mutações no DOM."""
+    if "project:read" not in auth["scopes"] and "screen:read" not in auth["scopes"]:
+        raise HTTPException(
+            status_code=403, detail="Chave MCP sem escopo de leitura de telas/projetos"
+        )
+
+    user = auth["user"]
+    screen = await authorize_screen(payload.screen_id, user, "read", db)
+
+    canvas_res = await db.execute(
+        select(Canvas).where(Canvas.id == screen.canvas_id)
+    )
+    canvas = canvas_res.scalars().first()
+    if not canvas:
+        raise HTTPException(status_code=404, detail="Canvas não encontrado")
+    validate_mcp_project_access(auth, canvas.project_id)
+
+    tok_res = await db.execute(
+        select(DesignTokens).where(DesignTokens.project_id == canvas.project_id)
+    )
+    tokens_row = tok_res.scalars().first()
+    tokens = {
+        "light": tokens_row.light_tokens if tokens_row else {},
+        "dark": tokens_row.dark_tokens if tokens_row else {},
+        "shared": tokens_row.shared_tokens if tokens_row else {},
+    } if tokens_row else {}
+
+    try:
+        interaction_res = await simulate_element_interaction(
+            html_content=screen.html_content or "",
+            css_content=screen.css_content or "",
+            js_content=screen.js_content or "",
+            tokens=tokens,
+            element_mb_id=payload.element_mb_id,
+            selector=payload.selector,
+            action=payload.action or "click",
+            input_value=payload.input_value,
+            viewport_name=payload.viewport or "desktop",
+            theme=payload.theme or "light",
+            capture_screenshot=payload.capture_screenshot if payload.capture_screenshot is not None else True,
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Erro ao simular interação no elemento: {str(e)}"
+        )
+
+    interaction_res["screen_id"] = screen.id
+    interaction_res["screen_name"] = screen.name
+    return interaction_res
+
+
 # ============================================================================
 # Handler do Protocolo MCP JSON-RPC 2.0 Padrão (/mcp)
 # ============================================================================
@@ -1743,6 +1952,34 @@ async def mcp_jsonrpc_endpoint(
                         "error": {"code": -32602, "message": "screen_id é obrigatório"},
                     }
                 res = await mcp_get_implementation_bundle(s_id, auth, db)
+
+            elif tool_name == "render_screen_screenshot":
+                req_obj = MCPRenderScreenshotRequest(**arguments)
+                res = await mcp_render_screen_screenshot(req_obj, auth, db)
+                img_b64 = res.pop("image_base64", None)
+                res_text = json.dumps(res, ensure_ascii=False, indent=2, default=str)
+                content = [{"type": "text", "text": res_text}]
+                if img_b64:
+                    content.append({"type": "image", "data": img_b64, "mimeType": "image/png"})
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {"content": content},
+                }
+
+            elif tool_name == "interact_screen_element":
+                req_obj = MCPInteractElementRequest(**arguments)
+                res = await mcp_interact_screen_element(req_obj, auth, db)
+                img_b64 = res.pop("screenshot_base64", None)
+                res_text = json.dumps(res, ensure_ascii=False, indent=2, default=str)
+                content = [{"type": "text", "text": res_text}]
+                if img_b64:
+                    content.append({"type": "image", "data": img_b64, "mimeType": "image/png"})
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {"content": content},
+                }
 
             else:
                 return {
