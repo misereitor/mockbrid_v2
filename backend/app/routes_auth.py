@@ -119,6 +119,14 @@ def _is_designated_admin_email(email: str) -> bool:
     return bool(configured and email.strip().lower() == configured)
 
 
+def _use_secure_cookie(request: Request) -> bool:
+    """Ativa flag Secure no cookie quando em HTTPS ou se forçado via COOKIE_SECURE."""
+    if settings.COOKIE_SECURE is not None:
+        return settings.COOKIE_SECURE
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    return request.url.scheme == "https" or proto == "https"
+
+
 async def require_system_admin(current_user: User = Depends(get_current_user)) -> User:
     """Administrador da instância (primeira conta criada)."""
     if not current_user.is_system_admin:
@@ -130,7 +138,7 @@ async def require_system_admin(current_user: User = Depends(get_current_user)) -
 
 
 @router.post("/register", response_model=UserOut)
-async def register(payload: UserRegister, response: Response, db: AsyncSession = Depends(get_db)):
+async def register(payload: UserRegister, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     # Verifica se o e-mail já existe
     existing = await db.execute(select(User).where(User.email == payload.email))
     if existing.scalars().first():
@@ -196,14 +204,14 @@ async def register(payload: UserRegister, response: Response, db: AsyncSession =
     except Exception:
         logger.exception("Cadastro %s: falha inesperada ao enviar verificação", user.email)
 
-    # Define cookies (secure=True em produção, False em homologação HTTP)
-    is_prod = (settings.ENVIRONMENT == "production")
+    # Define cookies (secure=True em HTTPS / proxy TLS, False em HTTP direto ou VPN)
+    is_secure = _use_secure_cookie(request)
     response.set_cookie(
         key="mockbird_token",
         value=token,
         httponly=True,
         samesite="lax",
-        secure=is_prod,
+        secure=is_secure,
         max_age=60 * 60 * 24 * 7,
     )
     response.set_cookie(
@@ -211,7 +219,7 @@ async def register(payload: UserRegister, response: Response, db: AsyncSession =
         value=csrf_token,
         httponly=False,  # JS pode ler para anexar no header CSRF
         samesite="lax",
-        secure=is_prod,
+        secure=is_secure,
         max_age=60 * 60 * 24 * 7,
     )
 
@@ -219,7 +227,7 @@ async def register(payload: UserRegister, response: Response, db: AsyncSession =
 
 
 @router.post("/login", response_model=UserOut)
-async def login(payload: UserLogin, response: Response, db: AsyncSession = Depends(get_db)):
+async def login(payload: UserLogin, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.email == payload.email))
     user = result.scalars().first()
 
@@ -244,13 +252,13 @@ async def login(payload: UserLogin, response: Response, db: AsyncSession = Depen
     db.add(session)
     await db.commit()
 
-    is_prod = (settings.ENVIRONMENT == "production")
+    is_secure = _use_secure_cookie(request)
     response.set_cookie(
         key="mockbird_token",
         value=token,
         httponly=True,
         samesite="lax",
-        secure=is_prod,
+        secure=is_secure,
         max_age=60 * 60 * 24 * 7,
     )
     response.set_cookie(
@@ -258,7 +266,7 @@ async def login(payload: UserLogin, response: Response, db: AsyncSession = Depen
         value=csrf_token,
         httponly=False,
         samesite="lax",
-        secure=is_prod,
+        secure=is_secure,
         max_age=60 * 60 * 24 * 7,
     )
 

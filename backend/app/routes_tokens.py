@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from pydantic import BaseModel
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from app.database import get_db
 from app.models import User, DesignTokens, Project
@@ -15,8 +15,6 @@ router = APIRouter(prefix="/api/tokens", tags=["tokens"])
 async def _validate_project_ownership(project_id: str, current_user: User, db: AsyncSession, action: str = "read") -> Project:
     return await authorize_project(project_id, current_user, action, db)
 
-
-from typing import Dict, Any, Optional
 
 class TokensUpdate(BaseModel):
     light_tokens: Optional[Dict[str, Any]] = None

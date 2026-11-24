@@ -165,8 +165,13 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
   const [plans, setPlans] = useState<any[]>([]);
   const [userRole, setUserRole] = useState('');
   const [assigningPlan, setAssigningPlan] = useState<string | null>(null);
+  const [appEnv, setAppEnv] = useState<string>('homologation');
 
   useEffect(() => {
+    fetch('/api/health')
+      .then(r => (r.ok ? r.json() : null))
+      .then(h => h?.environment && setAppEnv(h.environment))
+      .catch(() => {});
     fetch('/api/auth/me')
       .then(r => (r.ok ? r.json() : null))
       .then(u => u && setUserRole(u.role))
@@ -1194,8 +1199,16 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
 
             <div className="bg-mockbird-surface border border-mockbird-border p-4 rounded-xl">
               <div className="text-slate-400 mb-1">Ambiente de Execução</div>
-              <div className="text-emerald-400 font-bold text-sm">Homologação Ativa (Porta 8082)</div>
-              <div className="text-[11px] text-slate-500 mt-1">Testes isolados antes da publicação em produção.</div>
+              <div className="text-emerald-400 font-bold text-sm">
+                {appEnv === 'production'
+                  ? `Produção Ativa (Porta ${window.location.port || '8083'})`
+                  : 'Homologação Ativa (Porta 8082)'}
+              </div>
+              <div className="text-[11px] text-slate-500 mt-1">
+                {appEnv === 'production'
+                  ? 'Instância dedicada de produção com banco e segredos isolados.'
+                  : 'Testes isolados antes da publicação em produção.'}
+              </div>
             </div>
           </div>
 

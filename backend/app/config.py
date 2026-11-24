@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     ENCRYPTION_KEY: str = ""
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 dias
+    COOKIE_SECURE: bool | None = None
     ALLOW_ORIGINS: str = "http://localhost:8082,http://127.0.0.1:8082,http://localhost:5173"
     ASSETS_DIR: str = "/app/assets_storage"
     # URL pública usada nos links de e-mail (reset, verificação, convite).

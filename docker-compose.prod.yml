@@ -1,0 +1,42 @@
+name: mockbird_v2_prod
+
+services:
+  db_prod:
+    image: postgres:16-alpine
+    container_name: mockbird_v2_prod_db
+    restart: unless-stopped
+    env_file:
+      - .env.prod
+    volumes:
+      - mockbird_v2_prod_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend_prod:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mockbird_v2_prod_api
+    restart: unless-stopped
+    depends_on:
+      db_prod:
+        condition: service_healthy
+    env_file:
+      - .env.prod
+    command: >
+      sh -c "alembic upgrade head &&
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2 --proxy-headers"
+    ports:
+      # Acesso local e pela VPN WireGuard na porta dedicada de produção (8083)
+      - "127.0.0.1:8083:8000"
+      - "10.8.0.7:8083:8000"
+    volumes:
+      - ./frontend/dist:/app/frontend_dist:ro
+      - mockbird_v2_prod_assets:/app/assets_storage
+
+volumes:
+  mockbird_v2_prod_pgdata:
+  mockbird_v2_prod_assets:

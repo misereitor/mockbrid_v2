@@ -11,7 +11,6 @@ import logging
 from typing import Optional, Tuple
 
 from fastapi import HTTPException, status
-from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
@@ -28,8 +27,8 @@ async def get_org_plan(db: AsyncSession, organization_id: str) -> Optional[AIPla
         select(AIPlan)
         .join(Organization, Organization.ai_plan_id == AIPlan.id)
         .where(
-            Organization.id == organization_id, AIPlan.is_active == True
-        )  # noqa: E712
+            Organization.id == organization_id, AIPlan.is_active.is_(True)
+        )
     )
     return res.scalars().first()
 
