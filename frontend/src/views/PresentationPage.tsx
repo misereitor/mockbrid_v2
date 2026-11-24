@@ -454,7 +454,7 @@ export const PresentationPage: React.FC<PresentationPageProps> = ({ slug, onBack
             }
             var cssRules = Object.keys(themeTokens).map(function(k) {
               return '--' + k + ': ' + themeTokens[k] + ';';
-            }).join('\n');
+            }).join(' ');
             dynStyle.textContent = ':root, [data-theme="' + theme + '"], html, body { ' + cssRules + ' }';
           }
           return;
@@ -614,6 +614,9 @@ export const PresentationPage: React.FC<PresentationPageProps> = ({ slug, onBack
 
           <span className="font-semibold text-xs text-slate-200 tracking-tight">
             {projectData.project_name || projectData.name}
+          </span>
+          <span className="text-[10px] bg-sky-500/10 text-mockbird-cyan border border-sky-500/20 px-2 py-0.5 rounded-full font-bold uppercase">
+            Modo Apresentação
           </span>
         </div>
 

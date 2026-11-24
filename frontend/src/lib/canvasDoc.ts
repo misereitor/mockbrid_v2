@@ -291,7 +291,7 @@ const CANVAS_RUNTIME = `
             clone.querySelectorAll('*').forEach(function (n) {
               n.removeAttribute('__mockbirddevtoolsid');
             });
-            post({ type: 'MOCKBIRD_HTML_CHANGED', html: '<!DOCTYPE html>\n' + clone.outerHTML });
+            post({ type: 'MOCKBIRD_HTML_CHANGED', html: '<!DOCTYPE html>\\n' + clone.outerHTML });
           }
         }
 
@@ -1205,7 +1205,7 @@ const CANVAS_RUNTIME = `
               }
               var cssRules = Object.keys(themeTokens).map(function (k) {
                 return '--' + k + ': ' + themeTokens[k] + ';';
-              }).join('\n');
+              }).join(' ');
               dynamicStyle.textContent = ':root, [data-theme="' + theme + '"], html, body { ' + cssRules + ' }';
             }
             positionOverlay();

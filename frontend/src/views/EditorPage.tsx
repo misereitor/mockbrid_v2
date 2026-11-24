@@ -480,8 +480,8 @@ export const EditorPage: React.FC<EditorPageProps> = ({
               type="button"
               onClick={onNewProject}
               className="p-1 rounded text-slate-400 hover:text-mockbird-cyan hover:bg-mockbird-card transition-colors shrink-0"
-              title="Criar novo projeto"
-              aria-label="Criar novo projeto"
+              title="Iniciar no editor"
+              aria-label="Iniciar no editor"
             >
               <FolderPlus size={14} />
             </button>

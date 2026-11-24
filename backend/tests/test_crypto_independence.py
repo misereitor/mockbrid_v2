@@ -4,6 +4,8 @@ import httpx
 import secrets
 from app.crypto import encrypt_secret, decrypt_secret
 
+BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8082")
+
 
 def test_encryption_key_independence_and_fallback():
     """Valida se uma chave criptografada com ENCRYPTION_KEY não se corrompe ao alterar SECRET_KEY."""
@@ -21,7 +23,6 @@ def test_encryption_key_independence_and_fallback():
 @pytest.mark.asyncio
 async def test_api_providers_returns_only_masked_keys():
     """Valida que o endpoint GET /api/ai/providers retorna apenas máscara e flag booleana, nunca a chave completa."""
-    BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8082")
     async with httpx.AsyncClient(base_url=BASE_URL, timeout=15.0) as client:
         email = f"ai_mask_{secrets.token_hex(4)}@empresa.com"
         reg = await client.post("/api/auth/register", json={

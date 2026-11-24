@@ -99,8 +99,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     onNewProject();
                   }}
                   className="absolute right-2 p-1 rounded hover:bg-mockbird-surface text-slate-500 hover:text-mockbird-cyan transition-colors"
-                  title="Criar novo projeto"
-                  aria-label="Criar novo projeto"
+                  title="Iniciar no editor"
+                  aria-label="Iniciar no editor"
                 >
                   <Plus size={13} />
                 </button>

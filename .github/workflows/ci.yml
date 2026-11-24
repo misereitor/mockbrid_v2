@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   backend:
     runs-on: ubuntu-latest
@@ -47,6 +50,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build do frontend e instalação do Chromium
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+          npx playwright install --with-deps chromium
+
       - name: Subir stack de homologação
         run: docker compose up -d --build
 
@@ -59,18 +75,6 @@ jobs:
             sleep 2
           done
           echo "API não respondeu a tempo"; docker compose logs --tail=100 backend; exit 1
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Instalar dependências e Chromium
-        working-directory: frontend
-        run: |
-          npm ci
-          npx playwright install --with-deps chromium
 
       - name: E2E de navegador
         working-directory: frontend
