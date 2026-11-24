@@ -28,7 +28,8 @@ import {
   Redo2,
   Sun,
   Moon,
-  FolderPlus
+  FolderPlus,
+  Edit2
 } from 'lucide-react';
 import { CanvasEditor, CanvasEditorHandle, SelectedElementInfo } from '../CanvasEditor';
 import { TokensPanel } from '../TokensPanel';
@@ -77,6 +78,7 @@ interface EditorPageProps {
   onOpenPresentation: (slug: string) => void;
   onNotify?: (msg: string) => void;
   onNewProject?: () => void;
+  onRenameProject?: (projectId: string, newName: string) => Promise<void> | void;
 }
 
 const VIEWPORT_SIZES = {
@@ -105,8 +107,49 @@ export const EditorPage: React.FC<EditorPageProps> = ({
   onOpenPresentation,
   onNotify,
   onNewProject,
+  onRenameProject,
 }) => {
   const [screens, setScreens] = useState<ScreenData[]>(project.screens || []);
+  const [projectName, setProjectName] = useState(project.name);
+  const [isEditingName, setIsEditingName] = useState(false);
+  const [nameInput, setNameInput] = useState(project.name);
+  const [savingName, setSavingName] = useState(false);
+
+  useEffect(() => {
+    setProjectName(project.name);
+    setNameInput(project.name);
+  }, [project.name]);
+
+  const handleSaveName = async () => {
+    const trimmed = nameInput.trim();
+    if (!trimmed || trimmed === projectName) {
+      setNameInput(projectName);
+      setIsEditingName(false);
+      return;
+    }
+    setSavingName(true);
+    try {
+      const res = await fetch(`/api/projects/${project.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: trimmed }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Falha ao renomear projeto');
+      }
+      const data = await res.json();
+      setProjectName(data.name);
+      setIsEditingName(false);
+      onNotify?.('Projeto renomeado com sucesso');
+      onRenameProject?.(project.id, data.name);
+    } catch (e: any) {
+      alert(e.message || 'Erro ao renomear projeto');
+      setNameInput(projectName);
+    } finally {
+      setSavingName(false);
+    }
+  };
   const [currentScreenIndex, setCurrentScreenIndex] = useState(0);
   const [activeTab, setActiveTab] = useState<ActiveEditorTab | null>('ai'); // Aberto na IA por padrão
   const [viewport, setViewport] = useState<'desktop' | 'tablet' | 'mobile'>('desktop');
@@ -474,7 +517,37 @@ export const EditorPage: React.FC<EditorPageProps> = ({
       <div className="h-12 bg-mockbird-surface border-b border-mockbird-border px-3 flex items-center justify-between gap-4 select-none shrink-0 z-30">
         {/* Projeto + telas */}
         <div className="flex items-center gap-2 min-w-0">
-          <span className="text-[13px] font-medium text-slate-200 truncate max-w-[180px]">{project.name}</span>
+          {isEditingName ? (
+            <input
+              type="text"
+              value={nameInput}
+              onChange={(e) => setNameInput(e.target.value)}
+              onBlur={handleSaveName}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleSaveName();
+                if (e.key === 'Escape') {
+                  setNameInput(projectName);
+                  setIsEditingName(false);
+                }
+              }}
+              autoFocus
+              disabled={savingName}
+              className="bg-mockbird-bg border border-mockbird-cyan text-white text-[13px] px-2 py-0.5 rounded outline-none w-44 font-medium"
+              placeholder="Nome do projeto"
+              aria-label="Editar nome do projeto"
+            />
+          ) : (
+            <div
+              className="group/name flex items-center gap-1.5 cursor-pointer py-0.5 px-1.5 rounded hover:bg-mockbird-card transition-colors min-w-0"
+              onClick={() => setIsEditingName(true)}
+              title="Clique para renomear o projeto"
+            >
+              <span className="text-[13px] font-medium text-slate-200 truncate max-w-[180px]">
+                {projectName}
+              </span>
+              <Edit2 size={11} className="text-slate-500 group-hover/name:text-mockbird-cyan transition-colors shrink-0 opacity-0 group-hover/name:opacity-100" />
+            </div>
+          )}
           {onNewProject && (
             <button
               type="button"

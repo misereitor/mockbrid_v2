@@ -14,6 +14,7 @@ import {
   Plug,
   Trash2,
   Upload,
+  Edit2,
 } from 'lucide-react';
 import { copyPresentationLink, openPresentation } from '../lib/presentation';
 
@@ -34,6 +35,7 @@ interface DashboardPageProps {
   onImportDesign?: (file: File, name: string) => Promise<void>;
   onDeleteProject?: (projectId: string) => Promise<void> | void;
   onDuplicateProject?: (projectId: string) => Promise<void> | void;
+  onRenameProject?: (projectId: string, newName: string) => Promise<void> | void;
   onNavigate: (view: 'dashboard' | 'editor' | 'team' | 'settings' | 'presentation') => void;
   memberCount: number;
 }
@@ -52,6 +54,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   onImportDesign,
   onDeleteProject,
   onDuplicateProject,
+  onRenameProject,
   onNavigate,
   memberCount,
 }) => {
@@ -63,6 +66,9 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   const [query, setQuery] = useState('');
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
+  const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [renaming, setRenaming] = useState(false);
   const importInputRef = useRef<HTMLInputElement>(null);
 
   const handleImport = async (file?: File) => {
@@ -266,8 +272,71 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                   <div className="p-4 flex-1 flex flex-col gap-3">
                     <div className="min-w-0">
                       <div className="flex items-center justify-between gap-2">
-                        <h3 className="font-medium text-sm text-white truncate" title={proj.name}>{proj.name}</h3>
-                        <span className="text-[10px] text-slate-500 shrink-0 tabular-nums">{formatDate(proj.updated_at)}</span>
+                        {editingProjectId === proj.id ? (
+                          <div className="flex items-center gap-1.5 w-full">
+                            <input
+                              type="text"
+                              value={renameValue}
+                              onChange={(e) => setRenameValue(e.target.value)}
+                              onKeyDown={async (e) => {
+                                if (e.key === 'Enter') {
+                                  const val = renameValue.trim();
+                                  if (val && val !== proj.name && onRenameProject) {
+                                    setRenaming(true);
+                                    try {
+                                      await onRenameProject(proj.id, val);
+                                      setEditingProjectId(null);
+                                    } finally {
+                                      setRenaming(false);
+                                    }
+                                  } else {
+                                    setEditingProjectId(null);
+                                  }
+                                }
+                                if (e.key === 'Escape') setEditingProjectId(null);
+                              }}
+                              autoFocus
+                              disabled={renaming}
+                              className="bg-mockbird-bg border border-mockbird-cyan text-white text-xs px-2 py-1 rounded outline-none w-full font-medium"
+                              placeholder="Nome do projeto"
+                              aria-label="Editar nome do projeto"
+                            />
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                const val = renameValue.trim();
+                                if (val && val !== proj.name && onRenameProject) {
+                                  setRenaming(true);
+                                  try {
+                                    await onRenameProject(proj.id, val);
+                                    setEditingProjectId(null);
+                                  } finally {
+                                    setRenaming(false);
+                                  }
+                                } else {
+                                  setEditingProjectId(null);
+                                }
+                              }}
+                              className="p-1 rounded bg-mockbird-blue hover:bg-mockbird-bluedark text-white text-xs shrink-0"
+                              title="Salvar nome"
+                            >
+                              <Check size={12} />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setEditingProjectId(null)}
+                              className="p-1 rounded text-slate-400 hover:text-white text-xs shrink-0"
+                              title="Cancelar"
+                            >
+                              <X size={12} />
+                            </button>
+                          </div>
+                        ) : (
+                          <>
+                            <h3 className="font-medium text-sm text-white truncate" title={proj.name}>{proj.name}</h3>
+                            <span className="text-[10px] text-slate-500 shrink-0 tabular-nums">{formatDate(proj.updated_at)}</span>
+                          </>
+                        )}
                       </div>
                       <p className="text-xs text-slate-400 line-clamp-2 mt-1 min-h-[32px] leading-relaxed">
                         {proj.description || 'Sem descrição.'}
@@ -293,6 +362,21 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                         >
                           {copiedSlug === proj.slug ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
                         </button>
+                        {onRenameProject && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setEditingProjectId(proj.id);
+                              setRenameValue(proj.name);
+                            }}
+                            className="mb-btn-ghost !p-1.5 hover:!text-mockbird-cyan text-slate-500 transition-colors"
+                            title="Renomear projeto"
+                            aria-label="Renomear projeto"
+                          >
+                            <Edit2 size={14} />
+                          </button>
+                        )}
                         {onDuplicateProject && (
                           <button
                             type="button"

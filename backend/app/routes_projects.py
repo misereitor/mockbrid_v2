@@ -23,12 +23,14 @@ from app.models import (
 from app.schemas import (
     DesignImportOut,
     ProjectCreate,
+    ProjectUpdate,
     ProjectOut,
     ScreenOut,
     ProjectMemberCreate,
     ProjectMemberOut,
     ProjectVisibilityUpdate,
 )
+from app.timeutils import utcnow
 from app.design_corpus import (
     DesignCorpusError,
     build_design_corpus,
@@ -411,6 +413,45 @@ async def _get_project_for_user(
 ) -> Project:
     """Carrega o projeto garantindo que pertence à organização do usuário e respeita regras de visibilidade e papel."""
     return await authorize_project(project_id, current_user, action, db)
+
+
+@router.patch("/{project_id}", response_model=ProjectOut)
+@router.put("/{project_id}", response_model=ProjectOut)
+async def update_project(
+    project_id: str,
+    payload: ProjectUpdate,
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Atualiza metadados do projeto como nome, descrição, visibilidade e design dials."""
+    project = await authorize_project(project_id, current_user, "edit", db)
+
+    if payload.name is not None:
+        clean_name = payload.name.strip()
+        if not clean_name:
+            raise HTTPException(
+                status_code=400, detail="Nome do projeto não pode ser vazio"
+            )
+        project.name = clean_name
+
+    if payload.description is not None:
+        project.description = payload.description.strip()
+
+    if payload.visibility is not None:
+        if payload.visibility not in ["private", "org"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Visibilidade inválida. Opções: 'private', 'org'",
+            )
+        project.visibility = payload.visibility
+
+    if payload.design_dials is not None:
+        project.design_dials = payload.design_dials
+
+    project.updated_at = utcnow()
+    await db.commit()
+    await db.refresh(project)
+    return project
 
 
 @router.patch("/{project_id}/visibility", response_model=ProjectOut)

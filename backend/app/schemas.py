@@ -59,6 +59,13 @@ class ProjectCreate(BaseModel):
     visibility: Optional[str] = "private"
 
 
+class ProjectUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    description: Optional[str] = None
+    visibility: Optional[str] = None
+    design_dials: Optional[Dict[str, Any]] = None
+
+
 class ProjectOut(BaseModel):
     id: str
     workspace_id: str

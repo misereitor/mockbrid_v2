@@ -249,6 +249,28 @@ export function App() {
     }
   };
 
+  const handleRenameProject = async (id: string, newName: string) => {
+    try {
+      const res = await fetch(`/api/projects/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newName }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Falha ao renomear projeto');
+      }
+      const updated = await res.json();
+      setProjects((prev) =>
+        prev.map((p) => (p.id === id ? { ...p, name: updated.name } : p))
+      );
+    } catch (e: any) {
+      console.error('Erro ao renomear projeto:', e);
+      alert(e.message || 'Erro ao renomear projeto');
+      throw e;
+    }
+  };
+
   const handleLogout = async () => {
     try {
       await fetch('/api/auth/logout', { method: 'POST' });
@@ -375,6 +397,7 @@ export function App() {
               onImportDesign={handleImportDesign}
               onDeleteProject={handleDeleteProject}
               onDuplicateProject={handleDuplicateProject}
+              onRenameProject={handleRenameProject}
               onNavigate={handleSidebarNavigate}
               memberCount={memberCount}
             />
@@ -389,6 +412,7 @@ export function App() {
                 navigateTo(`/p/${slug}`);
               }}
               onNewProject={() => setShowNewProjectModal(true)}
+              onRenameProject={handleRenameProject}
             />
           )}
 
