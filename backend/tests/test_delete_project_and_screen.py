@@ -1,8 +1,9 @@
+import os
 import pytest
 import httpx
 import secrets
 
-BASE_URL = "http://127.0.0.1:8082"
+BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8082")
 
 
 @pytest.mark.asyncio

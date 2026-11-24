@@ -10,12 +10,17 @@
 export interface NavScreen {
   id: string;
   name: string;
+  slug?: string;
 }
 
 /** Normaliza um alvo/nome para comparação. */
 export function screenKey(value: string): string {
   let raw = String(value || '').trim();
-  raw = raw.split('#')[0].split('?')[0];
+  if (!raw) return '';
+  // Se começar com #/ ou #, limpa o prefixo de rota SPA
+  raw = raw.replace(/^#\/?/, '');
+  // Separa query params e fragmentos adicionais
+  raw = raw.split('?')[0].split('#')[0];
   raw = raw.replace(/\\/g, '/');
   raw = raw.split('/').filter(Boolean).pop() || raw;
   raw = raw.replace(/\.html?$/i, '');
@@ -41,11 +46,14 @@ export function resolveScreenIndex(target: string, screens: NavScreen[]): number
   const byId = screens.findIndex((screen) => screen.id === target.trim());
   if (byId >= 0) return byId;
 
+  const bySlug = screens.findIndex((screen) => screen.slug && screenKey(screen.slug) === key);
+  if (bySlug >= 0) return bySlug;
+
   const keys = screens.map((screen) => screenKey(screen.name));
   const exact = keys.indexOf(key);
   if (exact >= 0) return exact;
 
   return keys.findIndex(
-    (candidate) => candidate.length >= 4 && (candidate.includes(key) || key.includes(candidate)),
+    (candidate) => candidate.length >= 3 && (candidate.includes(key) || key.includes(candidate)),
   );
 }

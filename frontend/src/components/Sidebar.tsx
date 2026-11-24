@@ -8,6 +8,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   ExternalLink,
+  Plus,
 } from 'lucide-react';
 import { openPresentation } from '../lib/presentation';
 
@@ -22,6 +23,8 @@ interface SidebarProps {
   activeProjectId?: string;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  onNewProject?: () => void;
+  onOpenActiveProject?: (id: string) => void;
 }
 
 const ROLE_LABEL: Record<string, string> = {
@@ -40,6 +43,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   activeProjectId,
   collapsed,
   onToggleCollapsed,
+  onNewProject,
+  onOpenActiveProject,
 }) => {
   const items: { id: View; label: string; icon: React.ElementType }[] = [
     { id: 'dashboard', label: 'Projetos', icon: LayoutGrid },
@@ -72,20 +77,35 @@ export const Sidebar: React.FC<SidebarProps> = ({
         {items.map(({ id, label, icon: Icon }) => {
           const active = currentView === id;
           return (
-            <button
-              key={id}
-              onClick={() => onNavigate(id)}
-              title={collapsed ? label : undefined}
-              aria-current={active ? 'page' : undefined}
-              className={`w-full flex items-center ${collapsed ? 'justify-center' : 'gap-2.5 px-2.5'} py-2 rounded-md text-[13px] font-medium transition-colors duration-150 ${
-                active
-                  ? 'bg-mockbird-card text-white'
-                  : 'text-slate-400 hover:text-slate-100 hover:bg-mockbird-card/60'
-              }`}
-            >
-              <Icon size={16} className={active ? 'text-mockbird-cyan' : ''} />
-              {!collapsed && <span>{label}</span>}
-            </button>
+            <div key={id} className="relative group/nav flex items-center">
+              <button
+                onClick={() => onNavigate(id)}
+                title={collapsed ? label : undefined}
+                aria-current={active ? 'page' : undefined}
+                className={`w-full flex items-center ${collapsed ? 'justify-center' : 'gap-2.5 px-2.5'} py-2 rounded-md text-[13px] font-medium transition-colors duration-150 ${
+                  active
+                    ? 'bg-mockbird-card text-white'
+                    : 'text-slate-400 hover:text-slate-100 hover:bg-mockbird-card/60'
+                }`}
+              >
+                <Icon size={16} className={active ? 'text-mockbird-cyan' : ''} />
+                {!collapsed && <span>{label}</span>}
+              </button>
+              {!collapsed && id === 'editor' && onNewProject && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onNewProject();
+                  }}
+                  className="absolute right-2 p-1 rounded hover:bg-mockbird-surface text-slate-500 hover:text-mockbird-cyan transition-colors"
+                  title="Criar novo projeto"
+                  aria-label="Criar novo projeto"
+                >
+                  <Plus size={13} />
+                </button>
+              )}
+            </div>
           );
         })}
 
@@ -93,7 +113,18 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <div className="pt-4 mt-3 border-t border-mockbird-border">
             <div className="px-2.5 text-[10px] font-medium uppercase tracking-wider text-slate-500 mb-1.5">Projeto ativo</div>
             <div className="px-2.5 py-2 rounded-md bg-mockbird-bg border border-mockbird-border">
-              <div className="text-xs font-medium text-slate-200 truncate">{activeProjectName}</div>
+              {activeProjectId && onOpenActiveProject ? (
+                <button
+                  type="button"
+                  onClick={() => onOpenActiveProject(activeProjectId)}
+                  className="w-full text-left text-xs font-medium text-slate-200 truncate hover:text-mockbird-cyan transition-colors block"
+                  title={`Abrir editor de ${activeProjectName}`}
+                >
+                  {activeProjectName}
+                </button>
+              ) : (
+                <div className="text-xs font-medium text-slate-200 truncate">{activeProjectName}</div>
+              )}
               {activeProjectId && (
                 <button
                   onClick={() => { openPresentation(activeProjectId).catch(() => {}); }}

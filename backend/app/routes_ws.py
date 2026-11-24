@@ -104,8 +104,13 @@ async def project_socket(websocket: WebSocket, project_id: str):
                     exclude=participant,
                 )
             elif kind == "screen_update":
-                # Somente membros com permissão de leitura chegam aqui; o
-                # conteúdo autoritativo continua vindo do PUT /api/screens.
+                # Exige papel de edição para emitir atualizações em tempo real
+                async with AsyncSessionLocal() as db:
+                    try:
+                        await authorize_project(project_id, user, "edit", db)
+                    except Exception:
+                        continue
+
                 await broadcaster.broadcast(
                     project_id,
                     {

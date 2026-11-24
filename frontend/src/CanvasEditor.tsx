@@ -26,6 +26,13 @@ import {
   MousePointerClick,
   X,
 } from 'lucide-react';
+import { CanvasChromeBar } from './components/CanvasChromeBar';
+
+export interface BreadcrumbItem {
+  mbId: string;
+  tag: string;
+  selector?: string;
+}
 
 export interface SelectedElementInfo {
   mbId: string;
@@ -34,6 +41,12 @@ export interface SelectedElementInfo {
   selector?: string;
   snippet?: string;
   leaf?: boolean;
+  breadcrumbs?: BreadcrumbItem[];
+  dataGo?: string;
+  dataToast?: string;
+  dataOverlay?: string;
+  dataClose?: string;
+  dataMock?: string;
   styles: {
     text?: string;
     bg?: string;
@@ -46,16 +59,21 @@ export interface SelectedElementInfo {
 
 export interface CanvasEditorHandle {
   applyStylePatch: (patch: any) => void;
+  updateAttributes?: (attributes: Record<string, string | null>) => void;
+  selectByMbId?: (mbId: string) => void;
+  toggleElementVisibility?: (mbId: string) => void;
   sendAction: (actionType: string) => void;
   fitToScreen: () => void;
   setZoom: (zoom: number) => void;
   captureScreenshot: () => Promise<string>;
   patchElement?: (html: string, target?: { mbId?: string; selector?: string }) => void;
+  applyScenario?: (data: Record<string, any>) => void;
 }
 
 interface CanvasEditorProps {
   initialHtml: string;
   tokens: Record<string, string>;
+  theme?: 'light' | 'dark';
   onHtmlChange: (newHtml: string) => void;
   width?: number;
   height?: number;
@@ -88,6 +106,7 @@ const ZOOM_MAX = 3.0;
 export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
   initialHtml,
   tokens,
+  theme = 'dark',
   onHtmlChange,
   width = 1440,
   height = 900,
@@ -104,11 +123,22 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
   const [selectedMbId, setSelectedMbId] = useState<string | null>(null);
   const [selectedTag, setSelectedTag] = useState<string>('');
   const [selectionCount, setSelectionCount] = useState(0);
+  const [breadcrumbs, setBreadcrumbs] = useState<BreadcrumbItem[]>([]);
   const [copiedNotification, setCopiedNotification] = useState<string | null>(null);
 
   // O canvas abre como mock navegável; "Editar" trava o clique como seleção.
-  const [canvasMode, setCanvasMode] = useState<'edit' | 'interactive'>('interactive');
+  const [canvasMode, setCanvasMode] = useState<'edit' | 'hand' | 'interactive'>('interactive');
+  const [spacePressed, setSpacePressed] = useState(false);
   const [docVersion, setDocVersion] = useState(0);
+  const [canvasWidth, setCanvasWidth] = useState(width);
+  const [canvasHeight, setCanvasHeight] = useState(height);
+  const [navigationEvent, setNavigationEvent] = useState<{ target: string; id: number }>();
+  const navigationIdRef = useRef(0);
+
+  useEffect(() => {
+    setCanvasWidth(width);
+    setCanvasHeight(height);
+  }, [width, height]);
 
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState>({
     open: false,
@@ -122,16 +152,14 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const prevInitialHtmlRef = useRef(initialHtml);
-  // HTML que originou o documento atual. Alterações feitas dentro do iframe
-  // não voltam para o srcDoc, senão o canvas recarregaria e perderia a seleção.
+  // HTML que origina o documento no canvas
   const [docHtml, setDocHtml] = useState(initialHtml);
 
-  // Sincroniza quando initialHtml muda de fora (ex: IA aplicou código novo)
+  // Sincroniza quando initialHtml muda de fora (troca de tela/rota, IA, etc.)
   useEffect(() => {
     if (initialHtml !== prevInitialHtmlRef.current) {
       prevInitialHtmlRef.current = initialHtml;
       setDocHtml(initialHtml);
-      setDocVersion((v) => v + 1);
     }
   }, [initialHtml]);
 
@@ -197,6 +225,24 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
         patch,
       }, '*');
     },
+    updateAttributes: (attributes: Record<string, string | null>) => {
+      iframeRef.current?.contentWindow?.postMessage({
+        type: 'MOCKBIRD_UPDATE_ATTRIBUTES',
+        attributes,
+      }, '*');
+    },
+    selectByMbId: (mbId: string) => {
+      iframeRef.current?.contentWindow?.postMessage({
+        type: 'MOCKBIRD_SELECT_BY_MB_ID',
+        mbId,
+      }, '*');
+    },
+    toggleElementVisibility: (mbId: string) => {
+      iframeRef.current?.contentWindow?.postMessage({
+        type: 'MOCKBIRD_TOGGLE_VISIBILITY',
+        mbId,
+      }, '*');
+    },
     patchElement: (html: string, target?: { mbId?: string; selector?: string }) => {
       iframeRef.current?.contentWindow?.postMessage({
         type: 'MOCKBIRD_PATCH_ELEMENT',
@@ -217,6 +263,12 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
     captureScreenshot: async (): Promise<string> => {
       return '';
     },
+    applyScenario: (data: Record<string, any>) => {
+      iframeRef.current?.contentWindow?.postMessage({
+        type: 'MOCKBIRD_APPLY_SCENARIO',
+        data,
+      }, '*');
+    },
   }), [fitToScreen]);
 
   // Ajuste automático inicial
@@ -225,11 +277,23 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [width, height]);
 
-  // Script injetado no iframe: lida com cliques, seleção, postMessages e MENU DE CONTEXTO
+  // Script injetado no iframe: monta o documento do canvas com o runtime de seleção/edição embutido
+  const initialThemeRef = useRef(theme);
+  const initialTokensRef = useRef(tokens);
   const builtHtmlDoc = useMemo(
-    () => buildCanvasDoc(docHtml, tokens),
-    [docHtml, tokens, docVersion]
+    () => buildCanvasDoc(docHtml, initialTokensRef.current, initialThemeRef.current),
+    [docHtml, docVersion]
   );
+
+  useEffect(() => {
+    if (iframeRef.current?.contentWindow) {
+      iframeRef.current.contentWindow.postMessage({
+        type: 'MOCKBIRD_SET_THEME',
+        theme,
+        tokens,
+      }, '*');
+    }
+  }, [theme, tokens]);
 
   // Mensagens do iframe
   useEffect(() => {
@@ -242,6 +306,7 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
         setSelectedMbId(e.data.mbId);
         setSelectedTag(e.data.tag);
         setSelectionCount(Math.max(1, Number(e.data.count) || 1));
+        setBreadcrumbs(e.data.breadcrumbs || []);
         if (onElementSelected) {
           onElementSelected({
             mbId: e.data.mbId,
@@ -249,6 +314,12 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
             selector: e.data.selector,
             snippet: e.data.snippet,
             leaf: e.data.leaf,
+            breadcrumbs: e.data.breadcrumbs,
+            dataGo: e.data.dataGo,
+            dataToast: e.data.dataToast,
+            dataOverlay: e.data.dataOverlay,
+            dataClose: e.data.dataClose ? 'true' : '',
+            dataMock: e.data.dataMock,
             styles: {
               text: e.data.text,
               ...e.data.styles,
@@ -259,6 +330,7 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
         setSelectedMbId(null);
         setSelectedTag('');
         setSelectionCount(0);
+        setBreadcrumbs([]);
         if (onElementSelected) onElementSelected(null);
       } else if (e.data.type === 'MOCKBIRD_UNDO') {
         onUndo?.();
@@ -268,9 +340,31 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
         prevInitialHtmlRef.current = e.data.html;
         onHtmlChange(e.data.html);
       } else if (e.data.type === 'MOCKBIRD_NAVIGATE') {
-        onNavigate?.(String(e.data.target || ''), Boolean(e.data.external));
+        const target = String(e.data.target || '');
+        navigationIdRef.current += 1;
+        setNavigationEvent({ target, id: navigationIdRef.current });
+        onNavigate?.(target, Boolean(e.data.external));
       } else if (e.data.type === 'MOCKBIRD_CLOSE_CONTEXT_MENU') {
         closeContextMenu();
+      } else if (e.data.type === 'MOCKBIRD_SPACE_KEY') {
+        setSpacePressed(Boolean(e.data.pressed));
+      } else if (e.data.type === 'MOCKBIRD_IFRAME_WHEEL') {
+        closeContextMenu();
+        const iframe = iframeRef.current;
+        if (!iframe) return;
+        const rect = iframe.getBoundingClientRect();
+        const clientX = rect.left + (e.data.clientX || 0) * scale;
+        const clientY = rect.top + (e.data.clientY || 0) * scale;
+
+        if (e.data.ctrlKey || e.data.metaKey) {
+          const factor = Math.exp(-e.data.deltaY * 0.003);
+          zoomAtPoint(factor, clientX, clientY);
+        } else {
+          setPan((prev) => ({
+            x: Math.round(prev.x - e.data.deltaX),
+            y: Math.round(prev.y - e.data.deltaY),
+          }));
+        }
       } else if (e.data.type === 'MOCKBIRD_CONTEXT_MENU') {
         // O iframe disparou contextmenu. Converte as coordenadas do iframe para coordenadas da janela
         const iframe = iframeRef.current;
@@ -291,7 +385,29 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
 
     window.addEventListener('message', handleMsg);
     return () => window.removeEventListener('message', handleMsg);
-  }, [onHtmlChange, onElementSelected, scale, closeContextMenu, onNavigate, onUndo, onRedo]);
+  }, [onHtmlChange, onElementSelected, scale, closeContextMenu, onNavigate, onUndo, onRedo, zoomAtPoint]);
+
+  // Listener para barra de espaço (Modo Mão / Pan rápido)
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code === 'Space' && !e.repeat) {
+        const active = document.activeElement;
+        if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || (active as HTMLElement).isContentEditable)) return;
+        setSpacePressed(true);
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === 'Space') {
+        setSpacePressed(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+    };
+  }, []);
 
   // Listener nativo de wheel para zoom com Ctrl/Meta e Pan com scroll
   useEffect(() => {
@@ -328,6 +444,18 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
       if (e.key === 'Escape') {
         closeContextMenu();
         return;
+      }
+
+      // H (Hand mode / Mão) e V (Selection / Editar)
+      if (!e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+        if (e.key === 'h' || e.key === 'H') {
+          setCanvasMode((prev) => (prev === 'hand' ? 'edit' : 'hand'));
+          return;
+        }
+        if (e.key === 'v' || e.key === 'V') {
+          setCanvasMode('edit');
+          return;
+        }
       }
 
       // Ctrl + + (zoom in)
@@ -406,8 +534,13 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
   // Pan com arraste
   const handleMouseDown = (e: React.MouseEvent) => {
     closeContextMenu();
-    // Botão do meio (1) ou botão esquerdo (0) no fundo
-    if (e.button === 1 || (e.button === 0 && e.target === containerRef.current)) {
+    // Botão do meio (1), ou espaço pressionado, ou modo mão, ou botão esquerdo no fundo
+    if (
+      e.button === 1 ||
+      spacePressed ||
+      canvasMode === 'hand' ||
+      (e.button === 0 && e.target === containerRef.current)
+    ) {
       e.preventDefault();
       setIsPanning(true);
       startPanRef.current = { x: e.clientX - pan.x, y: e.clientY - pan.y };
@@ -490,8 +623,10 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onContextMenu={handleCanvasContextMenu}
-        className={`flex-1 bg-mockbird-bg flex items-center justify-center overflow-hidden relative cursor-default ${
-          isPanning ? 'cursor-grab active:cursor-grabbing' : ''
+        className={`flex-1 bg-mockbird-bg flex items-center justify-center overflow-hidden relative ${
+          isPanning || spacePressed || canvasMode === 'hand'
+            ? 'cursor-grab active:cursor-grabbing'
+            : 'cursor-default'
         }`}
         style={{
           backgroundImage: 'radial-gradient(circle, #27272a 1px, transparent 1px)',
@@ -532,6 +667,37 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
             >
               <X size={13} />
             </button>
+          </div>
+        )}
+
+        {/* Trilha de Breadcrumbs (Ancestrais do Elemento Selecionado) */}
+        {selectedMbId && breadcrumbs.length > 0 && (
+          <div className="absolute top-4 left-44 z-20 hidden md:flex items-center gap-1 py-1 px-2.5 rounded-lg bg-mockbird-surface/95 border border-mockbird-border shadow-panel backdrop-blur-md text-xs text-slate-300 max-w-[50vw] overflow-x-auto">
+            {breadcrumbs.map((crumb, idx) => {
+              const isLast = idx === breadcrumbs.length - 1;
+              return (
+                <React.Fragment key={crumb.mbId || idx}>
+                  {idx > 0 && <span className="text-slate-600 text-[10px]">›</span>}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      iframeRef.current?.contentWindow?.postMessage({
+                        type: 'MOCKBIRD_SELECT_BY_MB_ID',
+                        mbId: crumb.mbId,
+                      }, '*');
+                    }}
+                    className={`px-1.5 py-0.5 rounded text-[11px] font-mono transition-colors ${
+                      isLast
+                        ? 'bg-mockbird-blue/20 text-mockbird-cyan font-bold border border-mockbird-blue/30'
+                        : 'text-slate-400 hover:text-white hover:bg-mockbird-card'
+                    }`}
+                    title={`Selecionar <${crumb.tag}> (${crumb.mbId})`}
+                  >
+                    &lt;{crumb.tag}&gt;
+                  </button>
+                </React.Fragment>
+              );
+            })}
           </div>
         )}
 
@@ -582,8 +748,8 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
           </button>
         </div>
 
-        {/* Seletor de Modo: Edição vs Interativo (Canto Inferior Direito) */}
-        <div className="absolute bottom-5 right-5 z-20 flex items-center p-1 rounded-lg bg-mockbird-surface/95 border border-mockbird-border shadow-panel backdrop-blur-md text-xs">
+        {/* Seletor de Modo: Edição vs Mão vs Interativo (Canto Inferior Direito) */}
+        <div className="absolute bottom-5 right-5 z-20 flex items-center p-1 rounded-lg bg-mockbird-surface/95 border border-mockbird-border shadow-panel backdrop-blur-md text-xs gap-0.5">
           <button
             type="button"
             onClick={() => setCanvasMode('edit')}
@@ -599,65 +765,111 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
           </button>
           <button
             type="button"
+            onClick={() => setCanvasMode('hand')}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md font-medium transition-all ${
+              canvasMode === 'hand'
+                ? 'bg-mockbird-blue text-white shadow-sm'
+                : 'text-slate-400 hover:text-white'
+            }`}
+            title="Modo Mão (segure Espaço ou tecla H): clique e arraste em qualquer lugar para mover a tela"
+          >
+            <Hand size={13} />
+            <span>Mão</span>
+          </button>
+          <button
+            type="button"
             onClick={() => setCanvasMode('interactive')}
             className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md font-medium transition-all ${
               canvasMode === 'interactive'
                 ? 'bg-emerald-600 text-white shadow-sm'
                 : 'text-slate-400 hover:text-white'
             }`}
-            title="Modo Mock: clique navega como na página. Shift+clique seleciona (e acumula) blocos para editar"
+            title="Modo Mock: navegação real, modais e formulários ativos como na página final"
           >
-            <Hand size={13} />
+            <MousePointerClick size={13} />
             <span>Interagir</span>
           </button>
         </div>
 
         {/* Quadro da Tela (Artboard) */}
         <div
+          data-testid="canvas-transform"
           style={{
             transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})`,
             transformOrigin: 'center center',
-            transition: isPanning ? 'none' : 'transform 80ms ease-out',
+            transition: 'none',
           }}
-          className="shadow-2xl rounded-xl transition-shadow duration-200"
+          className="shadow-2xl rounded-xl"
         >
-          {/* Barra Superior do Artboard */}
-          <div
-            style={{ width: `${width}px` }}
-            className="h-9 px-4 rounded-t-xl bg-mockbird-surface border-x border-t border-mockbird-border flex items-center justify-between text-xs text-slate-400 select-none shadow-sm"
-          >
-            <span className="font-semibold text-slate-200 flex items-center gap-2">
-              <span className={`h-1.5 w-1.5 rounded-full ${canvasMode === 'interactive' ? 'bg-emerald-400' : 'bg-mockbird-cyan'}`}></span>
-              {canvasMode === 'interactive' ? 'Modo Interativo (Testando página)' : 'Tela Ativa (Edição)'}
-            </span>
-            <div className="flex items-center gap-3">
-              <span className="text-[10px] text-slate-500">
-                {canvasMode === 'interactive'
-                  ? 'Clique: interagir · Shift: selecionar/mover · Esc: limpar'
-                  : 'Clique: selecionar · Shift+clique: vários · Arraste: mover · Alças: redimensionar'}
-              </span>
-              <span className="font-mono text-[11px] text-slate-500 tabular-nums">
-                {width} × {height}
-              </span>
-            </div>
-          </div>
+          {/* Barra de Navegador (Chrome Bar Completa) */}
+          <CanvasChromeBar
+            width={canvasWidth}
+            height={canvasHeight}
+            zoom={scale}
+            iframeRef={iframeRef}
+            onNavigate={(target, external) => onNavigate?.(target, external)}
+            onReload={() => setDocVersion((v) => v + 1)}
+            onViewportChange={(nextWidth, nextHeight) => {
+              setCanvasWidth(nextWidth);
+              setCanvasHeight(nextHeight);
+              setPan({ x: 0, y: 0 });
+            }}
+            onZoom={(nextZoom) => setScale(Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, nextZoom)))}
+            onFitToScreen={fitToScreen}
+            navigationEvent={navigationEvent}
+          />
 
           {/* Iframe com key dinâmica para renderização imediata do patch */}
           <div
-            style={{ width: `${width}px`, height: `${height}px` }}
-            className="bg-mockbird-surface border-x border-b border-mockbird-border rounded-b-xl overflow-hidden"
+            style={{ width: `${canvasWidth}px`, height: `${canvasHeight}px` }}
+            className="bg-[#09090b] border-x border-[#3c4043] overflow-hidden relative shadow-inner"
           >
+            {/* Overlay transparente ativo durante Pan ou modo Mão para capturar arrasto sem engolir mouse no iframe */}
+            {(isPanning || spacePressed || canvasMode === 'hand') && (
+              <div
+                onMouseDown={handleMouseDown}
+                className="absolute inset-0 z-30 cursor-grab active:cursor-grabbing bg-transparent"
+              />
+            )}
             {/* Sem allow-same-origin: HTML gerado por IA/MCP roda em origem opaca
                 e não consegue ler cookies nem chamar a API do app. */}
             <iframe
               key={`canvas_iframe_${docVersion}`}
               ref={iframeRef}
+              data-mockbird-canvas="frame"
               srcDoc={builtHtmlDoc}
               title="Mockbird Canvas"
               sandbox="allow-scripts allow-forms allow-modals"
               onLoad={syncMode}
               className="w-full h-full border-0 bg-[#09090b]"
             />
+          </div>
+
+          {/* Barra de Status da Janela do Navegador (Rodapé) */}
+          <div
+            style={{ width: `${canvasWidth}px` }}
+            className="h-7 px-3 bg-[#202124] border-x border-b border-[#3c4043] rounded-b-xl flex items-center justify-between text-[11px] text-[#9aa0a6] select-none"
+          >
+            <span className="font-medium text-slate-300 flex items-center gap-2">
+              <span className={`h-1.5 w-1.5 rounded-full ${canvasMode === 'interactive' ? 'bg-emerald-400' : 'bg-[#8ab4f8]'}`}></span>
+              {canvasMode === 'interactive'
+                ? 'Modo Interativo (Testar página)'
+                : canvasMode === 'hand'
+                ? 'Modo Mão (Pan)'
+                : 'Modo Inspeção & Edição'}
+            </span>
+            <div className="flex items-center gap-3">
+              <span className="text-[10px] text-slate-500 hidden sm:inline">
+                {canvasMode === 'interactive'
+                  ? 'Clique: navegar / interagir · Shift: selecionar'
+                  : canvasMode === 'hand'
+                  ? 'Arraste para mover o canvas'
+                  : 'Clique: selecionar · Duplo-clique: editar texto · F12: DevTools'}
+              </span>
+              <span className="font-mono text-[11px] text-slate-400 tabular-nums">
+                {canvasWidth} × {canvasHeight}
+              </span>
+            </div>
           </div>
         </div>
       </div>

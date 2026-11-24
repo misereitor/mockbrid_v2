@@ -16,10 +16,14 @@ async def _validate_project_ownership(project_id: str, current_user: User, db: A
     return await authorize_project(project_id, current_user, action, db)
 
 
+from typing import Dict, Any, Optional
+
 class TokensUpdate(BaseModel):
-    light_tokens: Dict[str, Any]
-    dark_tokens: Dict[str, Any]
-    shared_tokens: Dict[str, Any]
+    light_tokens: Optional[Dict[str, Any]] = None
+    dark_tokens: Optional[Dict[str, Any]] = None
+    shared_tokens: Optional[Dict[str, Any]] = None
+    light_theme: Optional[Dict[str, Any]] = None
+    dark_theme: Optional[Dict[str, Any]] = None
 
 
 class TokensOut(BaseModel):
@@ -28,6 +32,8 @@ class TokensOut(BaseModel):
     light_tokens: Dict[str, Any]
     dark_tokens: Dict[str, Any]
     shared_tokens: Dict[str, Any]
+    light_theme: Optional[Dict[str, Any]] = None
+    dark_theme: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
@@ -69,7 +75,15 @@ async def get_project_tokens(
         await db.commit()
         await db.refresh(tokens)
 
-    return tokens
+    return TokensOut(
+        id=str(tokens.id),
+        project_id=str(tokens.project_id),
+        light_tokens=tokens.light_tokens or {},
+        dark_tokens=tokens.dark_tokens or {},
+        shared_tokens=tokens.shared_tokens or {},
+        light_theme=tokens.light_tokens or {},
+        dark_theme=tokens.dark_tokens or {},
+    )
 
 
 @router.put("/{project_id}", response_model=TokensOut)
@@ -86,11 +100,23 @@ async def update_project_tokens(
         tokens = DesignTokens(project_id=project_id)
         db.add(tokens)
 
-    tokens.light_tokens = payload.light_tokens
-    tokens.dark_tokens = payload.dark_tokens
-    tokens.shared_tokens = payload.shared_tokens
+    light = payload.light_tokens if payload.light_tokens is not None else (payload.light_theme or {})
+    dark = payload.dark_tokens if payload.dark_tokens is not None else (payload.dark_theme or {})
+    shared = payload.shared_tokens or {}
+
+    tokens.light_tokens = light
+    tokens.dark_tokens = dark
+    tokens.shared_tokens = shared
 
     await db.commit()
     await db.refresh(tokens)
-    return tokens
+    return TokensOut(
+        id=str(tokens.id),
+        project_id=str(tokens.project_id),
+        light_tokens=tokens.light_tokens or {},
+        dark_tokens=tokens.dark_tokens or {},
+        shared_tokens=tokens.shared_tokens or {},
+        light_theme=tokens.light_tokens or {},
+        dark_theme=tokens.dark_tokens or {},
+    )
 

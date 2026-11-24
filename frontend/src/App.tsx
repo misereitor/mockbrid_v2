@@ -9,6 +9,7 @@ import { PresentationPage } from './views/PresentationPage';
 import { ResetPasswordPage } from './views/ResetPasswordPage';
 import { VerifyEmailPage } from './views/VerifyEmailPage';
 import { AcceptInvitePage } from './views/AcceptInvitePage';
+import { NewProjectModal } from './components/NewProjectModal';
 
 type ViewMode = 'dashboard' | 'editor' | 'team' | 'settings' | 'presentation';
 
@@ -25,6 +26,7 @@ export function App() {
   const [emailStatus, setEmailStatus] = useState<any>(null);
   const [resending, setResending] = useState(false);
   const [resendMsg, setResendMsg] = useState<string | null>(null);
+  const [showNewProjectModal, setShowNewProjectModal] = useState(false);
 
   // Parseador de URL para rotas reais no navegador
   const parseRouteFromUrl = useCallback(() => {
@@ -54,14 +56,8 @@ export function App() {
     }
 
     if (path === '/editor') {
-      // Tenta recuperar último projeto trabalhado
-      const lastId = activeProjectId || localStorage.getItem('mockbird_last_project_id');
-      if (lastId) {
-        setActiveProjectId(lastId);
-        window.history.replaceState({}, '', `/editor/${lastId}`);
-      }
-      setCurrentView('editor');
-      setSidebarCollapsed(true);
+      setShowNewProjectModal(true);
+      setCurrentView('dashboard');
       return;
     }
 
@@ -193,13 +189,15 @@ export function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, description })
     });
-    if (res.ok) {
-      const newProj = await res.json();
-      await loadProjects();
-      setActiveProjectId(newProj.id);
-      try { localStorage.setItem('mockbird_last_project_id', newProj.id); } catch {}
-      navigateTo(`/editor/${newProj.id}`);
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.detail || 'Falha ao criar novo projeto.');
     }
+    const newProj = await res.json();
+    await loadProjects();
+    setActiveProjectId(newProj.id);
+    try { localStorage.setItem('mockbird_last_project_id', newProj.id); } catch {}
+    navigateTo(`/editor/${newProj.id}`);
   };
 
   const handleImportDesign = async (file: File, name: string) => {
@@ -263,12 +261,7 @@ export function App() {
     if (view === 'dashboard') {
       navigateTo('/dashboard');
     } else if (view === 'editor') {
-      const targetId = activeProjectId || projects[0]?.id || localStorage.getItem('mockbird_last_project_id');
-      if (targetId) {
-        navigateTo(`/editor/${targetId}`);
-      } else {
-        navigateTo('/editor');
-      }
+      setShowNewProjectModal(true);
     } else if (view === 'team') {
       navigateTo('/team');
     } else if (view === 'settings') {
@@ -276,18 +269,23 @@ export function App() {
     }
   };
 
-  // Projeto atualmente em foco
+  // Projeto atualmente em foco: apenas o explicitamente ativo ou buscado diretamente
   const activeProject = 
     projects.find(p => p.id === activeProjectId) || 
-    (directProject?.id === activeProjectId ? directProject : null) || 
-    projects[0];
+    (directProject?.id === activeProjectId ? directProject : null);
 
   // Rota pública de apresentação (/p/:slug)
   if (currentView === 'presentation' && presentationSlug) {
     return (
       <PresentationPage
         slug={presentationSlug}
-        onBackToApp={currentUser ? () => navigateTo('/dashboard') : undefined}
+        onBackToApp={currentUser ? () => {
+          if (activeProjectId) {
+            navigateTo('/editor');
+          } else {
+            navigateTo('/dashboard');
+          }
+        } : undefined}
       />
     );
   }
@@ -335,6 +333,12 @@ export function App() {
         activeProjectId={activeProject?.id}
         collapsed={sidebarCollapsed}
         onToggleCollapsed={() => setSidebarCollapsed((c) => !c)}
+        onNewProject={() => setShowNewProjectModal(true)}
+        onOpenActiveProject={(id) => {
+          setActiveProjectId(id);
+          try { localStorage.setItem('mockbird_last_project_id', id); } catch {}
+          navigateTo(`/editor/${id}`);
+        }}
       />
 
       <main className="flex-1 min-w-0 flex flex-col overflow-y-auto">
@@ -356,55 +360,70 @@ export function App() {
             </div>
           )}
 
-        {currentView === 'dashboard' && (
-          <DashboardPage
-            projects={projects}
-            onSelectProject={(id) => {
-              setActiveProjectId(id);
-              try { localStorage.setItem('mockbird_last_project_id', id); } catch {}
-              navigateTo(`/editor/${id}`);
-            }}
-            onCreateProject={handleCreateProject}
-            onImportDesign={handleImportDesign}
-            onDeleteProject={handleDeleteProject}
-            onDuplicateProject={handleDuplicateProject}
-            onNavigate={handleSidebarNavigate}
-            memberCount={memberCount}
-          />
-        )}
+        <div key={currentView} className="flex-1 min-h-0 flex flex-col animate-in fade-in duration-150">
+          {currentView === 'dashboard' && (
+            <DashboardPage
+              projects={projects}
+              onSelectProject={(id) => {
+                setActiveProjectId(id);
+                try { localStorage.setItem('mockbird_last_project_id', id); } catch {}
+                navigateTo(`/editor/${id}`);
+              }}
+              onCreateProject={handleCreateProject}
+              onImportDesign={handleImportDesign}
+              onDeleteProject={handleDeleteProject}
+              onDuplicateProject={handleDuplicateProject}
+              onNavigate={handleSidebarNavigate}
+              memberCount={memberCount}
+            />
+          )}
 
-        {currentView === 'editor' && activeProject && (
-          <EditorPage
-            key={activeProject.id}
-            project={activeProject as any}
-            onOpenPresentation={(slug) => {
-              setPresentationSlug(slug);
-              navigateTo(`/p/${slug}`);
-            }}
-          />
-        )}
+          {currentView === 'editor' && activeProject && (
+            <EditorPage
+              key={activeProject.id}
+              project={activeProject as any}
+              onOpenPresentation={(slug) => {
+                setPresentationSlug(slug);
+                navigateTo(`/p/${slug}`);
+              }}
+              onNewProject={() => setShowNewProjectModal(true)}
+            />
+          )}
 
-        {currentView === 'editor' && !activeProject && (
-          <div className="flex-1 flex flex-col items-center justify-center p-12 text-center">
-            <h2 className="text-base font-semibold text-white mb-1">Nenhum projeto encontrado</h2>
-            <p className="text-xs text-slate-400 mb-4">Escolha ou crie um projeto no painel para abrir o editor.</p>
-            <button
-              onClick={() => navigateTo('/dashboard')}
-              className="mb-btn-primary"
-            >
-              Ir para o Painel
-            </button>
-          </div>
-        )}
+          {currentView === 'editor' && !activeProject && (
+            <div className="flex-1 flex flex-col items-center justify-center p-12 text-center">
+              <h2 className="text-base font-semibold text-white mb-1">Nenhum projeto encontrado</h2>
+              <p className="text-xs text-slate-400 mb-4">Escolha ou crie um projeto no painel para abrir o editor.</p>
+              <button
+                onClick={() => navigateTo('/dashboard')}
+                className="mb-btn-primary"
+              >
+                Ir para o Painel
+              </button>
+            </div>
+          )}
 
-        {currentView === 'team' && (
-          <TeamPage currentUserRole={currentUser.role} />
-        )}
+          {currentView === 'team' && (
+            <TeamPage currentUserRole={currentUser.role} />
+          )}
 
-        {currentView === 'settings' && (
-          <SettingsPage currentUser={currentUser} />
-        )}
+          {currentView === 'settings' && (
+            <SettingsPage currentUser={currentUser} />
+          )}
+        </div>
       </main>
+
+      <NewProjectModal
+        isOpen={showNewProjectModal}
+        onClose={() => setShowNewProjectModal(false)}
+        onCreateProject={handleCreateProject}
+        recentProject={activeProject ? { id: activeProject.id, name: activeProject.name } : null}
+        onContinueRecent={(id) => {
+          setActiveProjectId(id);
+          try { localStorage.setItem('mockbird_last_project_id', id); } catch {}
+          navigateTo(`/editor/${id}`);
+        }}
+      />
     </div>
   );
 }

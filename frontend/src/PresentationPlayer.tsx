@@ -59,19 +59,82 @@ export function PresentationPlayer({
           </div>
           <script>
             // Runtime de Interação para Apresentação ao CEO
+            function post(payload) {
+              window.parent.postMessage(payload, '*');
+            }
+
+            function mockTarget(node) {
+              if (!node || !node.closest) return null;
+              const goEl = node.closest('[data-go]');
+              if (goEl) {
+                const value = (goEl.getAttribute('data-go') || '').trim();
+                if (value && value !== '#') return { kind: 'screen', target: value };
+              }
+              const link = node.closest('a[href]');
+              if (!link || link.hasAttribute('download')) return null;
+              const href = (link.getAttribute('href') || '').trim();
+              if (!href || href === '#' || href.indexOf('javascript:') === 0) return null;
+              if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.indexOf('//') === 0) {
+                return { kind: 'external', target: href };
+              }
+              return { kind: 'screen', target: href };
+            }
+
             document.addEventListener('click', (e) => {
               // Verbo: data-toast="Mensagem"
               const toastEl = e.target.closest('[data-toast]');
               if (toastEl) {
                 const msg = toastEl.getAttribute('data-toast');
-                window.parent.postMessage({ type: 'MOCK_TOAST', message: msg }, '*');
+                if (msg) post({ type: 'MOCK_TOAST', message: msg });
+              }
+
+              // Verbo: data-overlay abre overlay
+              const overlayBtn = e.target.closest('[data-overlay]');
+              if (overlayBtn) {
+                const id = overlayBtn.getAttribute('data-overlay');
+                if (id) {
+                  const targetModal = document.getElementById(id) ||
+                    document.querySelector('[data-mb-id="' + id + '"]') ||
+                    document.querySelector('[data-mb-id*="' + id + '"]');
+                  if (targetModal) {
+                    e.preventDefault();
+                    targetModal.style.display = 'flex';
+                    targetModal.classList.remove('hidden');
+                    return;
+                  }
+                }
               }
 
               // Verbo: data-close fecha overlay mais próximo
               const closeEl = e.target.closest('[data-close]');
               if (closeEl) {
-                const overlay = closeEl.closest('[data-mb-id*="modal"], [data-mb-id*="overlay"]');
-                if (overlay) overlay.style.display = 'none';
+                const overlay = closeEl.closest('[data-mb-id*="modal"], [data-mb-id*="overlay"], [role="dialog"], .fixed');
+                if (overlay) {
+                  e.preventDefault();
+                  overlay.style.display = 'none';
+                  return;
+                }
+              }
+
+              // Navegação entre telas
+              const nav = mockTarget(e.target);
+              if (nav) {
+                e.preventDefault();
+                if (nav.kind === 'screen') {
+                  post({ type: 'MOCKBIRD_NAVIGATE', target: nav.target });
+                } else if (nav.target) {
+                  window.open(nav.target, '_blank');
+                }
+              }
+            });
+
+            document.addEventListener('submit', (e) => {
+              e.preventDefault();
+              const form = e.target;
+              if (!form || !form.getAttribute) return;
+              const go = (form.getAttribute('data-go') || form.getAttribute('action') || '').trim();
+              if (go && go !== '#' && go.indexOf('javascript:') !== 0) {
+                post({ type: 'MOCKBIRD_NAVIGATE', target: go });
               }
             });
           </script>

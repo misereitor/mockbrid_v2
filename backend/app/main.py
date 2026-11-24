@@ -103,7 +103,7 @@ if os.path.exists(FRONTEND_DIST):
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
-        if full_path.startswith("api/") or full_path.startswith("mcp/"):
+        if full_path == "mcp" or full_path.startswith("mcp/") or full_path == "api" or full_path.startswith("api/"):
             raise HTTPException(
                 status_code=404, detail="Endpoint de API não encontrado"
             )

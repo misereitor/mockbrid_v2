@@ -68,7 +68,11 @@ DESIGN_SYSTEM = (
     "Use SOMENTE classes utilitárias do Tailwind (o CDN já está ativo). É PROIBIDO <style>, "
     "<script>, <html>, <head> ou <body>. Não use Lorem ipsum, placeholders cinzas nem comentários de TODO. "
     "Imagens sempre com <img> de URLs reais do Unsplash (auto=format&fit=crop&w=1200&q=80). "
-    "Todo container, card, botão, link, imagem e título precisa de data-mb-id único e descritivo."
+    "Todo container, card, botão, link, imagem e título precisa de data-mb-id único e descritivo.\n"
+    "INTERATIVIDADE & NAVEGAÇÃO MOCKBIRD:\n"
+    "- Links e botões de fluxo entre telas devem ter data-go='<NomeOuSlug>' ou href='#/<nome>'.\n"
+    "- Modais devem ter id único e botões de abertura devem ter data-overlay='#<id>'. Botões de fechar devem ter data-close.\n"
+    "- Dados dinâmicos de backend devem ter data-mock='<chave>' (ex: data-mock='user.name') e listas com data-mock-list='<itens>'."
 )
 
 
@@ -481,6 +485,7 @@ class MockbirdAgentGraph:
             "detail": "Alterando exclusivamente o componente solicitado sem tocar no restante da tela...",
         }
 
+        proj_ctx = f"\n{state.project_context}\n" if state.project_context else ""
         base_prompt = (
             "Você é o Engenheiro Frontend do Mockbird v2 especializado em refatoração cirúrgica.\n"
             f"PEDIDO DO USUÁRIO: {state.prompt}\n\n"
@@ -488,6 +493,7 @@ class MockbirdAgentGraph:
             f"IDENTIFICADOR data-mb-id: {target_mb_id or 'alvo'}\n"
             f"SELETOR: {target_selector}\n"
             f"CÓDIGO ATUAL DO ELEMENTO:\n{target_snippet or 'Elemento no Canvas'}\n\n"
+            f"{proj_ctx}"
             "REGRAS ESTRITAS:\n"
             "0. Raciocínio curto (máx. 3 linhas) e código imediatamente dentro de ```html ... ```.\n"
             "1. Devolva UM único elemento HTML atualizado (o próprio elemento alvo), nada mais.\n"
@@ -789,12 +795,14 @@ class MockbirdAgentGraph:
                 + "\n"
             )
         position = "primeira" if index == 0 else ("última" if index == total - 1 else f"{index + 1}ª")
+        proj_ctx = f"\n{state.project_context}\n" if state.project_context else ""
         return (
             "Você é o Diretor de Arte e Desenvolvedor Frontend Sênior do Mockbird v2.\n"
             f"PEDIDO COMPLETO DO USUÁRIO: {state.prompt}\n"
             f"Você está gerando a {position} de {total} seções.\n"
             f"SEÇÃO ATUAL: {step.title} — {step.description}\n"
             f"{context}\n"
+            f"{proj_ctx}"
             f"{DESIGN_SYSTEM}\n\n"
             "FORMATO DA RESPOSTA:\n"
             "1. Uma frase curta de raciocínio e, em seguida, o bloco ```html ... ```.\n"

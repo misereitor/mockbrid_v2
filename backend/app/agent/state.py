@@ -41,6 +41,7 @@ class AgentState(BaseModel):
     model_name: str = "bonsai-27b"
     project_id: Optional[str] = None
     screen_id: Optional[str] = None
+    project_context: Optional[str] = None
 
     # Intenção do agente: "explanation" | "surgical_edit" | "layout_repair" | "full_page"
     intent: str = "surgical_edit"

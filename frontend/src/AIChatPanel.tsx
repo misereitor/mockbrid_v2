@@ -66,6 +66,7 @@ interface AIChatPanelProps {
   initialPrompt?: string;
   onClose?: () => void;
   projectId?: string;
+  screenId?: string;
   onCaptureScreenshot?: () => Promise<string>;
 }
 
@@ -76,7 +77,8 @@ export function AIChatPanel({
   selectedElement,
   onClearSelectedElement,
   initialPrompt, 
-  projectId = 'default'
+  projectId = 'default',
+  screenId
 }: AIChatPanelProps) {
   const storageKey = `mockbird_chat_sessions_${projectId}`;
   // Hidrata direto do localStorage no primeiro render: se um efeito fizesse
@@ -289,6 +291,8 @@ export function AIChatPanel({
           body: JSON.stringify({
             prompt: cleanPrompt,
             current_html: currentHtml,
+            project_id: projectId,
+            screen_id: screenId,
             target_element: selectedElement ? {
               mbId: selectedElement.mbId,
               tag: selectedElement.tag,
@@ -457,6 +461,8 @@ export function AIChatPanel({
         body: JSON.stringify({
           prompt: cleanPrompt,
           current_html: currentHtml,
+          project_id: projectId,
+          screen_id: screenId,
           target_element: selectedElement ? {
             mbId: selectedElement.mbId,
             tag: selectedElement.tag,

@@ -44,12 +44,19 @@ def _resolve_settings_url(row: EmailSettings) -> str:
 
 
 async def get_email_settings(db: AsyncSession) -> EmailSettings:
-    """Retorna a linha única de configuração, criando-a se ainda não existir."""
-    res = await db.execute(select(EmailSettings).order_by(EmailSettings.updated_at.asc()))
-    row = res.scalars().first()
+    """Retorna a linha única de configuração (singleton), criando-a se ainda não existir."""
+    row = await db.get(EmailSettings, "singleton")
     if row:
         return row
-    row = EmailSettings()
+    res = await db.execute(select(EmailSettings).order_by(EmailSettings.updated_at.desc()))
+    row = res.scalars().first()
+    if row:
+        if row.id != "singleton":
+            row.id = "singleton"
+            await db.commit()
+            await db.refresh(row)
+        return row
+    row = EmailSettings(id="singleton")
     db.add(row)
     await db.commit()
     await db.refresh(row)

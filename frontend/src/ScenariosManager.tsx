@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { Database, Plus, Check } from 'lucide-react';
+import { Database, Plus, Check, Trash2 } from 'lucide-react';
 
 export interface Scenario {
+  id?: string;
   name: string;
   data: Record<string, any>;
 }
@@ -41,25 +42,60 @@ export function ScenariosManager({
           if (Array.isArray(data) && data.length > 0) {
             setScenarios(data);
             setActiveName(data[0].name);
+            if (onApplyScenario) onApplyScenario(data[0].data);
           }
         })
         .catch(() => {});
     }
   }, [projectId]);
 
-  const handleCreate = (e: React.FormEvent) => {
+  const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
       const parsed = JSON.parse(newJson);
-      const newScen = { name: newName.trim(), data: parsed };
-      setScenarios(prev => [...prev, newScen]);
-      setActiveName(newScen.name);
-      if (onAddScenario) onAddScenario(newScen);
+      const cleanName = newName.trim();
+      let createdScenario: Scenario = { name: cleanName, data: parsed };
+
+      if (projectId) {
+        try {
+          const res = await fetch(`/api/projects/${projectId}/scenarios`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: cleanName, data: parsed }),
+          });
+          if (res.ok) {
+            createdScenario = await res.json();
+          }
+        } catch (err) {
+          console.error('Erro ao salvar cenário no servidor:', err);
+        }
+      }
+
+      setScenarios(prev => [...prev, createdScenario]);
+      setActiveName(createdScenario.name);
+      if (onAddScenario) onAddScenario(createdScenario);
       if (onApplyScenario) onApplyScenario(parsed);
       setShowModal(false);
       setNewName('');
     } catch {
       alert('JSON Inválido! Corrija a sintaxe antes de salvar.');
+    }
+  };
+
+  const handleDelete = async (sc: Scenario, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (scenarios.length <= 1) return;
+    if (sc.id && projectId) {
+      try {
+        await fetch(`/api/projects/${projectId}/scenarios/${sc.id}`, { method: 'DELETE' });
+      } catch (err) {
+        console.error('Erro ao excluir cenário:', err);
+      }
+    }
+    const filtered = scenarios.filter(s => (s.id ? s.id !== sc.id : s.name !== sc.name));
+    setScenarios(filtered);
+    if (activeName === sc.name && filtered.length > 0) {
+      handleSelect(filtered[0]);
     }
   };
 
@@ -95,9 +131,9 @@ export function ScenariosManager({
           const isActive = activeName === s.name;
           return (
             <div 
-              key={s.name}
+              key={s.id || s.name}
               onClick={() => handleSelect(s)}
-              className={`p-3 rounded-xl border cursor-pointer transition text-xs ${
+              className={`p-3 rounded-xl border cursor-pointer transition text-xs group ${
                 isActive 
                   ? 'bg-mockbird-blue/15 border-mockbird-cyan text-white shadow-sm ring-1 ring-mockbird-cyan/40' 
                   : 'bg-mockbird-card border-mockbird-border text-slate-300 hover:border-slate-500'
@@ -105,7 +141,19 @@ export function ScenariosManager({
             >
               <div className="flex items-center justify-between font-semibold">
                 <span>{s.name}</span>
-                {isActive && <Check className="h-3.5 w-3.5 text-mockbird-cyan" />}
+                <div className="flex items-center gap-1.5">
+                  {isActive && <Check className="h-3.5 w-3.5 text-mockbird-cyan" />}
+                  {scenarios.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={(e) => handleDelete(s, e)}
+                      className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-slate-500 hover:text-rose-400 transition"
+                      title="Excluir cenário"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  )}
+                </div>
               </div>
               <pre className="mt-1.5 text-[10px] font-mono text-slate-400 bg-mockbird-surface p-2 rounded-lg border border-mockbird-border/60 overflow-hidden line-clamp-3">
                 {JSON.stringify(s.data, null, 2)}

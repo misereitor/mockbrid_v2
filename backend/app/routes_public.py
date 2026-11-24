@@ -7,7 +7,7 @@ from sqlalchemy.future import select
 
 from app.auth import verify_password
 from app.database import get_db
-from app.models import Project, Screen, DesignTokens, Canvas, ShareLink, Comment
+from app.models import Project, Screen, DesignTokens, Canvas, ShareLink, Comment, DataScenario
 from app.timeutils import utcnow
 
 router = APIRouter(prefix="/api/public", tags=["public"])
@@ -104,6 +104,18 @@ async def get_public_presentation(
         for s in all_screens
     ]
 
+    # Busca todos os cenários de mock do projeto
+    sc_res = await db.execute(
+        select(DataScenario)
+        .join(Canvas, Canvas.id == DataScenario.canvas_id)
+        .where(Canvas.project_id == project.id)
+        .order_by(DataScenario.created_at.asc())
+    )
+    scenarios_data = [
+        {"id": sc.id, "name": sc.name, "data": sc.mock_data}
+        for sc in sc_res.scalars().all()
+    ]
+
     if link:
         link.view_count += 1
         await db.commit()
@@ -120,6 +132,7 @@ async def get_public_presentation(
             "height": screen.height,
         },
         "screens": screens_data,
+        "scenarios": scenarios_data,
         "tokens": {
             "light": tokens.light_tokens if tokens else {},
             "dark": tokens.dark_tokens if tokens else {},

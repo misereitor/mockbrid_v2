@@ -13,7 +13,7 @@ export interface CanvasDocTokens {
 }
 
 const CANVAS_RUNTIME = `
-      <script>
+      <script id="mockbird-runtime-script">
         let selectedEl = null;
         let selectedEls = [];
         let currentMode = 'edit';
@@ -28,10 +28,227 @@ const CANVAS_RUNTIME = `
         let dragInfo = null;
         let dropMarker = null;
         let dropTarget = null;
+        let devtoolsThrottle = 'off';
+        let devtoolsInstalled = false;
+        let devtoolsOriginals = null;
+        let devtoolsNodeCounter = 0;
+        let devtoolsHoverBox = null;
+        let devtoolsInspectActive = false;
 
         function post(payload) {
           window.parent.postMessage(payload, '*');
         }
+
+        function devtoolsText(value) {
+          try { return typeof value === 'string' ? value : JSON.stringify(value); } catch (e) { return String(value); }
+        }
+
+        function devtoolsDelay() {
+          return devtoolsThrottle === 'slow3g' ? 2000 : devtoolsThrottle === '4g' ? 150 : 0;
+        }
+
+        function devtoolsLog(level, args) {
+          post({ type: 'MOCKBIRD_DEVTOOLS_CONSOLE', level: level, text: Array.prototype.map.call(args, devtoolsText).join(' ') });
+        }
+
+        function devtoolsNetwork(method, url, status, started, ok, error) {
+          post({ type: 'MOCKBIRD_DEVTOOLS_NETWORK', method: method, url: String(url), status: status || 0, duration: Math.round(performance.now() - started), ok: ok, error: error || undefined });
+        }
+
+        function devtoolsInstall() {
+          if (devtoolsInstalled) return;
+          devtoolsInstalled = true;
+          devtoolsOriginals = { console: {}, fetch: window.fetch, xhr: window.XMLHttpRequest, onerror: window.onerror, rejection: window.onunhandledrejection };
+          ['log', 'warn', 'error', 'info'].forEach(function (level) {
+            devtoolsOriginals.console[level] = console[level];
+            console[level] = function () { devtoolsLog(level, arguments); devtoolsOriginals.console[level].apply(console, arguments); };
+          });
+          window.onerror = function (message, source, lineno, colno, error) { devtoolsLog('error', [message]); if (devtoolsOriginals.onerror) return devtoolsOriginals.onerror.apply(window, arguments); return false; };
+          window.onunhandledrejection = function (event) { devtoolsLog('error', ['Unhandled rejection', event.reason]); if (devtoolsOriginals.rejection) return devtoolsOriginals.rejection.call(window, event); return false; };
+          if (devtoolsOriginals.fetch) {
+            window.fetch = function (input, init) {
+              const method = (init && init.method) || (input && input.method) || 'GET';
+              const url = typeof input === 'string' ? input : input.url;
+              const started = performance.now();
+              const wait = devtoolsDelay();
+              return new Promise(function (resolve, reject) { setTimeout(function () {
+                devtoolsOriginals.fetch.call(window, input, init).then(function (response) { devtoolsNetwork(method, url, response.status, started, response.ok); resolve(response); }, function (error) { devtoolsNetwork(method, url, 0, started, false, devtoolsText(error)); reject(error); });
+              }, wait); });
+            };
+          }
+          const OriginalXHR = devtoolsOriginals.xhr;
+          if (OriginalXHR) {
+            window.XMLHttpRequest = function () {
+              const xhr = new OriginalXHR(); const started = performance.now(); let method = 'GET'; let url = '';
+              const open = xhr.open; xhr.open = function (m, u) { method = m; url = u; return open.apply(xhr, arguments); };
+              xhr.addEventListener('loadend', function () { devtoolsNetwork(method, url, xhr.status, started, xhr.status >= 200 && xhr.status < 400); });
+              return xhr;
+            };
+            window.XMLHttpRequest.prototype = OriginalXHR.prototype;
+          }
+        }
+
+        function devtoolsNodeId(node) {
+          if (!node || node.nodeType !== 1) return '';
+          if (!node.__mockbirdDevtoolsId) node.__mockbirdDevtoolsId = 'node-' + (++devtoolsNodeCounter);
+          return node.__mockbirdDevtoolsId;
+        }
+
+        function findNodeByDevtoolsId(id) {
+          if (!id) return null;
+          if (devtoolsNodeId(document.documentElement) === id) return document.documentElement;
+          if (devtoolsNodeId(document.head) === id) return document.head;
+          if (devtoolsNodeId(document.body) === id) return document.body;
+          let target = null;
+          document.querySelectorAll('*').forEach(function (node) {
+            if (devtoolsNodeId(node) === id) target = node;
+          });
+          return target;
+        }
+
+        function devtoolsExcluded(node) {
+          if (!node || node.nodeType !== 1) return true;
+          if (node.id === 'mb-overlay' || node.id === 'mb-drop-marker' || node.id === 'mb-devtools-hover-box') return true;
+          if (node.id === 'mockbird-presentation-styles' || node.id === 'mockbird-presentation-runtime' || node.id === 'mockbird-runtime-script') return true;
+          return false;
+        }
+
+        function devtoolsDom() {
+          const nodes = [];
+          const walk = function (node, parentId) {
+            if (!node || node.nodeType !== 1 || devtoolsExcluded(node)) return null;
+            
+            // Se for o mockbird-root interno, expõe seus filhos diretamente para não poluir a árvore
+            if (node.id === 'mockbird-root') {
+              const rootChildIds = [];
+              Array.prototype.forEach.call(node.children, function (child) {
+                const childId = walk(child, parentId);
+                if (childId) rootChildIds.push(childId);
+              });
+              return rootChildIds[0] || null;
+            }
+
+            const id = devtoolsNodeId(node);
+            const item = {
+              id: id,
+              tag: node.tagName.toLowerCase(),
+              attributes: {},
+              textSnippet: extractSnippet(node),
+              parentId: parentId,
+              childIds: [],
+              rect: (function () {
+                const r = node.getBoundingClientRect();
+                return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) };
+              })()
+            };
+            Array.prototype.forEach.call(node.attributes, function (a) {
+              if (a.name !== '__mockbirddevtoolsid') item.attributes[a.name] = a.value;
+            });
+            nodes.push(item);
+
+            Array.prototype.forEach.call(node.children, function (child) {
+              if (child.id === 'mockbird-root') {
+                Array.prototype.forEach.call(child.children, function (gc) {
+                  const gcId = walk(gc, id);
+                  if (gcId) item.childIds.push(gcId);
+                });
+              } else {
+                const childId = walk(child, id);
+                if (childId) item.childIds.push(childId);
+              }
+            });
+            return id;
+          };
+          walk(document.documentElement, null);
+          return nodes;
+        }
+
+        function ensureDevtoolsHoverBox() {
+          if (devtoolsHoverBox && devtoolsHoverBox.isConnected) return devtoolsHoverBox;
+          devtoolsHoverBox = document.createElement('div');
+          devtoolsHoverBox.id = 'mb-devtools-hover-box';
+          devtoolsHoverBox.style.cssText = 'position: fixed; pointer-events: none; z-index: 2147483647; display: none; transition: none; box-sizing: border-box;';
+          document.documentElement.appendChild(devtoolsHoverBox);
+          return devtoolsHoverBox;
+        }
+
+        function devtoolsHoverHighlight(id) {
+          const box = ensureDevtoolsHoverBox();
+          if (!id) {
+            box.style.display = 'none';
+            return;
+          }
+          const target = findNodeByDevtoolsId(id);
+          if (!target) {
+            box.style.display = 'none';
+            return;
+          }
+          const isDocRoot = target === document.documentElement || target === document.body;
+          const rect = target.getBoundingClientRect();
+          const width = isDocRoot ? window.innerWidth : rect.width;
+          const height = isDocRoot ? window.innerHeight : rect.height;
+          if (width === 0 && height === 0) {
+            box.style.display = 'none';
+            return;
+          }
+          const tag = target.tagName.toLowerCase();
+          const idStr = target.id ? '#' + target.id : '';
+          const classStr = Array.from(target.classList || [])
+            .filter(function (c) { return !c.startsWith('mb-'); })
+            .slice(0, 2)
+            .map(function (c) { return '.' + c; })
+            .join('');
+          const label = '<' + tag + idStr + classStr + '> ' + Math.round(width) + ' × ' + Math.round(height);
+
+          box.style.display = 'block';
+          box.style.left = (isDocRoot ? 0 : rect.left) + 'px';
+          box.style.top = (isDocRoot ? 0 : rect.top) + 'px';
+          box.style.width = width + 'px';
+          box.style.height = height + 'px';
+          box.style.backgroundColor = 'rgba(138, 180, 248, 0.28)';
+          box.style.border = '1px solid #8ab4f8';
+          box.style.boxShadow = '0 0 0 1px rgba(138, 180, 248, 0.45)';
+
+          const isNearTop = (isDocRoot ? 0 : rect.top) < 26;
+          const tipStyle = isNearTop
+            ? 'position: absolute; top: 100%; left: 0; margin-top: 3px;'
+            : 'position: absolute; bottom: 100%; left: 0; margin-bottom: 3px;';
+
+          box.innerHTML = '<div style=\"' + tipStyle + ' background: #202124; color: #8ab4f8; border: 1px solid #3c4043; border-radius: 4px; padding: 2px 6px; font-family: monospace; font-size: 11px; font-weight: bold; white-space: nowrap; box-shadow: 0 4px 10px rgba(0,0,0,0.5); pointer-events: none; z-index: 2147483647;\">' + label + '</div>';
+        }
+
+        function devtoolsStyles(id) {
+          const target = findNodeByDevtoolsId(id);
+          const inlineStyles = {};
+          const computedStyles = {};
+          let className = '';
+          if (target) {
+            className = target.getAttribute('class') || '';
+            // 1. Extrai propriedades de estilo inline
+            if (target.style) {
+              for (let i = 0; i < target.style.length; i++) {
+                const prop = target.style[i];
+                inlineStyles[prop] = target.style.getPropertyValue(prop);
+              }
+            }
+            // 2. Extrai propriedades computadas completas para a aba Computed
+            const computed = window.getComputedStyle(target);
+            if (computed) {
+              for (let i = 0; i < computed.length; i++) {
+                computedStyles[computed[i]] = computed.getPropertyValue(computed[i]);
+              }
+            }
+          }
+          post({
+            type: 'MOCKBIRD_DEVTOOLS_STYLES',
+            nodeId: id,
+            inlineStyles: inlineStyles,
+            computedStyles: computedStyles,
+            className: className,
+            styles: inlineStyles,
+          });
+        }
+        devtoolsInstall();
 
         function rootEl() {
           return document.getElementById('mockbird-root') || document.body;
@@ -47,17 +264,35 @@ const CANVAS_RUNTIME = `
         }
 
         function emitHtmlChanged() {
-          const root = rootEl();
-          const clone = root.cloneNode(true);
-          clone.querySelectorAll('#mb-overlay, #mb-drop-marker').forEach(function (n) { n.remove(); });
-          clone.querySelectorAll('.mb-hover, .mb-selected, .mb-editing').forEach(function (n) {
-            n.classList.remove('mb-hover', 'mb-selected', 'mb-editing');
-          });
-          clone.querySelectorAll('[contenteditable]').forEach(function (n) {
-            n.removeAttribute('contenteditable');
-            n.style.removeProperty('user-select');
-          });
-          post({ type: 'MOCKBIRD_HTML_CHANGED', html: clone.innerHTML });
+          const isSnippet = Boolean(document.getElementById('mockbird-root'));
+          if (isSnippet) {
+            const root = document.getElementById('mockbird-root');
+            if (!root) return;
+            const clone = root.cloneNode(true);
+            clone.querySelectorAll('#mb-overlay, #mb-drop-marker, #mb-devtools-hover-box').forEach(function (n) { n.remove(); });
+            clone.querySelectorAll('.mb-hover, .mb-selected, .mb-editing').forEach(function (n) {
+              n.classList.remove('mb-hover', 'mb-selected', 'mb-editing');
+            });
+            clone.querySelectorAll('[contenteditable]').forEach(function (n) {
+              n.removeAttribute('contenteditable');
+              n.style.removeProperty('user-select');
+            });
+            post({ type: 'MOCKBIRD_HTML_CHANGED', html: clone.innerHTML });
+          } else {
+            const clone = document.documentElement.cloneNode(true);
+            clone.querySelectorAll('#mb-overlay, #mb-drop-marker, #mb-devtools-hover-box, #mockbird-presentation-styles, #mockbird-presentation-runtime, #mockbird-runtime-script, #mockbird-runtime-style, #mockbird-dynamic-tokens, #mockbird-tailwind-config, #mockbird-tailwind-script').forEach(function (n) { n.remove(); });
+            clone.querySelectorAll('.mb-hover, .mb-selected, .mb-editing').forEach(function (n) {
+              n.classList.remove('mb-hover', 'mb-selected', 'mb-editing');
+            });
+            clone.querySelectorAll('[contenteditable]').forEach(function (n) {
+              n.removeAttribute('contenteditable');
+              n.style.removeProperty('user-select');
+            });
+            clone.querySelectorAll('*').forEach(function (n) {
+              n.removeAttribute('__mockbirddevtoolsid');
+            });
+            post({ type: 'MOCKBIRD_HTML_CHANGED', html: '<!DOCTYPE html>\n' + clone.outerHTML });
+          }
         }
 
         function extractSnippet(target) {
@@ -142,6 +377,22 @@ const CANVAS_RUNTIME = `
           if (hoverEl && hoverEl !== selectedEl) hoverEl.classList.add('mb-hover');
         }
 
+        function getBreadcrumbs(el) {
+          var trail = [];
+          var cur = el;
+          while (cur && cur !== document.body && cur !== document.documentElement) {
+            if (cur.nodeType === 1) {
+              trail.unshift({
+                mbId: cur.getAttribute('data-mb-id') || cur.id || cur.tagName.toLowerCase(),
+                tag: cur.tagName.toLowerCase(),
+                selector: buildSelector(cur)
+              });
+            }
+            cur = cur.parentElement;
+          }
+          return trail;
+        }
+
         function postSelection() {
           if (!selectedEl) {
             post({ type: 'MOCKBIRD_DESELECT' });
@@ -157,6 +408,13 @@ const CANVAS_RUNTIME = `
             snippet: extractSnippet(selectedEl),
             leaf: selectedEl.children.length === 0 && !isFormControl(selectedEl),
             count: selectedEls.length,
+            devtoolsNodeId: devtoolsNodeId(selectedEl),
+            breadcrumbs: getBreadcrumbs(selectedEl),
+            dataGo: selectedEl.getAttribute('data-go') || selectedEl.getAttribute('href') || '',
+            dataToast: selectedEl.getAttribute('data-toast') || '',
+            dataOverlay: selectedEl.getAttribute('data-overlay') || '',
+            dataClose: selectedEl.hasAttribute('data-close'),
+            dataMock: selectedEl.getAttribute('data-mock') || '',
             styles: {
               color: computed.color,
               backgroundColor: computed.backgroundColor,
@@ -528,6 +786,13 @@ const CANVAS_RUNTIME = `
         }, true);
 
         document.addEventListener('pointerover', function (e) {
+          if (devtoolsInspectActive) {
+            const node = e.target;
+            if (node && node.nodeType === 1 && !devtoolsExcluded(node)) {
+              devtoolsHoverHighlight(devtoolsNodeId(node));
+            }
+            return;
+          }
           if (currentMode !== 'edit' || inlineEditing) return;
           const node = e.target;
           if (!node || node.nodeType !== 1 || node === document.body || node === document.documentElement || isOverlayTarget(node)) return;
@@ -544,16 +809,15 @@ const CANVAS_RUNTIME = `
           const goEl = node.closest('[data-go]');
           if (goEl) {
             const value = (goEl.getAttribute('data-go') || '').trim();
-            if (value) return { kind: 'screen', target: value };
+            if (value && value !== '#') return { kind: 'screen', target: value };
           }
           const link = node.closest('a[href]');
           if (!link || link.hasAttribute('download')) return null;
           const href = (link.getAttribute('href') || '').trim();
-          if (!href || href.charAt(0) === '#') return null;
+          if (!href || href === '#' || href.indexOf('javascript:') === 0) return null;
           if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.indexOf('//') === 0) {
             return { kind: 'external', target: href };
           }
-          if (!/\.html?$/i.test(href.split(/[?#]/)[0])) return null;
           return { kind: 'screen', target: href };
         }
 
@@ -561,6 +825,17 @@ const CANVAS_RUNTIME = `
         // acumula elementos (em qualquer modo). No modo edição, clique seleciona.
         document.addEventListener('click', function (e) {
           post({ type: 'MOCKBIRD_CLOSE_CONTEXT_MENU' });
+          if (devtoolsInspectActive) {
+            e.preventDefault();
+            e.stopPropagation();
+            devtoolsInspectActive = false;
+            document.body.style.cursor = '';
+            devtoolsHoverHighlight(null);
+            const picked = e.target.closest('[data-mb-id]') || e.target;
+            selectElement(picked);
+            post({ type: 'MOCKBIRD_DEVTOOLS_INSPECT_PICKED', devtoolsNodeId: devtoolsNodeId(picked) });
+            return;
+          }
           if (inlineEditing || suppressClick || isOverlayTarget(e.target)) return;
 
           const target = e.target.closest('[data-mb-id]') || e.target;
@@ -579,6 +854,42 @@ const CANVAS_RUNTIME = `
             return;
           }
 
+          // Ações interativas: data-toast
+          const toastEl = e.target.closest('[data-toast]');
+          if (toastEl) {
+            const msg = toastEl.getAttribute('data-toast');
+            if (msg) post({ type: 'MOCKBIRD_TOAST', message: msg });
+          }
+
+          // Ações interativas: data-overlay (abrir modal)
+          const overlayTrigger = e.target.closest('[data-overlay]');
+          if (overlayTrigger) {
+            const overlayAttr = overlayTrigger.getAttribute('data-overlay');
+            if (overlayAttr) {
+              const cleanId = overlayAttr.replace(/^#/, '');
+              const modalEl = document.getElementById(cleanId) ||
+                document.querySelector('[data-mb-id="' + cleanId + '"]') ||
+                document.querySelector('[data-mb-id*="' + cleanId + '"]');
+              if (modalEl) {
+                e.preventDefault();
+                modalEl.style.display = 'flex';
+                modalEl.classList.remove('hidden');
+                return;
+              }
+            }
+          }
+
+          // Ações interativas: data-close (fechar modal)
+          const closeTrigger = e.target.closest('[data-close]');
+          if (closeTrigger) {
+            const modalEl = closeTrigger.closest('[data-mb-id*="modal"], [data-mb-id*="overlay"], [role="dialog"], .fixed');
+            if (modalEl) {
+              e.preventDefault();
+              modalEl.style.display = 'none';
+              return;
+            }
+          }
+
           const nav = mockTarget(e.target);
           if (nav) {
             e.preventDefault();
@@ -588,14 +899,14 @@ const CANVAS_RUNTIME = `
           if (!isCanvasNode) selectElement(null);
         }, true);
 
-        // Formulário no mock não navega nem envia nada: só troca de tela via data-go/action.
+        // Formulário no mock não envia nada: troca de tela via data-go ou action
         document.addEventListener('submit', function (e) {
           e.preventDefault();
           e.stopPropagation();
           const form = e.target;
           if (!form || !form.getAttribute) return;
           const go = (form.getAttribute('data-go') || form.getAttribute('action') || '').trim();
-          if (/\.html?$/i.test(go.split(/[?#]/)[0])) {
+          if (go && go !== '#' && go.indexOf('javascript:') !== 0) {
             post({ type: 'MOCKBIRD_NAVIGATE', target: go, external: false });
           }
         }, true);
@@ -689,9 +1000,38 @@ const CANVAS_RUNTIME = `
           }
         });
 
-        window.addEventListener('wheel', function () {
+        window.addEventListener('wheel', function (e) {
           post({ type: 'MOCKBIRD_CLOSE_CONTEXT_MENU' });
-        }, { passive: true });
+          // Repassa zoom e scroll/pan para o canvas pai quando Ctrl pressionado ou fora do mock
+          if (e.ctrlKey || e.metaKey || currentMode !== 'interactive') {
+            post({
+              type: 'MOCKBIRD_IFRAME_WHEEL',
+              deltaX: e.deltaX,
+              deltaY: e.deltaY,
+              ctrlKey: e.ctrlKey,
+              metaKey: e.metaKey,
+              clientX: e.clientX,
+              clientY: e.clientY
+            });
+            if (e.ctrlKey || e.metaKey) {
+              e.preventDefault();
+            }
+          }
+        }, { passive: false });
+
+        // Repassa tecla Espaço para ativar modo Mão (Pan)
+        document.addEventListener('keydown', function (e) {
+          if (e.code === 'Space' && !e.repeat) {
+            var active = document.activeElement;
+            if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) return;
+            post({ type: 'MOCKBIRD_SPACE_KEY', pressed: true });
+          }
+        });
+        document.addEventListener('keyup', function (e) {
+          if (e.code === 'Space') {
+            post({ type: 'MOCKBIRD_SPACE_KEY', pressed: false });
+          }
+        });
 
         document.addEventListener('scroll', positionOverlay, true);
         window.addEventListener('resize', positionOverlay);
@@ -752,12 +1092,263 @@ const CANVAS_RUNTIME = `
           scheduleEmit();
         });
 
+        function getNestedValue(obj, path) {
+          if (!obj || !path) return undefined;
+          var parts = path.split('.');
+          var cur = obj;
+          for (var i = 0; i < parts.length; i++) {
+            if (cur == null) return undefined;
+            cur = cur[parts[i]];
+          }
+          return cur;
+        }
+
+        function evaluateCondition(obj, cond) {
+          if (!cond) return true;
+          if (cond.indexOf('!=') >= 0) {
+            var p = cond.split('!=');
+            return String(getNestedValue(obj, p[0].trim())) !== p[1].trim();
+          }
+          if (cond.indexOf('=') >= 0) {
+            var p = cond.split('=');
+            return String(getNestedValue(obj, p[0].trim())) === p[1].trim();
+          }
+          var val = getNestedValue(obj, cond.trim());
+          return !!val;
+        }
+
+        function applyMockData(data) {
+          if (!data || typeof data !== 'object') return;
+          window.__MOCK_DATA__ = data;
+
+          // 1. data-mock="caminho"
+          document.querySelectorAll('[data-mock]').forEach(function(el) {
+            var path = el.getAttribute('data-mock');
+            if (!path) return;
+            var val = getNestedValue(data, path);
+            if (val !== undefined && val !== null) {
+              if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                el.value = String(val);
+              } else {
+                el.innerText = String(val);
+              }
+            }
+          });
+
+          // 2. data-mock-show="cond"
+          document.querySelectorAll('[data-mock-show]').forEach(function(el) {
+            var cond = el.getAttribute('data-mock-show');
+            var ok = evaluateCondition(data, cond);
+            el.style.display = ok ? '' : 'none';
+          });
+
+          // 3. data-mock-hide="cond"
+          document.querySelectorAll('[data-mock-hide]').forEach(function(el) {
+            var cond = el.getAttribute('data-mock-hide');
+            var ok = evaluateCondition(data, cond);
+            el.style.display = ok ? 'none' : '';
+          });
+
+          // 4. data-mock-list="itens"
+          document.querySelectorAll('[data-mock-list]').forEach(function(container) {
+            var listKey = container.getAttribute('data-mock-list');
+            var items = getNestedValue(data, listKey);
+            if (!Array.isArray(items)) return;
+
+            if (!container._mockTemplate) {
+              var firstChild = container.firstElementChild;
+              if (!firstChild) return;
+              container._mockTemplate = firstChild.cloneNode(true);
+            }
+
+            container.innerHTML = '';
+            if (items.length === 0) return;
+
+            items.forEach(function(item) {
+              var clone = container._mockTemplate.cloneNode(true);
+              if (typeof item === 'object' && item !== null) {
+                clone.querySelectorAll('[data-mock-item]').forEach(function(itemEl) {
+                  var prop = itemEl.getAttribute('data-mock-item');
+                  var val = item[prop];
+                  if (val !== undefined && val !== null) itemEl.innerText = String(val);
+                });
+              } else {
+                clone.innerText = String(item);
+              }
+              container.appendChild(clone);
+            });
+          });
+        }
+
         // Mensagens do editor
         window.addEventListener('message', function (ev) {
           if (!ev.data) return;
 
+          if (ev.data.type === 'MOCKBIRD_SET_THEME') {
+            var theme = ev.data.theme || 'dark';
+            document.documentElement.setAttribute('data-theme', theme);
+            document.documentElement.style.colorScheme = theme;
+            if (theme === 'dark') {
+              document.documentElement.classList.add('dark');
+              if (document.body) document.body.classList.add('dark');
+            } else {
+              document.documentElement.classList.remove('dark');
+              if (document.body) document.body.classList.remove('dark');
+            }
+            if (ev.data.tokens) {
+              var themeTokens = ev.data.tokens;
+              var dynamicStyle = document.getElementById('mockbird-dynamic-tokens');
+              if (!dynamicStyle) {
+                dynamicStyle = document.createElement('style');
+                dynamicStyle.id = 'mockbird-dynamic-tokens';
+                document.head.appendChild(dynamicStyle);
+              }
+              var cssRules = Object.keys(themeTokens).map(function (k) {
+                return '--' + k + ': ' + themeTokens[k] + ';';
+              }).join('\n');
+              dynamicStyle.textContent = ':root, [data-theme="' + theme + '"], html, body { ' + cssRules + ' }';
+            }
+            positionOverlay();
+            return;
+          }
+
+          if (ev.data.type === 'MOCKBIRD_DEVTOOLS_EVAL') {
+            try {
+              var evalRes = (0, eval)(ev.data.code);
+              post({ type: 'MOCKBIRD_DEVTOOLS_CONSOLE', level: 'info', text: devtoolsText(evalRes) });
+            } catch (err) {
+              post({ type: 'MOCKBIRD_DEVTOOLS_CONSOLE', level: 'error', text: devtoolsText(err) });
+            }
+            return;
+          }
+
+          if (ev.data.type === 'MOCKBIRD_APPLY_SCENARIO') {
+            applyMockData(ev.data.data);
+            positionOverlay();
+            return;
+          }
+
+          if (ev.data.type === 'MOCKBIRD_SELECT_BY_MB_ID') {
+            var targetMbId = ev.data.mbId;
+            var elToSelect = document.querySelector('[data-mb-id="' + targetMbId + '"]') || document.getElementById(targetMbId);
+            if (elToSelect) selectElement(elToSelect);
+            return;
+          }
+
+          if (ev.data.type === 'MOCKBIRD_TOGGLE_VISIBILITY') {
+            var targetToggleId = ev.data.mbId;
+            var elToToggle = document.querySelector('[data-mb-id="' + targetToggleId + '"]') || document.getElementById(targetToggleId);
+            if (elToToggle) {
+              elToToggle.style.display = elToToggle.style.display === 'none' ? '' : 'none';
+              emitHtmlChanged();
+              positionOverlay();
+            }
+            return;
+          }
+
+          if (ev.data.type === 'MOCKBIRD_UPDATE_ATTRIBUTES') {
+            var attrs = ev.data.attributes || {};
+            if (selectedEl) {
+              Object.keys(attrs).forEach(function (k) {
+                var val = attrs[k];
+                if (val !== null && val !== undefined && val !== false) {
+                  selectedEl.setAttribute(k, String(val));
+                } else {
+                  selectedEl.removeAttribute(k);
+                }
+              });
+              emitHtmlChanged();
+              positionOverlay();
+              postSelection();
+            }
+            return;
+          }
+
           if (ev.data.type === 'MOCKBIRD_SET_MODE') {
             applyMode(ev.data.mode);
+            return;
+          }
+
+          if (ev.data.type === 'MOCKBIRD_DEVTOOLS_REQUEST_DOM') { post({ type: 'MOCKBIRD_DEVTOOLS_DOM_TREE', nodes: devtoolsDom() }); return; }
+          if (ev.data.type === 'MOCKBIRD_DEVTOOLS_REQUEST_STYLES') { devtoolsStyles(ev.data.nodeId); return; }
+          if (ev.data.type === 'MOCKBIRD_DEVTOOLS_UPDATE_STYLE') {
+            var target = findNodeByDevtoolsId(ev.data.nodeId);
+            if (target) {
+              if (ev.data.value === null || ev.data.value === undefined || ev.data.value === '') {
+                target.style.removeProperty(ev.data.property);
+              } else {
+                target.style.setProperty(ev.data.property, String(ev.data.value));
+              }
+              positionOverlay();
+              emitHtmlChanged();
+              devtoolsStyles(ev.data.nodeId);
+            }
+            return;
+          }
+          if (ev.data.type === 'MOCKBIRD_DEVTOOLS_UPDATE_CLASSES') {
+            var target = findNodeByDevtoolsId(ev.data.nodeId);
+            if (target) {
+              if (ev.data.className) {
+                target.setAttribute('class', ev.data.className);
+              } else {
+                target.removeAttribute('class');
+              }
+              positionOverlay();
+              emitHtmlChanged();
+              devtoolsStyles(ev.data.nodeId);
+            }
+            return;
+          }
+          if (ev.data.type === 'MOCKBIRD_DEVTOOLS_UPDATE_ATTRIBUTE') {
+            var target = findNodeByDevtoolsId(ev.data.nodeId);
+            if (target) {
+              if (ev.data.value === null || ev.data.value === undefined) {
+                target.removeAttribute(ev.data.name);
+              } else {
+                target.setAttribute(ev.data.name, String(ev.data.value));
+              }
+              positionOverlay();
+              emitHtmlChanged();
+              post({ type: 'MOCKBIRD_DEVTOOLS_DOM_TREE', nodes: devtoolsDom() });
+            }
+            return;
+          }
+          if (ev.data.type === 'MOCKBIRD_DEVTOOLS_UPDATE_TEXT') {
+            var target = findNodeByDevtoolsId(ev.data.nodeId);
+            if (target) {
+              target.innerText = String(ev.data.text || '');
+              positionOverlay();
+              emitHtmlChanged();
+              post({ type: 'MOCKBIRD_DEVTOOLS_DOM_TREE', nodes: devtoolsDom() });
+            }
+            return;
+          }
+          if (ev.data.type === 'MOCKBIRD_DEVTOOLS_SELECT_NODE') {
+            var target = findNodeByDevtoolsId(ev.data.nodeId);
+            if (target) {
+              if (target !== document.body && target !== document.documentElement && target !== document.head) {
+                selectElement(target);
+              }
+              try { target.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' }); } catch (e) {}
+              devtoolsHoverHighlight(ev.data.nodeId);
+              setTimeout(function () { devtoolsHoverHighlight(null); }, 1200);
+              devtoolsStyles(ev.data.nodeId);
+            }
+            return;
+          }
+          if (ev.data.type === 'MOCKBIRD_DEVTOOLS_HOVER_NODE') {
+            devtoolsHoverHighlight(ev.data.nodeId);
+            return;
+          }
+          if (ev.data.type === 'MOCKBIRD_DEVTOOLS_INSPECT_MODE') {
+            devtoolsInspectActive = Boolean(ev.data.active);
+            document.body.style.cursor = devtoolsInspectActive ? 'crosshair' : '';
+            if (!devtoolsInspectActive) devtoolsHoverHighlight(null);
+            return;
+          }
+          if (ev.data.type === 'MOCKBIRD_DEVTOOLS_SET_THROTTLE') { devtoolsThrottle = ev.data.profile === 'slow3g' || ev.data.profile === '4g' ? ev.data.profile : 'off'; return; }
+          if (ev.data.type === 'MOCKBIRD_DEVTOOLS_CLEAR') {
+            if (devtoolsInstalled && devtoolsOriginals) { ['log', 'warn', 'error', 'info'].forEach(function (level) { console[level] = devtoolsOriginals.console[level]; }); window.fetch = devtoolsOriginals.fetch; window.XMLHttpRequest = devtoolsOriginals.xhr; window.onerror = devtoolsOriginals.onerror; window.onunhandledrejection = devtoolsOriginals.rejection; devtoolsInstalled = false; }
             return;
           }
 
@@ -773,6 +1364,28 @@ const CANVAS_RUNTIME = `
 
           if (ev.data.type === 'MOCKBIRD_DESELECT_ALL') {
             setSelection([]);
+            return;
+          }
+
+          if (ev.data.type === 'MOCKBIRD_PATCH_ELEMENT') {
+            const newSnippet = (ev.data.html || '').trim();
+            const targetMbId = ev.data.mbId;
+            const targetSel = ev.data.selector;
+            let target = selectedEl;
+            if (!target && targetMbId) {
+              target = document.querySelector('[data-mb-id="' + targetMbId + '"]') || document.getElementById(targetMbId);
+            }
+            if (!target && targetSel) {
+              try { target = document.querySelector(targetSel); } catch (err) {}
+            }
+            if (target && newSnippet) {
+              const temp = document.createElement('div');
+              temp.innerHTML = newSnippet;
+              const newEl = temp.firstElementChild || temp;
+              target.replaceWith(newEl);
+              emitHtmlChanged();
+              selectElement(newEl);
+            }
             return;
           }
 
@@ -823,25 +1436,6 @@ const CANVAS_RUNTIME = `
             selectedEl = null;
             emitHtmlChanged();
             setSelection([]);
-          } else if (ev.data.type === 'MOCKBIRD_PATCH_ELEMENT') {
-            const newSnippet = (ev.data.html || '').trim();
-            const targetMbId = ev.data.mbId;
-            const targetSel = ev.data.selector;
-            let target = selectedEl;
-            if (!target && targetMbId) {
-              target = document.querySelector('[data-mb-id="' + targetMbId + '"]') || document.getElementById(targetMbId);
-            }
-            if (!target && targetSel) {
-              try { target = document.querySelector(targetSel); } catch (err) {}
-            }
-            if (target && newSnippet) {
-              const temp = document.createElement('div');
-              temp.innerHTML = newSnippet;
-              const newEl = temp.firstElementChild || temp;
-              target.replaceWith(newEl);
-              emitHtmlChanged();
-              selectElement(newEl);
-            }
           }
         });
 
@@ -857,8 +1451,10 @@ const CANVAS_RUNTIME = `
           boot();
         }
       </script>
-      <style>
-        :root { \${cssVars} }
+      <style id="mockbird-runtime-style">
+        :root {
+          \${cssVars}
+        }
         body:not(.mb-interactive) .mb-hover {
           outline: 1px dashed #5e6ad2 !important;
           outline-offset: 1px;
@@ -925,11 +1521,56 @@ const CANVAS_RUNTIME = `
 `;
 
 /**
+ * Aplica o tema (data-theme, class="dark" e color-scheme) na tag <html>.
+ */
+export function applyThemeToHtml(html: string, theme: 'light' | 'dark' = 'dark'): string {
+  if (!html) return html;
+  const isDark = theme === 'dark';
+  const htmlTagRegex = /<html\b([^>]*)>/i;
+  const match = html.match(htmlTagRegex);
+
+  if (!match) return html;
+
+  let attrs = match[1] || '';
+
+  // 1. data-theme
+  if (/data-theme\s*=\s*["'][^"']*["']/i.test(attrs)) {
+    attrs = attrs.replace(/data-theme\s*=\s*["'][^"']*["']/i, `data-theme="${theme}"`);
+  } else {
+    attrs = `${attrs} data-theme="${theme}"`;
+  }
+
+  // 2. class="...": adiciona ou remove 'dark'
+  if (/class\s*=\s*["']([^"']*)["']/i.test(attrs)) {
+    attrs = attrs.replace(/class\s*=\s*["']([^"']*)["']/i, (_all, classes) => {
+      const classList = classes.split(/\s+/).filter(Boolean).filter((c: string) => c !== 'dark');
+      if (isDark) classList.push('dark');
+      return `class="${classList.join(' ')}"`;
+    });
+  } else if (isDark) {
+    attrs = `${attrs} class="dark"`;
+  }
+
+  // 3. style="...": atualiza ou adiciona color-scheme
+  if (/style\s*=\s*["']([^"']*)["']/i.test(attrs)) {
+    attrs = attrs.replace(/style\s*=\s*["']([^"']*)["']/i, (_all, styles) => {
+      const cleaned = styles.replace(/color-scheme\s*:\s*(?:light|dark)\s*;?/gi, '').trim();
+      return `style="color-scheme: ${theme}; ${cleaned}"`;
+    });
+  } else {
+    attrs = `${attrs} style="color-scheme: ${theme};"`;
+  }
+
+  return html.replace(htmlTagRegex, `<html${attrs}>`);
+}
+
+/**
  * Monta o documento do canvas com o runtime de seleção/edição embutido.
  */
 export function buildCanvasDoc(
   html: string,
-  tokens: CanvasDocTokens
+  tokens: CanvasDocTokens,
+  theme: 'light' | 'dark' = 'dark'
 ): string {
   const cssVars = Object.entries(tokens)
     .map(([k, v]) => `--${k}: ${v};`)
@@ -937,8 +1578,8 @@ export function buildCanvasDoc(
 
   const runtime = CANVAS_RUNTIME.replace('${cssVars}', cssVars);
 
-  const raw = (html || '').trim();
-  const tailwindScript = '<script src="https://cdn.tailwindcss.com"></script>';
+  const raw = applyThemeToHtml((html || '').trim(), theme);
+  const tailwindScript = '<script id="mockbird-tailwind-config">window.tailwind = { config: { darkMode: "class" } };</script><script id="mockbird-tailwind-script" src="https://cdn.tailwindcss.com"></script>';
 
   if (raw.toLowerCase().includes('<!doctype') || raw.toLowerCase().includes('<html')) {
     if (raw.includes('</head>')) {
@@ -949,21 +1590,22 @@ export function buildCanvasDoc(
     return `${raw}\n${tailwindScript}${runtime}`;
   }
 
+  const isDark = theme === 'dark';
   return `
       <!doctype html>
-      <html lang="pt-BR">
+      <html lang="pt-BR" data-theme="${theme}" class="${isDark ? 'dark' : ''}" style="color-scheme: ${theme};">
         <head>
           <meta charset="utf-8" />
           <meta name="viewport" content="width=device-width, initial-scale=1" />
-          <script src="https://cdn.tailwindcss.com"></script>
+          ${tailwindScript}
           ${runtime}
           <style>
             body {
               margin: 0;
               padding: 0;
               min-height: 100vh;
-              background-color: var(--color-bg, #09090b);
-              color: var(--color-text, #f4f4f5);
+              background-color: var(--color-bg, ${isDark ? '#09090b' : '#ffffff'});
+              color: var(--color-text, ${isDark ? '#f4f4f5' : '#0f172a'});
               font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
               user-select: none;
             }

@@ -39,16 +39,32 @@ export function TokensPanel({
   const [savedSuccess, setSavedSuccess] = useState(false);
 
   useEffect(() => {
+    if (currentTheme && currentTheme !== activeTheme) {
+      setActiveTheme(currentTheme);
+    }
+  }, [currentTheme]);
+
+  useEffect(() => {
+    if (lightTokens) setCurrentLight(lightTokens);
+  }, [lightTokens]);
+
+  useEffect(() => {
+    if (darkTokens) setCurrentDark(darkTokens);
+  }, [darkTokens]);
+
+  useEffect(() => {
     if (projectId && !lightTokens && !darkTokens) {
       fetch(`/api/tokens/${projectId}`)
         .then(r => r.json())
         .then(d => {
-          if (d.light_theme) setCurrentLight(d.light_theme);
-          if (d.dark_theme) setCurrentDark(d.dark_theme);
+          const light = d.light_tokens || d.light_theme;
+          const dark = d.dark_tokens || d.dark_theme;
+          if (light && Object.keys(light).length > 0) setCurrentLight(light);
+          if (dark && Object.keys(dark).length > 0) setCurrentDark(dark);
         })
         .catch(console.error);
     }
-  }, [projectId]);
+  }, [projectId, lightTokens, darkTokens]);
 
   const activeTokens = activeTheme === 'light' ? currentLight : currentDark;
 
@@ -83,6 +99,9 @@ export function TokensPanel({
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
+            light_tokens: currentLight,
+            dark_tokens: currentDark,
+            shared_tokens: {},
             light_theme: currentLight,
             dark_theme: currentDark
           })

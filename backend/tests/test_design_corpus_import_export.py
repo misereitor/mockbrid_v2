@@ -7,13 +7,14 @@ reimportação do ZIP exportado.
 
 import io
 import json
+import os
 import secrets
 import zipfile
 
 import httpx
 import pytest
 
-BASE_URL = "http://127.0.0.1:8082"
+BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8082")
 
 
 def _build_corpus_zip() -> bytes:

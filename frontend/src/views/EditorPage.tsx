@@ -14,6 +14,7 @@ import {
   Check, 
   ChevronRight,
   Layers,
+  LayoutGrid,
   MessageSquare,
   Copy,
   PanelRightClose,
@@ -24,16 +25,22 @@ import {
   WifiOff,
   Download,
   Undo2,
-  Redo2
+  Redo2,
+  Sun,
+  Moon,
+  FolderPlus
 } from 'lucide-react';
 import { CanvasEditor, CanvasEditorHandle, SelectedElementInfo } from '../CanvasEditor';
 import { TokensPanel } from '../TokensPanel';
 import { AIChatPanel } from '../AIChatPanel';
 import { ScenariosManager } from '../ScenariosManager';
 import { ComponentsCatalogPanel } from '../components/ComponentsCatalogPanel';
+import { LayersPanel } from '../components/LayersPanel';
 import { CommentsPanel } from '../components/CommentsPanel';
+import { DevToolsDock } from '../components/DevToolsDock';
 import { InspectorPanel } from '../components/InspectorPanel';
 import { HistoryPanel } from '../components/HistoryPanel';
+import { MediaLibraryPanel } from '../components/MediaLibraryPanel';
 import { ensurePublished } from '../lib/presentation';
 import { useProjectSocket } from '../lib/realtime';
 import { imageHtml, uploadProjectAsset } from '../lib/assets';
@@ -69,6 +76,7 @@ interface EditorPageProps {
   project: ProjectData;
   onOpenPresentation: (slug: string) => void;
   onNotify?: (msg: string) => void;
+  onNewProject?: () => void;
 }
 
 const VIEWPORT_SIZES = {
@@ -80,7 +88,9 @@ const VIEWPORT_SIZES = {
 const PANEL_TABS: { id: ActiveEditorTab; label: string; icon: React.ElementType }[] = [
   { id: 'ai', label: 'IA', icon: Sparkles },
   { id: 'visual', label: 'Inspector', icon: Sliders },
-  { id: 'blocks', label: 'Blocos', icon: Layers },
+  { id: 'media', label: 'Mídia', icon: ImageIcon },
+  { id: 'layers', label: 'Camadas', icon: Layers },
+  { id: 'blocks', label: 'Blocos', icon: LayoutGrid },
   { id: 'code', label: 'Código', icon: Code2 },
   { id: 'tokens', label: 'Tokens', icon: Palette },
   { id: 'comments', label: 'Comentários', icon: MessageSquare },
@@ -88,18 +98,42 @@ const PANEL_TABS: { id: ActiveEditorTab; label: string; icon: React.ElementType 
   { id: 'scenarios', label: 'Cenários', icon: Database },
 ];
 
-type ActiveEditorTab = 'ai' | 'visual' | 'blocks' | 'code' | 'tokens' | 'comments' | 'history' | 'scenarios';
+type ActiveEditorTab = 'ai' | 'visual' | 'media' | 'layers' | 'blocks' | 'code' | 'tokens' | 'comments' | 'history' | 'scenarios';
 
 export const EditorPage: React.FC<EditorPageProps> = ({
   project,
   onOpenPresentation,
   onNotify,
+  onNewProject,
 }) => {
   const [screens, setScreens] = useState<ScreenData[]>(project.screens || []);
   const [currentScreenIndex, setCurrentScreenIndex] = useState(0);
   const [activeTab, setActiveTab] = useState<ActiveEditorTab | null>('ai'); // Aberto na IA por padrão
   const [viewport, setViewport] = useState<'desktop' | 'tablet' | 'mobile'>('desktop');
   const [tokenTheme, setTokenTheme] = useState<'light' | 'dark'>('dark');
+  const [allTokens, setAllTokens] = useState<{
+    light: Record<string, string>;
+    dark: Record<string, string>;
+    shared: Record<string, string>;
+  }>({
+    light: {
+      'color-primary': '#2563eb',
+      'color-bg': '#ffffff',
+      'color-surface': '#f8fafc',
+      'color-text': '#0f172a',
+      'color-border': '#e2e8f0',
+    },
+    dark: {
+      'color-primary': '#2563eb',
+      'color-bg': '#0b1120',
+      'color-surface': '#1e293b',
+      'color-text': '#f8fafc',
+      'color-border': '#334155',
+    },
+    shared: {
+      'font-body': '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif'
+    }
+  });
   const [tokens, setTokens] = useState<Record<string, string>>({
     'color-primary': '#2563eb',
     'color-bg': '#0b1120',
@@ -118,9 +152,10 @@ export const EditorPage: React.FC<EditorPageProps> = ({
   const [copiedCode, setCopiedCode] = useState(false);
   const [selectedElement, setSelectedElement] = useState<SelectedElementInfo | null>(null);
   const [commentsRefresh, setCommentsRefresh] = useState(0);
-  const [remoteRevision, setRemoteRevision] = useState(0);
   const [uploading, setUploading] = useState(false);
   const [exportingBundle, setExportingBundle] = useState<string | null>(null);
+  const [showDevTools, setShowDevTools] = useState(false);
+  const [devToolsDockPosition, setDevToolsDockPosition] = useState<'right' | 'bottom'>('right');
   const canvasEditorRef = useRef<CanvasEditorHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dirtyRef = useRef(false);
@@ -163,7 +198,6 @@ export const EditorPage: React.FC<EditorPageProps> = ({
             : s
         )
       );
-      if (isActive) setRemoteRevision(v => v + 1);
     }
     if (message.type === 'comment_created' && message.comment?.screen_id === activeScreenIdRef.current) {
       setCommentsRefresh(v => v + 1);
@@ -183,8 +217,18 @@ export const EditorPage: React.FC<EditorPageProps> = ({
     fetch(`/api/tokens/${project.id}`)
       .then(r => r.json())
       .then(tokData => {
-        if (tokData && tokData.dark_theme) {
-          setTokens(tokData.dark_theme);
+        if (tokData) {
+          const light = tokData.light_tokens || tokData.light_theme || {};
+          const dark = tokData.dark_tokens || tokData.dark_theme || {};
+          const shared = tokData.shared_tokens || {};
+          setAllTokens(prev => {
+            const nextLight = Object.keys(light).length > 0 ? light : prev.light;
+            const nextDark = Object.keys(dark).length > 0 ? dark : prev.dark;
+            const nextShared = Object.keys(shared).length > 0 ? shared : prev.shared;
+            const active = tokenTheme === 'light' ? nextLight : nextDark;
+            setTokens({ ...nextShared, ...active });
+            return { light: nextLight, dark: nextDark, shared: nextShared };
+          });
         }
       })
       .catch(console.error);
@@ -196,6 +240,11 @@ export const EditorPage: React.FC<EditorPageProps> = ({
     const onKeyDown = (e: KeyboardEvent) => {
       const active = document.activeElement as HTMLElement | null;
       if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) {
+        return;
+      }
+      if (e.key === 'F12') {
+        e.preventDefault();
+        setShowDevTools((v) => !v);
         return;
       }
       if (!e.ctrlKey && !e.metaKey) return;
@@ -426,6 +475,17 @@ export const EditorPage: React.FC<EditorPageProps> = ({
         {/* Projeto + telas */}
         <div className="flex items-center gap-2 min-w-0">
           <span className="text-[13px] font-medium text-slate-200 truncate max-w-[180px]">{project.name}</span>
+          {onNewProject && (
+            <button
+              type="button"
+              onClick={onNewProject}
+              className="p-1 rounded text-slate-400 hover:text-mockbird-cyan hover:bg-mockbird-card transition-colors shrink-0"
+              title="Criar novo projeto"
+              aria-label="Criar novo projeto"
+            >
+              <FolderPlus size={14} />
+            </button>
+          )}
           <span
             title={connected ? 'Colaboração em tempo real ativa' : 'Reconectando colaboração…'}
             className="shrink-0"
@@ -517,6 +577,23 @@ export const EditorPage: React.FC<EditorPageProps> = ({
           })}
         </div>
 
+        {/* Alternador de Tema do Canvas (Light / Dark) */}
+        <button
+          type="button"
+          onClick={() => {
+            const nextTheme = tokenTheme === 'dark' ? 'light' : 'dark';
+            setTokenTheme(nextTheme);
+            const active = nextTheme === 'light' ? allTokens.light : allTokens.dark;
+            setTokens({ ...allTokens.shared, ...active });
+          }}
+          className="flex items-center gap-1.5 px-2 py-1.5 rounded-md bg-mockbird-bg border border-mockbird-border text-slate-300 hover:text-white hover:bg-mockbird-card transition text-xs"
+          title={tokenTheme === 'dark' ? 'Mudar tela para tema claro' : 'Mudar tela para tema escuro'}
+          aria-label="Alternar tema da tela"
+        >
+          {tokenTheme === 'dark' ? <Moon size={14} className="text-cyan-400" /> : <Sun size={14} className="text-amber-400" />}
+          <span className="hidden xl:inline text-[11px] font-medium">{tokenTheme === 'dark' ? 'Escuro' : 'Claro'}</span>
+        </button>
+
         {/* Ações */}
         <div className="flex items-center gap-2">
           <div className="flex items-center gap-0.5 p-0.5 rounded-md bg-mockbird-bg border border-mockbird-border">
@@ -548,6 +625,13 @@ export const EditorPage: React.FC<EditorPageProps> = ({
             className="hidden"
             onChange={(e) => handleUploadImage(e.target.files?.[0])}
           />
+          <button
+            onClick={() => setShowDevTools((v) => !v)}
+            className={`mb-btn-outline ${showDevTools ? 'bg-mockbird-card text-mockbird-cyan border-mockbird-cyan/40' : ''}`}
+            title="Alternar DevTools F12 (Console, Elementos, Rede, Estilos)"
+          >
+            <Code2 size={14} /> DevTools (F12)
+          </button>
           <button
             onClick={() => fileInputRef.current?.click()}
             disabled={uploading}
@@ -611,33 +695,42 @@ export const EditorPage: React.FC<EditorPageProps> = ({
       {/* Editor Body */}
       <div className="flex-1 flex overflow-hidden relative">
         
-        {/* Canvas Central */}
-        <div className="flex-1 flex flex-col h-full overflow-hidden">
-          <CanvasEditor
-            ref={canvasEditorRef}
-            key={`${activeScreen.id}-${remoteRevision}`}
-            initialHtml={activeScreen.html_content}
-            tokens={tokens}
-            onHtmlChange={handleHtmlChange}
-            width={vp.width}
-            height={vp.height}
-            onElementSelected={(el) => {
-              setSelectedElement(el);
-              if (el && !activeTab) {
-                setActiveTab('visual');
-              }
-            }}
-            onRequestOpenTab={(tab) => setActiveTab(tab)}
-            onNavigate={handleMockNavigate}
-            onUndo={history.undo}
-            onRedo={history.redo}
-            onNewCommentOnElement={(selector, snippet) => {
-              setActiveTab('comments');
-              if (selector) {
-                setAiPromptInstruction(`Ajuste no elemento ${selector}${snippet ? ` ("${snippet}")` : ''}: `);
-              }
-            }}
-          />
+        {/* Canvas Central e DevTools acoplado na Lateral ou na Base */}
+        <div className={`flex-1 flex ${devToolsDockPosition === 'right' ? 'flex-row' : 'flex-col'} min-w-0 min-h-0 h-full relative overflow-hidden`}>
+          <div className="flex-1 flex flex-col min-w-0 min-h-0 relative overflow-hidden">
+            <CanvasEditor
+              ref={canvasEditorRef}
+              initialHtml={activeScreen.html_content}
+              tokens={tokens}
+              theme={tokenTheme}
+              onHtmlChange={handleHtmlChange}
+              width={vp.width}
+              height={vp.height}
+              onElementSelected={(el) => {
+                setSelectedElement(el);
+                if (el && !activeTab) {
+                  setActiveTab('visual');
+                }
+              }}
+              onRequestOpenTab={(tab) => setActiveTab(tab)}
+              onNavigate={handleMockNavigate}
+              onUndo={history.undo}
+              onRedo={history.redo}
+              onNewCommentOnElement={(selector, snippet) => {
+                setActiveTab('comments');
+                if (selector) {
+                  setAiPromptInstruction(`Ajuste no elemento ${selector}${snippet ? ` ("${snippet}")` : ''}: `);
+                }
+              }}
+            />
+          </div>
+          {showDevTools && (
+            <DevToolsDock
+              dockPosition={devToolsDockPosition}
+              onDockChange={(pos) => setDevToolsDockPosition(pos)}
+              onClose={() => setShowDevTools(false)}
+            />
+          )}
         </div>
 
         {/* Painel direito único com abas */}
@@ -677,6 +770,7 @@ export const EditorPage: React.FC<EditorPageProps> = ({
             <div className={activeTab === 'ai' ? 'flex w-full min-h-0 h-full [&>*]:!w-full [&>*]:!border-l-0 [&>*]:!shadow-none' : 'hidden'}>
               <AIChatPanel
                 projectId={project.id}
+                screenId={activeScreen.id}
                 currentHtml={activeScreen.html_content}
                 selectedElement={selectedElement}
                 onClearSelectedElement={() => setSelectedElement(null)}
@@ -692,9 +786,45 @@ export const EditorPage: React.FC<EditorPageProps> = ({
             {activeTab === 'visual' && (
               <InspectorPanel
                 selectedElement={selectedElement}
+                screens={screens}
                 onApplyStylePatch={(patch) => canvasEditorRef.current?.applyStylePatch(patch)}
+                onApplyAttributes={(attrs) => canvasEditorRef.current?.updateAttributes?.(attrs)}
                 onSendAction={(actionType) => canvasEditorRef.current?.sendAction(actionType)}
                 onClose={() => setActiveTab(null)}
+              />
+            )}
+
+            {activeTab === 'media' && (
+              <div className="w-80 border-l border-mockbird-border bg-mockbird-surface flex flex-col h-full shrink-0 shadow-2xl">
+                <MediaLibraryPanel
+                  projectId={project.id}
+                  onInsertImage={(imgTag) => {
+                    const updated = (activeScreen.html_content || '').trim() + '\n\n' + imgTag;
+                    handleApplyAiPatch(updated);
+                  }}
+                  onNotify={onNotify}
+                  onRefreshScreens={() => {
+                    fetch(`/api/projects/${project.id}/screens`)
+                      .then((r) => (r.ok ? r.json() : []))
+                      .then((list: any[]) => {
+                        if (Array.isArray(list) && list.length > 0) {
+                          setScreens(list.map((sc) => ({ ...sc, is_main: sc.is_entry ?? sc.is_main })));
+                        }
+                      })
+                      .catch(console.error);
+                  }}
+                />
+              </div>
+            )}
+
+            {activeTab === 'layers' && (
+              <LayersPanel
+                htmlContent={activeScreen.html_content}
+                selectedMbId={selectedElement?.mbId}
+                onSelectMbId={(mbId) => canvasEditorRef.current?.selectByMbId?.(mbId)}
+                onToggleVisibility={(mbId) => canvasEditorRef.current?.toggleElementVisibility?.(mbId)}
+                onDuplicate={() => canvasEditorRef.current?.sendAction?.('MOCKBIRD_DUPLICATE')}
+                onDelete={() => canvasEditorRef.current?.sendAction?.('MOCKBIRD_DELETE')}
               />
             )}
 
@@ -779,9 +909,36 @@ export const EditorPage: React.FC<EditorPageProps> = ({
               <div className="w-80 border-l border-mockbird-border bg-mockbird-surface flex flex-col h-full shrink-0 shadow-2xl">
                 <TokensPanel
                   projectId={project.id}
+                  lightTokens={allTokens.light}
+                  darkTokens={allTokens.dark}
                   currentTheme={tokenTheme}
-                  onThemeChange={setTokenTheme}
-                  onTokensUpdate={setTokens}
+                  onThemeChange={(th) => {
+                    setTokenTheme(th);
+                    const active = th === 'light' ? allTokens.light : allTokens.dark;
+                    setTokens({ ...allTokens.shared, ...active });
+                  }}
+                  onTokensUpdate={(updated) => {
+                    setTokens((prev) => ({ ...prev, ...updated }));
+                    setAllTokens((prev) => ({
+                      ...prev,
+                      [tokenTheme]: { ...prev[tokenTheme], ...updated },
+                    }));
+                  }}
+                  onSave={async (light, dark) => {
+                    await fetch(`/api/tokens/${project.id}`, {
+                      method: 'PUT',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        light_tokens: light,
+                        dark_tokens: dark,
+                        shared_tokens: allTokens.shared,
+                        light_theme: light,
+                        dark_theme: dark,
+                      }),
+                    });
+                    setAllTokens((prev) => ({ ...prev, light, dark }));
+                    onNotify?.('Design Tokens salvos com sucesso!');
+                  }}
                 />
               </div>
             )}
@@ -803,7 +960,9 @@ export const EditorPage: React.FC<EditorPageProps> = ({
               <div className="w-80 border-l border-mockbird-border bg-mockbird-surface flex flex-col h-full shrink-0 shadow-2xl">
                 <ScenariosManager
                   projectId={project.id}
-                  onApplyScenario={(data) => console.log('Cenário:', data)}
+                  onApplyScenario={(data) => {
+                    canvasEditorRef.current?.applyScenario?.(data);
+                  }}
                 />
               </div>
             )}
