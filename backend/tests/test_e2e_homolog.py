@@ -104,4 +104,4 @@ async def test_mcp_info():
         assert res.status_code == 200
         data = res.json()
         assert data["name"] == "mockbird-mcp-server"
-        assert len(data["tools"]) == 3
+        assert len(data["tools"]) >= 14

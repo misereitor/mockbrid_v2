@@ -15,9 +15,27 @@ import {
   CheckCircle2,
   Globe,
   Sliders,
-  Mail
+  Mail,
+  Layers,
+  FileCode,
+  Database,
+  Wrench,
+  FolderKanban
 } from 'lucide-react';
 import { EmailSettingsPanel } from '../components/EmailSettingsPanel';
+
+interface MCPKey {
+  id: string;
+  name: string;
+  prefix: string;
+  project_id: string | null;
+  scopes: string[];
+  last_used_at: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+  raw_key?: string;
+}
 
 interface AIProviderData {
   id?: string;
@@ -75,6 +93,72 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
   const [testResult, setTestResult] = useState<{ status: 'ok' | 'error'; message: string } | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [copiedMcp, setCopiedMcp] = useState<string | null>(null);
+
+  // MCP State
+  const [mcpKeys, setMcpKeys] = useState<MCPKey[]>([]);
+  const [loadingMcpKeys, setLoadingMcpKeys] = useState(false);
+  const [showCreateMcpKey, setShowCreateMcpKey] = useState(false);
+  const [newKeyName, setNewKeyName] = useState('');
+  const [newKeyScopes, setNewKeyScopes] = useState<string[]>(['project:read', 'screen:write', 'export:read']);
+  const [createdKey, setCreatedKey] = useState<MCPKey | null>(null);
+  const [generatingKey, setGeneratingKey] = useState(false);
+
+  const loadMcpKeys = async () => {
+    setLoadingMcpKeys(true);
+    try {
+      const res = await fetch('/api/mcp/keys');
+      if (res.ok) setMcpKeys(await res.json());
+    } catch (err) {
+      console.error('Erro ao ler chaves MCP:', err);
+    } finally {
+      setLoadingMcpKeys(false);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab === 'mcp') loadMcpKeys();
+  }, [activeTab]);
+
+  const handleCreateMcpKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newKeyName.trim() || generatingKey) return;
+    setGeneratingKey(true);
+    try {
+      const res = await fetch('/api/mcp/keys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: newKeyName.trim(),
+          scopes: newKeyScopes,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Falha ao gerar chave MCP');
+      }
+      const created = await res.json();
+      setCreatedKey(created);
+      setMcpKeys((prev) => [created, ...prev]);
+      setNewKeyName('');
+      setShowCreateMcpKey(false);
+    } catch (err: any) {
+      alert(err.message || 'Erro ao criar chave MCP');
+    } finally {
+      setGeneratingKey(false);
+    }
+  };
+
+  const handleRevokeMcpKey = async (keyId: string, keyName: string) => {
+    if (!window.confirm(`Tem certeza que deseja revogar a chave MCP "${keyName}"? Todas as conexões ativas serão interrompidas.`)) return;
+    try {
+      const res = await fetch(`/api/mcp/keys/${keyId}`, { method: 'DELETE' });
+      if (res.ok) {
+        setMcpKeys((prev) => prev.map((k) => (k.id === keyId ? { ...k, revoked_at: new Date().toISOString() } : k)));
+      }
+    } catch (err: any) {
+      alert(err.message || 'Erro ao revogar chave');
+    }
+  };
 
   // Plano de IA da organização
   const [usage, setUsage] = useState<any>(null);
@@ -228,19 +312,38 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
     }
   };
 
+  const activeToken = createdKey?.raw_key || (mcpKeys.find(k => !k.revoked_at)?.prefix ? `${mcpKeys.find(k => !k.revoked_at)?.prefix} (use sua chave completa)` : 'mb_live_SEU_TOKEN_AQUI');
+
   const mcpClaudeConfig = JSON.stringify({
     mcpServers: {
-      mockbird_v2: {
-        command: "npx",
-        args: ["-y", "mcp-proxy", `${window.location.origin}/mcp/sse`]
+      mockbird: {
+        url: `${window.location.origin}/mcp`,
+        headers: {
+          Authorization: `Bearer ${activeToken}`
+        }
       }
     }
   }, null, 2);
 
   const mcpCursorConfig = JSON.stringify({
-    "mcp.servers": {
-      "mockbird_v2": {
-        "url": `${window.location.origin}/mcp/info`
+    mcpServers: {
+      mockbird: {
+        url: `${window.location.origin}/mcp`,
+        headers: {
+          Authorization: `Bearer ${activeToken}`
+        }
+      }
+    }
+  }, null, 2);
+
+  const mcpVSCodeConfig = JSON.stringify({
+    mcpServers: {
+      mockbird: {
+        type: "http",
+        url: `${window.location.origin}/mcp`,
+        headers: {
+          Authorization: `Bearer ${activeToken}`
+        }
       }
     }
   }, null, 2);
@@ -579,94 +682,488 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
         </div>
       )}
 
-      {/* TAB 2: SERVIDOR MCP NATIVO */}
+      {/* TAB 2: SERVIDOR MCP NATIVO COM AUTENTICAÇÃO */}
       {activeTab === 'mcp' && (
         <div className="space-y-6">
           <div className="bg-mockbird-card border border-mockbird-border rounded-2xl p-6 shadow-xl space-y-6">
-            <div>
-              <div className="inline-flex items-center gap-1.5 bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 px-2.5 py-0.5 rounded-full text-[11px] font-bold mb-2">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                Endpoint Ativo: /mcp/info
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <div className="inline-flex items-center gap-1.5 bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 px-2.5 py-0.5 rounded-full text-[11px] font-bold mb-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                  Endpoint Ativo: {window.location.origin}/mcp
+                </div>
+                <h2 className="text-lg font-bold text-white flex items-center gap-2">
+                  <Key size={18} className="text-mockbird-cyan" />
+                  Servidor MCP Nativo (Model Context Protocol)
+                </h2>
+                <p className="text-xs text-slate-400 mt-1 leading-relaxed max-w-3xl">
+                  Conecte seu editor (Claude Desktop, Claude Code, Cursor AI, VS Code) ao Mockbird através do protocolo MCP JSON-RPC 2.0. As requisições são protegidas com autenticação via Bearer token (<code className="text-mockbird-cyan">mb_live_...</code>).
+                </p>
               </div>
-              <h2 className="text-lg font-bold text-white">Servidor MCP Nativo (Model Context Protocol)</h2>
-              <p className="text-xs text-slate-400 mt-1 leading-relaxed max-w-3xl">
-                O Mockbird SaaS expõe um servidor MCP de primeira classe. Ao plugar o MCP no seu Claude Desktop, Claude Code ou Cursor AI, a inteligência artificial pode inspecionar o mapa do projeto, ler o HTML exato de qualquer tela, aplicar correções de layout e gerar o bundle de implantação final sem você precisar copiar e colar nada manualmente.
-              </p>
+
+              <button
+                type="button"
+                onClick={() => setShowCreateMcpKey(!showCreateMcpKey)}
+                className="bg-mockbird-blue hover:bg-mockbird-bluedark text-white font-semibold text-xs px-4 py-2 rounded-lg flex items-center gap-1.5 shrink-0 transition"
+              >
+                <Plus size={14} />
+                <span>Nova Chave MCP</span>
+              </button>
             </div>
 
-            {/* Claude Desktop Config Snippet */}
-            <div className="bg-mockbird-surface border border-mockbird-border rounded-xl p-4">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-bold text-slate-200 flex items-center gap-2 font-mono">
-                  <Terminal size={14} className="text-blue-400" />
-                  Claude Code / Claude Desktop (claude_desktop_config.json)
-                </span>
+            {/* Banner de Chave Gerada com Sucesso */}
+            {createdKey && (
+              <div className="bg-emerald-950/40 border border-emerald-500/50 p-4 rounded-xl space-y-2 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-emerald-300 flex items-center gap-1.5">
+                    <CheckCircle2 size={16} className="text-emerald-400" />
+                    Chave MCP Criada com Sucesso!
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setCreatedKey(null)}
+                    className="text-slate-400 hover:text-white text-[11px]"
+                  >
+                    Fechar
+                  </button>
+                </div>
+                <p className="text-slate-300 text-[11px]">
+                  Copie sua chave secreta agora. Por segurança, ela <strong>não será exibida novamente</strong>:
+                </p>
+                <div className="flex items-center gap-2 bg-[#161b22] p-2 rounded-lg border border-[#30363d]">
+                  <input
+                    type="text"
+                    readOnly
+                    value={createdKey.raw_key}
+                    className="bg-transparent font-mono text-emerald-300 text-xs flex-1 outline-none select-all"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => copyToClipboard(createdKey.raw_key || '', 'new_raw_key')}
+                    className="bg-emerald-500 hover:bg-emerald-600 text-black font-semibold px-3 py-1 rounded text-[11px] flex items-center gap-1 transition shrink-0"
+                  >
+                    {copiedMcp === 'new_raw_key' ? <Check size={13} /> : <Copy size={13} />}
+                    <span>{copiedMcp === 'new_raw_key' ? 'Copiada!' : 'Copiar Chave'}</span>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Formulário de Criação de Chave MCP */}
+            {showCreateMcpKey && (
+              <form onSubmit={handleCreateMcpKey} className="bg-mockbird-surface border border-mockbird-border p-4 rounded-xl space-y-4">
+                <h3 className="text-xs font-bold text-white uppercase tracking-wider">Criar Nova Chave de Acesso MCP</h3>
+                <div className="space-y-1.5">
+                  <label className="text-xs text-slate-300 font-medium">Nome identificador da chave</label>
+                  <input
+                    type="text"
+                    placeholder="Ex: Claude Desktop MacBook, Cursor AI Homologação"
+                    value={newKeyName}
+                    onChange={(e) => setNewKeyName(e.target.value)}
+                    required
+                    className="w-full bg-mockbird-bg border border-mockbird-border text-white text-xs px-3 py-2 rounded-lg outline-none focus:border-mockbird-cyan"
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-xs text-slate-300 font-medium">Permissões e Escopos</label>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+                    {[
+                      { id: 'project:read', label: 'project:read', desc: 'Ler mapa de telas e tokens' },
+                      { id: 'screen:write', label: 'screen:write', desc: 'Aplicar patches e atualizar HTML' },
+                      { id: 'export:read', label: 'export:read', desc: 'Gerar bundle de implantação' },
+                    ].map((scope) => {
+                      const isChecked = newKeyScopes.includes(scope.id);
+                      return (
+                        <label
+                          key={scope.id}
+                          className={`p-2.5 rounded-lg border cursor-pointer flex flex-col gap-1 transition ${
+                            isChecked ? 'bg-mockbird-blue/15 border-mockbird-cyan text-white' : 'bg-mockbird-bg border-mockbird-border text-slate-400'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              onChange={(e) => {
+                                if (e.target.checked) {
+                                  setNewKeyScopes([...newKeyScopes, scope.id]);
+                                } else {
+                                  setNewKeyScopes(newKeyScopes.filter((s) => s !== scope.id));
+                                }
+                              }}
+                              className="accent-mockbird-blue"
+                            />
+                            <span className="font-mono font-bold text-[11px] text-mockbird-cyan">{scope.label}</span>
+                          </div>
+                          <span className="text-[10px] text-slate-400">{scope.desc}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowCreateMcpKey(false)}
+                    className="px-3 py-1.5 rounded-lg text-xs text-slate-400 hover:text-white"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={generatingKey || !newKeyName.trim()}
+                    className="bg-mockbird-blue hover:bg-mockbird-bluedark text-white font-semibold text-xs px-4 py-1.5 rounded-lg transition disabled:opacity-50"
+                  >
+                    {generatingKey ? 'Gerando...' : 'Gerar Chave de Acesso'}
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {/* Lista de Chaves MCP */}
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <h3 className="text-xs font-bold text-slate-200 uppercase tracking-wider">
+                  Chaves de Acesso MCP Ativas
+                </h3>
                 <button
                   type="button"
-                  onClick={() => copyToClipboard(mcpClaudeConfig, 'claude')}
-                  className="text-xs text-mockbird-cyan hover:underline flex items-center gap-1 font-sans"
+                  onClick={loadMcpKeys}
+                  className="text-xs text-slate-400 hover:text-mockbird-cyan flex items-center gap-1"
                 >
-                  {copiedMcp === 'claude' ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} />}
-                  <span>{copiedMcp === 'claude' ? 'Copiado!' : 'Copiar JSON'}</span>
+                  <RefreshCw size={12} className={loadingMcpKeys ? 'animate-spin' : ''} />
+                  <span>Atualizar</span>
                 </button>
               </div>
-              <pre className="text-xs font-mono text-slate-300 bg-mockbird-bg p-3.5 rounded-lg border border-mockbird-border overflow-x-auto">
-                {mcpClaudeConfig}
-              </pre>
+
+              {loadingMcpKeys ? (
+                <div className="text-xs text-slate-400 py-4 text-center">Carregando chaves MCP...</div>
+              ) : mcpKeys.length === 0 ? (
+                <div className="bg-mockbird-surface border border-mockbird-border p-4 rounded-xl text-center text-xs text-slate-400">
+                  Nenhuma chave MCP gerada ainda. Clique em <strong>"Nova Chave MCP"</strong> acima para criar uma.
+                </div>
+              ) : (
+                <div className="border border-mockbird-border rounded-xl overflow-hidden divide-y divide-mockbird-border">
+                  {mcpKeys.map((k) => {
+                    const isRevoked = Boolean(k.revoked_at);
+                    return (
+                      <div key={k.id} className="p-3.5 bg-mockbird-surface flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                        <div className="space-y-1">
+                          <div className="flex items-center gap-2">
+                            <span className="font-semibold text-white">{k.name}</span>
+                            <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${
+                              isRevoked ? 'bg-rose-500/10 text-rose-400 border border-rose-500/30' : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+                            }`}>
+                              {isRevoked ? 'Revogada' : 'Ativa'}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2 text-[11px] text-slate-400 font-mono">
+                            <span>Prefixo: <strong className="text-slate-300">{k.prefix}••••••••</strong></span>
+                            <span>•</span>
+                            <span>Criada em: {new Date(k.created_at).toLocaleDateString('pt-BR')}</span>
+                            {k.last_used_at && (
+                              <>
+                                <span>•</span>
+                                <span>Último uso: {new Date(k.last_used_at).toLocaleDateString('pt-BR')}</span>
+                              </>
+                            )}
+                          </div>
+                          <div className="flex flex-wrap gap-1 pt-1">
+                            {k.scopes.map((s) => (
+                              <span key={s} className="bg-mockbird-bg text-mockbird-cyan px-2 py-0.5 rounded text-[10px] font-mono border border-mockbird-border">
+                                {s}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+
+                        {!isRevoked && (
+                          <button
+                            type="button"
+                            onClick={() => handleRevokeMcpKey(k.id, k.name)}
+                            className="text-xs text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 px-2.5 py-1 rounded transition self-start sm:self-auto flex items-center gap-1"
+                          >
+                            <Trash2 size={13} />
+                            <span>Revogar</span>
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
 
-            {/* Cursor Config Snippet */}
-            <div className="bg-mockbird-surface border border-mockbird-border rounded-xl p-4">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-bold text-slate-200 flex items-center gap-2 font-mono">
-                  <Terminal size={14} className="text-purple-400" />
-                  Cursor AI (.cursor/settings.json)
-                </span>
-                <button
-                  type="button"
-                  onClick={() => copyToClipboard(mcpCursorConfig, 'cursor')}
-                  className="text-xs text-mockbird-cyan hover:underline flex items-center gap-1 font-sans"
-                >
-                  {copiedMcp === 'cursor' ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} />}
-                  <span>{copiedMcp === 'cursor' ? 'Copiado!' : 'Copiar JSON'}</span>
-                </button>
+            {/* Config Snippets com Header Bearer */}
+            <div className="space-y-4 pt-2 border-t border-mockbird-border">
+              <h3 className="text-xs font-bold text-slate-200 uppercase tracking-wider">
+                Snippets de Configuração para seus Editores
+              </h3>
+
+              {/* Claude Desktop Config Snippet */}
+              <div className="bg-mockbird-surface border border-mockbird-border rounded-xl p-4">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-slate-200 flex items-center gap-2 font-mono">
+                    <Terminal size={14} className="text-blue-400" />
+                    Claude Code / Claude Desktop (claude_desktop_config.json)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => copyToClipboard(mcpClaudeConfig, 'claude')}
+                    className="text-xs text-mockbird-cyan hover:underline flex items-center gap-1 font-sans"
+                  >
+                    {copiedMcp === 'claude' ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} />}
+                    <span>{copiedMcp === 'claude' ? 'Copiado!' : 'Copiar JSON'}</span>
+                  </button>
+                </div>
+                <pre className="text-xs font-mono text-slate-300 bg-mockbird-bg p-3.5 rounded-lg border border-mockbird-border overflow-x-auto">
+                  {mcpClaudeConfig}
+                </pre>
               </div>
-              <pre className="text-xs font-mono text-slate-300 bg-mockbird-bg p-3.5 rounded-lg border border-mockbird-border overflow-x-auto">
-                {mcpCursorConfig}
-              </pre>
+
+              {/* Cursor Config Snippet */}
+              <div className="bg-mockbird-surface border border-mockbird-border rounded-xl p-4">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-slate-200 flex items-center gap-2 font-mono">
+                    <Terminal size={14} className="text-purple-400" />
+                    Cursor AI (.cursor/settings.json)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => copyToClipboard(mcpCursorConfig, 'cursor')}
+                    className="text-xs text-mockbird-cyan hover:underline flex items-center gap-1 font-sans"
+                  >
+                    {copiedMcp === 'cursor' ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} />}
+                    <span>{copiedMcp === 'cursor' ? 'Copiado!' : 'Copiar JSON'}</span>
+                  </button>
+                </div>
+                <pre className="text-xs font-mono text-slate-300 bg-mockbird-bg p-3.5 rounded-lg border border-mockbird-border overflow-x-auto">
+                  {mcpCursorConfig}
+                </pre>
+              </div>
+
+              {/* VS Code Config Snippet */}
+              <div className="bg-mockbird-surface border border-mockbird-border rounded-xl p-4">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-slate-200 flex items-center gap-2 font-mono">
+                    <Terminal size={14} className="text-amber-400" />
+                    VS Code (mcpServers em settings.json)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => copyToClipboard(mcpVSCodeConfig, 'vscode')}
+                    className="text-xs text-mockbird-cyan hover:underline flex items-center gap-1 font-sans"
+                  >
+                    {copiedMcp === 'vscode' ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} />}
+                    <span>{copiedMcp === 'vscode' ? 'Copiado!' : 'Copiar JSON'}</span>
+                  </button>
+                </div>
+                <pre className="text-xs font-mono text-slate-300 bg-mockbird-bg p-3.5 rounded-lg border border-mockbird-border overflow-x-auto">
+                  {mcpVSCodeConfig}
+                </pre>
+              </div>
             </div>
 
             {/* MCP Tools Guide */}
-            <div>
-              <h3 className="text-xs font-bold text-slate-200 uppercase tracking-wider mb-3">
-                Ferramentas MCP Nativas Disponíveis:
-              </h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
-                <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg">
-                  <div className="font-mono font-bold text-mockbird-cyan mb-1">get_project_map</div>
-                  <div className="text-slate-400 text-[11px]">
-                    Retorna a árvore do projeto com todas as telas, IDs, slugs e metadados de layout.
+            <div className="pt-4 border-t border-mockbird-border space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-xs font-bold text-slate-200 uppercase tracking-wider flex items-center gap-2">
+                    <Wrench size={14} className="text-mockbird-cyan" />
+                    Catálogo de Ferramentas MCP Nativas
+                  </h3>
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    14 ferramentas prontas para agentes autônomos (Claude Desktop, Cursor, Antigravity, Windsurf).
+                  </p>
+                </div>
+                <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-mockbird-cyan/10 text-mockbird-cyan border border-mockbird-cyan/20 font-bold">
+                  14 tools disponíveis
+                </span>
+              </div>
+
+              {/* Categoria 1: Descoberta & Projetos */}
+              <div className="space-y-2">
+                <div className="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                  <FolderKanban size={13} className="text-blue-400" />
+                  <span>Descoberta & Projetos</span>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 text-xs">
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">list_projects</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">read</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Lista todos os projetos aos quais a chave MCP tem acesso na organização.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">get_project_map</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">read</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Retorna a árvore do projeto com todas as telas, IDs, dimensões e design tokens.
+                    </div>
                   </div>
                 </div>
+              </div>
 
-                <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg">
-                  <div className="font-mono font-bold text-mockbird-cyan mb-1">get_screen</div>
-                  <div className="text-slate-400 text-[11px]">
-                    Obtém o código HTML, CSS, JS e Design Tokens em tempo real de uma tela específica.
+              {/* Categoria 2: Gestão de Telas */}
+              <div className="space-y-2">
+                <div className="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                  <Layers size={13} className="text-purple-400" />
+                  <span>Gestão de Telas</span>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 text-xs">
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">get_screen</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">read</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Obtém código HTML, CSS, JS, dimensões e tokens completos de uma tela específica.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">create_screen</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/40">write</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Cria uma nova tela em um canvas ou projeto com layout inicial configurável.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">duplicate_screen</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/40">write</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Duplica uma tela existente criando uma nova revisão e novo identificador.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">delete_screen</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-rose-950 text-rose-400 border border-rose-800/40">delete</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Exclui uma tela mantendo a integridade referencial do projeto.
+                    </div>
                   </div>
                 </div>
+              </div>
 
-                <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg">
-                  <div className="font-mono font-bold text-mockbird-cyan mb-1">update_screen_html</div>
-                  <div className="text-slate-400 text-[11px]">
-                    Aplica patches ou substituições no HTML da tela mantendo o histórico de revisões.
+              {/* Categoria 3: Edição & Design System */}
+              <div className="space-y-2">
+                <div className="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                  <Sliders size={13} className="text-amber-400" />
+                  <span>Edição & Design System</span>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 text-xs">
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">patch_screen_element</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/40">write</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Aplica patches cirúrgicos e atômicos em elementos específicos via data-mb-id.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">update_screen_html</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/40">write</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Atualiza o HTML completo da tela gerando novo snapshot no histórico de revisões.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">update_design_tokens</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/40">write</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Atualiza os tokens de cores (light/dark) e tokens compartilhados de design do projeto.
+                    </div>
                   </div>
                 </div>
+              </div>
 
-                <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg">
-                  <div className="font-mono font-bold text-mockbird-cyan mb-1">get_implementation_bundle</div>
-                  <div className="text-slate-400 text-[11px]">
-                    Facilitador de implantação: exporta todos os componentes e tokens empacotados para código de produção.
+              {/* Categoria 4: Mídia & Cenários de Dados */}
+              <div className="space-y-2">
+                <div className="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                  <Database size={13} className="text-emerald-400" />
+                  <span>Mídia & Cenários de Dados Mock</span>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 text-xs">
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">list_project_assets</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">read</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Lista logos, imagens e ícones da biblioteca de mídia com URLs assinadas.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">list_scenarios</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">read</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Lista os cenários de dados mockados (mock data) configurados para o projeto.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">set_scenario_data</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/40">write</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Cria ou atualiza dados mockados simulados (JSON) para cenários de teste da tela.
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Categoria 5: Qualidade & Implantação */}
+              <div className="space-y-2">
+                <div className="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                  <FileCode size={13} className="text-cyan-400" />
+                  <span>Qualidade & Implantação</span>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 text-xs">
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">validate_screen_html</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-cyan-950 text-cyan-400 border border-cyan-800/40">linter</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Linter e validador de HTML: detecta tags não fechadas, semântica e IDs antes de salvar.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">get_implementation_bundle</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">export</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Facilitador de produção: exporta componentes React JSX sanitizados e tokens prontos.
+                    </div>
                   </div>
                 </div>
               </div>
