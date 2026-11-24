@@ -10,7 +10,7 @@ import pytest
 import websockets
 
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8082")
-WS_URL = os.getenv("WS_URL", "ws://127.0.0.1:8082")
+WS_URL = os.getenv("WS_URL", os.getenv("BASE_URL", "http://127.0.0.1:8082").replace("http://", "ws://").replace("https://", "wss://"))
 PASSWORD = "PasswordStrong123!"
 
 
@@ -67,15 +67,17 @@ async def test_assets_upload_validation_and_public_serving():
 
         bad = await owner.post(
             f"/api/projects/{project['id']}/assets",
-            files={"file": ("x.svg", b"<svg onload=alert(1)>", "image/svg+xml")},
+            files={"file": ("malicious.exe", b"MZ\x90\x00\x03\x00\x00\x00", "application/octet-stream")},
             headers=headers,
         )
         assert bad.status_code == 415
 
         assert (await owner.get(asset["url"])).status_code == 200
 
+        # URL sem assinatura HMAC não pode ser acessada por anônimo em projeto não publicado
+        unsigned_url = f"/api/assets/{asset['id']}"
         async with httpx.AsyncClient(base_url=BASE_URL, timeout=20.0) as anon:
-            assert (await anon.get(asset["url"])).status_code == 404
+            assert (await anon.get(unsigned_url)).status_code == 404
 
         await owner.post(f"/api/projects/{project['id']}/publish", headers=headers)
         async with httpx.AsyncClient(base_url=BASE_URL, timeout=20.0) as anon:

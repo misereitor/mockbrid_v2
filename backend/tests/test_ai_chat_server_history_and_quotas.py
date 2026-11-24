@@ -90,15 +90,17 @@ async def test_ai_chat_conversations_history_and_quota_block():
         assert messages[1]["role"] == "assistant"
 
     # 7. Teste de Bloqueio por Cota Ultrapassada (429)
-    # Simula cota estourada atualizando o banco ou chamando com limite baixo
-
     # Vamos atualizar diretamente o user de teste para ter tokens_used_month >= monthly_token_limit
-    import asyncpg
-    conn = await asyncpg.connect("postgresql://mockbird:mockbird_homolog_secret@127.0.0.1:5434/mockbird_v2")
-    try:
-        await conn.execute("UPDATE users SET tokens_used_month = 250000, monthly_token_limit = 200000 WHERE email = $1", email)
-    finally:
-        await conn.close()
+    from app.database import AsyncSessionLocal
+    from app.models import User
+    from sqlalchemy import update
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            update(User)
+            .where(User.email == email)
+            .values(tokens_used_month=250000, monthly_token_limit=200000)
+        )
+        await session.commit()
 
     async with httpx.AsyncClient(base_url=BASE_URL, timeout=15.0) as client:
         await client.post("/api/auth/login", json={"email": email, "password": pwd})

@@ -17,6 +17,7 @@ from sqlalchemy.future import select
 
 from app.database import AsyncSessionLocal
 from app.models import AIProvider, AIPlan, Organization, User
+from app.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,9 @@ async def get_org_plan(db: AsyncSession, organization_id: str) -> Optional[AIPla
     res = await db.execute(
         select(AIPlan)
         .join(Organization, Organization.ai_plan_id == AIPlan.id)
-        .where(Organization.id == organization_id, AIPlan.is_active == True)  # noqa: E712
+        .where(
+            Organization.id == organization_id, AIPlan.is_active == True
+        )  # noqa: E712
     )
     return res.scalars().first()
 
@@ -44,29 +47,47 @@ def enforce_ai_quota(
     plan: Optional[AIPlan] = None,
 ) -> None:
     """Lança 429 se o usuário ou o provedor já estouraram a cota mensal."""
+    current_period = utcnow().strftime("%Y-%m")
+    # Só considera virada de mês quando há um período registrado e ele é antigo;
+    # período ausente (legado/NULL) mantém o consumo já contabilizado.
+    user_period = getattr(user, "usage_period", None)
+    user_used = (
+        0
+        if user_period and user_period != current_period
+        else user.tokens_used_month
+    )
     limit = user_token_limit(user, plan)
-    if user.tokens_used_month >= limit:
+    if user_used >= limit:
         plan_detail = f" do plano '{plan.name}'" if plan else ""
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=(
                 f"Limite mensal de tokens de IA{plan_detail} atingido "
-                f"({user.tokens_used_month}/{limit}). "
+                f"({user_used}/{limit}). "
                 "Contate o administrador da organização."
             ),
         )
 
-    if prov and prov.monthly_token_limit and prov.tokens_used_month >= prov.monthly_token_limit:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=(
-                f"Limite mensal do provedor '{prov.provider_type}' atingido "
-                f"({prov.tokens_used_month}/{prov.monthly_token_limit})."
-            ),
+    if prov and prov.monthly_token_limit:
+        prov_period = getattr(prov, "usage_period", None)
+        prov_used = (
+            0
+            if prov_period and prov_period != current_period
+            else prov.tokens_used_month
         )
+        if prov_used >= prov.monthly_token_limit:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    f"Limite mensal do provedor '{prov.provider_type}' atingido "
+                    f"({prov_used}/{prov.monthly_token_limit})."
+                ),
+            )
 
 
-async def enforce_ai_quota_for(db: AsyncSession, user: User, prov: Optional[AIProvider]) -> None:
+async def enforce_ai_quota_for(
+    db: AsyncSession, user: User, prov: Optional[AIProvider]
+) -> None:
     """Checa a cota considerando o plano da organização."""
     plan = await get_org_plan(db, user.organization_id)
     enforce_ai_quota(user, prov, plan)
@@ -95,24 +116,37 @@ async def charge_usage(
     prompt_tokens: int,
     completion_tokens: int,
 ) -> None:
-    """Cobra o consumo em sessão própria, de forma atômica, sem afetar a request."""
+    """Cobra o consumo em sessão própria, de forma atômica, resetando se o mês virou."""
     total = int(prompt_tokens or 0) + int(completion_tokens or 0)
     if total <= 0:
         return
+    current_period = utcnow().strftime("%Y-%m")
     try:
         async with AsyncSessionLocal() as session:
             if user_id:
-                await session.execute(
-                    update(User)
-                    .where(User.id == user_id)
-                    .values(tokens_used_month=User.tokens_used_month + total)
-                )
+                u_res = await session.execute(select(User).where(User.id == user_id))
+                u = u_res.scalars().first()
+                if u:
+                    if u.usage_period != current_period:
+                        u.tokens_used_month = total
+                        u.usage_period = current_period
+                    else:
+                        u.tokens_used_month += total
             if provider_id:
-                await session.execute(
-                    update(AIProvider)
-                    .where(AIProvider.id == provider_id)
-                    .values(tokens_used_month=AIProvider.tokens_used_month + total)
+                p_res = await session.execute(
+                    select(AIProvider).where(AIProvider.id == provider_id)
                 )
+                p = p_res.scalars().first()
+                if p:
+                    if p.usage_period != current_period:
+                        p.tokens_used_month = total
+                        p.usage_period = current_period
+                    else:
+                        p.tokens_used_month += total
             await session.commit()
     except Exception:
-        logger.exception("Falha ao contabilizar tokens de IA (user=%s provider=%s)", user_id, provider_id)
+        logger.exception(
+            "Falha ao contabilizar tokens de IA (user=%s provider=%s)",
+            user_id,
+            provider_id,
+        )

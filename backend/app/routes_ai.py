@@ -9,8 +9,16 @@ import json
 import re
 import os
 
-from app.database import get_db
-from app.models import User, AIProvider, AIConversation, AIMessage, AIGenerationLog
+from app.database import get_db, AsyncSessionLocal
+from app.models import (
+    User,
+    AIProvider,
+    AIConversation,
+    AIMessage,
+    AIGenerationLog,
+    Project,
+    Workspace,
+)
 from app.routes_auth import get_current_user, require_editor, require_admin
 from app.authz import authorize_screen
 from app.agent.state import AgentState, TargetElementInfo
@@ -18,24 +26,45 @@ from app.agent.graph import MockbirdAgentGraph
 from app.agent.htmlkit import extract_html, validate_and_repair
 from app.config import settings
 from app.ai_providers import get_active_provider, is_local_endpoint, resolve_endpoint
-from app.quotas import charge_usage, enforce_ai_quota_for, estimate_tokens, extract_usage
+from app.quotas import (
+    charge_usage,
+    enforce_ai_quota_for,
+    estimate_tokens,
+    extract_usage,
+)
 from app.crypto import encrypt_secret, decrypt_secret
 from app.timeutils import utcnow
 import logging
 from datetime import datetime
 import ipaddress
 import socket
+import struct
 from urllib.parse import urlparse
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
 logger = logging.getLogger(__name__)
 
-FORBIDDEN_PORTS = {22, 25, 110, 143, 445, 5432, 5434, 6379, 11211, 2375, 2376, 3306, 27017}
+FORBIDDEN_PORTS = {
+    22,
+    25,
+    110,
+    143,
+    445,
+    5432,
+    5434,
+    6379,
+    11211,
+    2375,
+    2376,
+    3306,
+    27017,
+}
 
 
 def validate_ai_endpoint_url(url: str) -> str:
     """Valida rigorosamente URLs de IA contra ataques de Server-Side Request Forgery (SSRF).
-    Bloqueia acesso a metadados de nuvem, IPs privados não autorizados e portas de serviços de infraestrutura."""
+    Bloqueia acesso a metadados de nuvem, IPs privados não autorizados e portas de serviços de infraestrutura.
+    """
     if not url:
         return ""
 
@@ -45,7 +74,7 @@ def validate_ai_endpoint_url(url: str) -> str:
     if parsed.scheme not in ["http", "https"]:
         raise HTTPException(
             status_code=400,
-            detail="Esquema de URL inválido. Apenas HTTP e HTTPS são permitidos."
+            detail="Esquema de URL inválido. Apenas HTTP e HTTPS são permitidos.",
         )
 
     hostname = parsed.hostname
@@ -56,19 +85,30 @@ def validate_ai_endpoint_url(url: str) -> str:
     if port in FORBIDDEN_PORTS:
         raise HTTPException(
             status_code=400,
-            detail=f"Porta {port} terminantemente proibida por política de segurança SSRF."
+            detail=f"Porta {port} terminantemente proibida por política de segurança SSRF.",
         )
 
     lower_host = hostname.lower()
-    if lower_host in ["metadata.google.internal", "metadata", "instance-data", "db", "mockbird_v2_db", "mockbird_v2_api"]:
+    if lower_host in [
+        "metadata.google.internal",
+        "metadata",
+        "instance-data",
+        "db",
+        "mockbird_v2_db",
+        "mockbird_v2_api",
+    ]:
         raise HTTPException(
             status_code=400,
-            detail="Acesso ao host de metadados ou infraestrutura interna bloqueado por política de segurança SSRF."
+            detail="Acesso ao host de metadados ou infraestrutura interna bloqueado por política de segurança SSRF.",
         )
 
     # Hosts locais autorizados explicitamente para provedores de LLM locais
     allowed_local = [
-        h.strip().lower() for h in os.getenv("AI_ALLOWED_LOCAL_HOSTS", "localhost,127.0.0.1,172.31.0.1").split(",") if h.strip()
+        h.strip().lower()
+        for h in os.getenv(
+            "AI_ALLOWED_LOCAL_HOSTS", "localhost,127.0.0.1,172.31.0.1"
+        ).split(",")
+        if h.strip()
     ]
     is_explicitly_allowed_local = lower_host in allowed_local
 
@@ -80,19 +120,28 @@ def validate_ai_endpoint_url(url: str) -> str:
             addr_info = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
             ips_to_check = [ipaddress.ip_address(item[4][0]) for item in addr_info]
         except socket.gaierror:
-            raise HTTPException(status_code=400, detail=f"Não foi possível resolver o hostname '{hostname}' via DNS.")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Não foi possível resolver o hostname '{hostname}' via DNS.",
+            )
 
     for ip in ips_to_check:
         if str(ip) == "169.254.169.254":
             raise HTTPException(
                 status_code=400,
-                detail="Acesso ao endereço de metadados 169.254.169.254 bloqueado por política de segurança SSRF."
+                detail="Acesso ao endereço de metadados 169.254.169.254 bloqueado por política de segurança SSRF.",
             )
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+        ):
             if not is_explicitly_allowed_local:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Endereço de rede ({ip}) não permitido por política de segurança SSRF."
+                    detail=f"Endereço de rede ({ip}) não permitido por política de segurança SSRF.",
                 )
 
     return clean_url
@@ -105,13 +154,29 @@ def _get_provider_api_key(prov: Optional[AIProvider]) -> str:
     return decrypt_secret(prov.encrypted_api_key)
 
 
+def _detect_docker_gateway() -> str:
+    env_gw = os.getenv("DOCKER_HOST_GATEWAY")
+    if env_gw and env_gw.strip():
+        return env_gw.strip()
+    try:
+        with open("/proc/net/route", "r") as f:
+            for line in f.readlines()[1:]:
+                fields = line.strip().split()
+                if len(fields) >= 3 and fields[1] == "00000000":
+                    return socket.inet_ntoa(struct.pack("<L", int(fields[2], 16)))
+    except Exception:
+        pass
+    return "172.30.0.1"
+
+
 def resolve_docker_base_url(url: str) -> str:
     """Se a URL estiver usando localhost ou 127.0.0.1 dentro do container Docker,
-    resolve para o gateway da máquina host para alcançar servidores locais como llama.cpp/Ollama."""
+    resolve para o gateway da máquina host para alcançar servidores locais como llama.cpp/Ollama.
+    """
     if not url:
         return ""
     clean = url.strip()
-    host_ip = os.getenv("DOCKER_HOST_GATEWAY", "172.31.0.1")
+    host_ip = _detect_docker_gateway()
     clean = re.sub(r"://localhost\b", f"://{host_ip}", clean)
     clean = re.sub(r"://127\.0\.0\.1\b", f"://{host_ip}", clean)
     return clean
@@ -202,8 +267,7 @@ class AITestRequest(BaseModel):
 
 @router.get("/providers", response_model=List[AIProviderOut])
 async def list_providers(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
 ):
     query = await db.execute(
         select(AIProvider)
@@ -217,18 +281,20 @@ async def list_providers(
         masked = ""
         if raw_key:
             masked = raw_key[:4] + "..." + raw_key[-4:] if len(raw_key) > 8 else "***"
-        results.append(AIProviderOut(
-            id=p.id,
-            provider_type=p.provider_type,
-            default_model=p.default_model,
-            base_url=p.base_url,
-            custom_models=p.custom_models or [],
-            is_active=p.is_active,
-            monthly_token_limit=p.monthly_token_limit,
-            tokens_used_month=p.tokens_used_month,
-            has_api_key=bool(raw_key),
-            masked_api_key=masked,
-        ))
+        results.append(
+            AIProviderOut(
+                id=p.id,
+                provider_type=p.provider_type,
+                default_model=p.default_model,
+                base_url=p.base_url,
+                custom_models=p.custom_models or [],
+                is_active=p.is_active,
+                monthly_token_limit=p.monthly_token_limit,
+                tokens_used_month=p.tokens_used_month,
+                has_api_key=bool(raw_key),
+                masked_api_key=masked,
+            )
+        )
     return results
 
 
@@ -236,7 +302,7 @@ async def list_providers(
 async def save_provider(
     payload: AIProviderConfig,
     current_user: User = Depends(require_admin),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     if payload.base_url and payload.base_url.strip():
         validate_ai_endpoint_url(payload.base_url)
@@ -244,12 +310,17 @@ async def save_provider(
     result = await db.execute(
         select(AIProvider).where(
             AIProvider.organization_id == current_user.organization_id,
-            AIProvider.provider_type == payload.provider_type
+            AIProvider.provider_type == payload.provider_type,
         )
     )
     prov = result.scalars().first()
-    clean_custom_models = list(dict.fromkeys([m.strip() for m in (payload.custom_models or []) if m.strip()]))
-    if payload.default_model and payload.default_model.strip() not in clean_custom_models:
+    clean_custom_models = list(
+        dict.fromkeys([m.strip() for m in (payload.custom_models or []) if m.strip()])
+    )
+    if (
+        payload.default_model
+        and payload.default_model.strip() not in clean_custom_models
+    ):
         clean_custom_models.insert(0, payload.default_model.strip())
 
     api_key_str = (payload.api_key or "").strip()
@@ -262,7 +333,7 @@ async def save_provider(
             default_model=payload.default_model.strip(),
             base_url=(payload.base_url or "").strip(),
             custom_models=clean_custom_models,
-            encrypted_api_key=encrypted_key
+            encrypted_api_key=encrypted_key,
         )
         db.add(prov)
     else:
@@ -274,23 +345,27 @@ async def save_provider(
 
     await db.commit()
     await db.refresh(prov)
-    logger.info("Provedor de IA salvo: tipo=%s url=%s modelo=%s", prov.provider_type, prov.base_url, prov.default_model)
+    logger.info(
+        "Provedor de IA salvo: tipo=%s url=%s modelo=%s",
+        prov.provider_type,
+        prov.base_url,
+        prov.default_model,
+    )
     return {
         "message": "Provedor e modelos configurados com sucesso",
         "provider_id": prov.id,
         "default_model": prov.default_model,
-        "custom_models": prov.custom_models
+        "custom_models": prov.custom_models,
     }
 
 
 @router.post("/test-connection")
 async def test_ai_connection(
-    payload: AITestRequest,
-    current_user: User = Depends(require_admin)
+    payload: AITestRequest, current_user: User = Depends(require_admin)
 ):
     url = (payload.base_url or "").strip()
     p_type = payload.provider_type.lower()
-    
+
     if not url:
         if p_type == "openai":
             url = "https://api.openai.com/v1"
@@ -309,7 +384,9 @@ async def test_ai_connection(
     validate_ai_endpoint_url(url)
 
     resolved_url = resolve_docker_base_url(url)
-    logger.info("Teste de conexao IA: %s -> %s modelo=%s", url, resolved_url, payload.model_name)
+    logger.info(
+        "Teste de conexao IA: %s -> %s modelo=%s", url, resolved_url, payload.model_name
+    )
 
     headers = {"Content-Type": "application/json"}
     api_key = (payload.api_key or "").strip()
@@ -323,7 +400,7 @@ async def test_ai_connection(
         headers["Authorization"] = "Bearer local-key"
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
             if p_type == "anthropic":
                 res = await client.post(
                     f"{resolved_url.rstrip('/')}/messages",
@@ -331,8 +408,8 @@ async def test_ai_connection(
                     json={
                         "model": payload.model_name or "claude-3-5-sonnet-20241022",
                         "max_tokens": 10,
-                        "messages": [{"role": "user", "content": "ping"}]
-                    }
+                        "messages": [{"role": "user", "content": "ping"}],
+                    },
                 )
             else:
                 res = await client.post(
@@ -341,24 +418,90 @@ async def test_ai_connection(
                     json={
                         "model": payload.model_name or "gpt-4o-mini",
                         "messages": [{"role": "user", "content": "ping"}],
-                        "max_tokens": 5
-                    }
+                        "max_tokens": 5,
+                    },
                 )
 
             if res.status_code in [200, 201]:
-                return {"status": "ok", "message": f"Conexão bem-sucedida com o endpoint e modelo {payload.model_name}!"}
+                return {
+                    "status": "ok",
+                    "message": f"Conexão bem-sucedida com o endpoint e modelo {payload.model_name}!",
+                }
             else:
                 return {
                     "status": "error",
                     "code": res.status_code,
-                    "message": f"Servidor retornou status {res.status_code}: {res.text[:200]}"
+                    "message": f"Servidor retornou status {res.status_code}: {res.text[:200]}",
                 }
     except Exception as e:
-        return {"status": "error", "message": f"Falha ao conectar em {resolved_url}: {str(e)}"}
+        return {
+            "status": "error",
+            "message": f"Falha ao conectar em {resolved_url}: {str(e)}",
+        }
 
 
-def build_system_prompt() -> str:
-    return (
+async def get_project_mock_context(db: AsyncSession, project_id: Optional[str]) -> str:
+    """Busca o mapa de telas e chaves de cenários mock para enriquecer o prompt da IA."""
+    if not project_id or project_id == "default":
+        return ""
+    try:
+        from app.models import Canvas, Screen, DataScenario
+
+        res = await db.execute(select(Canvas).where(Canvas.project_id == project_id))
+        canvas = res.scalars().first()
+        if not canvas:
+            return ""
+
+        screen_res = await db.execute(
+            select(Screen).where(Screen.canvas_id == canvas.id)
+        )
+        screens = screen_res.scalars().all()
+
+        scen_res = await db.execute(
+            select(DataScenario).where(DataScenario.canvas_id == canvas.id)
+        )
+        scenarios = scen_res.scalars().all()
+
+        lines = ["\nCONTEXTO DO PROJETO NO MOCKBIRD (Telas e Dados Mock):"]
+        if screens:
+            screen_list = [f"'{s.name}'" for s in screens]
+            lines.append(
+                f"- TELAS DISPONÍVEIS PARA NAVEGAÇÃO: {', '.join(screen_list)}."
+            )
+            lines.append(
+                "  * Em links/botões/menus de navegação, USE data-go='<NomeDaTela>' ou href='#/<nome>' para permitir que o cliente clique e navegue."
+            )
+
+        if scenarios:
+            lines.append("- CENÁRIOS DE DADOS MOCK:")
+            keys_seen = set()
+            for sc in scenarios:
+                if isinstance(sc.mock_data, dict):
+                    keys_seen.update(sc.mock_data.keys())
+            if keys_seen:
+                lines.append(
+                    f"  * Chaves mock disponíveis: {', '.join(sorted(keys_seen))}."
+                )
+                lines.append(
+                    "  * Vincule elementos dinâmicos usando data-mock='<chave>' (ex: data-mock='user.name') ou data-mock-list='<chave_lista>'."
+                )
+
+        lines.append(
+            "- MODAIS E OVERLAYS: Para modais, use data-overlay='#<id-do-modal>' no botão que abre, e data-close nos botões de fechar."
+        )
+        lines.append(
+            "- FEEDBACK (TOASTS): Para ações como salvar ou adicionar, use data-toast='Mensagem de sucesso'.\n"
+        )
+        return "\n".join(lines)
+    except Exception as e:
+        logger.warning(
+            "Falha ao obter contexto de mock do projeto %s: %s", project_id, e
+        )
+        return ""
+
+
+def build_system_prompt(project_context: str = "") -> str:
+    prompt = (
         "Você é o Diretor de Arte e Engenheiro Frontend Principal do Mockbird v2, premiado internacionalmente (Awwwards, Apple, Stripe e Linear). "
         "Seu objetivo é criar interfaces web estonteantes, modernas, elegantes e prontas para produção.\n\n"
         "REGRAS DE OURO DE DESIGN & COMPOSIÇÃO:\n"
@@ -388,9 +531,16 @@ def build_system_prompt() -> str:
         "   - Tipografia limpa com Inter/sans-serif e contrastes nítidos. Cores de texto text-white para títulos e text-slate-300 para corpo.\n"
         "4. IDENTIFICADORES DATA-MB-ID:\n"
         "   - Todo container, card, botão, imagem e título DEVE ter data-mb-id='...' único (ex: data-mb-id='hero-title', data-mb-id='card-civic-type-r') para inspeção no canvas.\n"
-        "5. SAÍDA DIRETA:\n"
+        "5. INTERATIVIDADE MOCKBIRD (OBRIGATÓRIO PARA PROTÓTIPOS FUNCIONAIS):\n"
+        "   - Todo link, botão de ação ou item de menu de navegação entre telas DEVE ter data-go='<NomeDaTela>' ou href='#/<nome>'.\n"
+        "   - Modais e gavetas laterais devem possuir id único e o botão de gatilho deve conter data-overlay='#<id>'. Botões de fechar devem conter data-close.\n"
+        "   - Dados dinâmicos simulados (nomes, valores numéricos, listas) devem conter data-mock='<chave>' ou data-mock-list='<chave>'.\n"
+        "6. SAÍDA DIRETA:\n"
         "   - Raciocine de forma ágil e concisa, e emita diretamente o código HTML completo dentro do bloco ```html ... ```."
     )
+    if project_context:
+        prompt += f"\n{project_context}\n"
+    return prompt
 
 
 def clean_and_extract_html(text: str) -> str:
@@ -402,12 +552,12 @@ def clean_and_extract_html(text: str) -> str:
 async def list_conversations(
     project_id: Optional[str] = None,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     """Lista as conversas de IA criadas exclusivamente pelo usuário atual."""
     query = select(AIConversation).where(
         AIConversation.user_id == current_user.id,
-        AIConversation.organization_id == current_user.organization_id
+        AIConversation.organization_id == current_user.organization_id,
     )
     if project_id:
         query = query.where(AIConversation.project_id == project_id)
@@ -419,15 +569,30 @@ async def list_conversations(
 async def create_conversation(
     payload: ConversationCreate,
     current_user: User = Depends(require_editor),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     """Cria uma nova sessão de conversa para o usuário."""
+    if payload.project_id:
+        proj_res = await db.execute(
+            select(Project)
+            .join(Workspace, Workspace.id == Project.workspace_id)
+            .where(
+                Project.id == payload.project_id,
+                Workspace.organization_id == current_user.organization_id,
+            )
+        )
+        if not proj_res.scalars().first():
+            raise HTTPException(
+                status_code=404,
+                detail="Projeto não encontrado ou acesso não autorizado",
+            )
+
     conv = AIConversation(
         user_id=current_user.id,
         organization_id=current_user.organization_id,
         project_id=payload.project_id,
         screen_id=payload.screen_id,
-        title=payload.title or "Nova Conversa"
+        title=payload.title or "Nova Conversa",
     )
     db.add(conv)
     await db.commit()
@@ -439,13 +604,12 @@ async def create_conversation(
 async def get_conversation_messages(
     conv_id: str,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     """Retorna o histórico de mensagens de uma conversa pertencente ao usuário."""
     res = await db.execute(
         select(AIConversation).where(
-            AIConversation.id == conv_id,
-            AIConversation.user_id == current_user.id
+            AIConversation.id == conv_id, AIConversation.user_id == current_user.id
         )
     )
     conv = res.scalars().first()
@@ -453,7 +617,9 @@ async def get_conversation_messages(
         raise HTTPException(status_code=404, detail="Conversa não encontrada")
 
     msg_res = await db.execute(
-        select(AIMessage).where(AIMessage.conversation_id == conv_id).order_by(AIMessage.created_at.asc())
+        select(AIMessage)
+        .where(AIMessage.conversation_id == conv_id)
+        .order_by(AIMessage.created_at.asc())
     )
     return msg_res.scalars().all()
 
@@ -462,13 +628,12 @@ async def get_conversation_messages(
 async def delete_conversation(
     conv_id: str,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     """Exclui uma conversa do usuário."""
     res = await db.execute(
         select(AIConversation).where(
-            AIConversation.id == conv_id,
-            AIConversation.user_id == current_user.id
+            AIConversation.id == conv_id, AIConversation.user_id == current_user.id
         )
     )
     conv = res.scalars().first()
@@ -484,17 +649,24 @@ async def delete_conversation(
 async def ai_generate_stream(
     payload: AIChatRequest,
     current_user: User = Depends(require_editor),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     """Endpoint Server-Sent Events (SSE) para streaming em tempo real do pensamento e do HTML."""
-    prov = await get_active_provider(db, current_user.organization_id, payload.provider_id)
+    prov = await get_active_provider(
+        db, current_user.organization_id, payload.provider_id
+    )
     await enforce_ai_quota_for(db, current_user, prov)
-    selected_model, raw_base_url, p_type, is_local_or_custom = resolve_endpoint(prov, payload.model_name)
+    selected_model, raw_base_url, p_type, is_local_or_custom = resolve_endpoint(
+        prov, payload.model_name
+    )
 
     validate_ai_endpoint_url(raw_base_url)
     resolved_base_url = resolve_docker_base_url(raw_base_url)
-    system_prompt = build_system_prompt()
-    user_msg = f"Instrução: {payload.prompt}\nHTML Atual da Tela:\n{payload.current_html}"
+    project_ctx = await get_project_mock_context(db, payload.project_id)
+    system_prompt = build_system_prompt(project_ctx)
+    user_msg = (
+        f"Instrução: {payload.prompt}\nHTML Atual da Tela:\n{payload.current_html}"
+    )
 
     headers = {"Content-Type": "application/json"}
     api_key_plain = _get_provider_api_key(prov)
@@ -507,11 +679,11 @@ async def ai_generate_stream(
         "model": selected_model,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_msg}
+            {"role": "user", "content": user_msg},
         ],
         "temperature": 0.5,
         "max_tokens": int(settings.AI_LLM_MAX_TOKENS),
-        "stream": True
+        "stream": True,
     }
     if is_local_endpoint(resolved_base_url) and settings.AI_DISABLE_THINKING:
         req_body["chat_template_kwargs"] = {"enable_thinking": False}
@@ -521,7 +693,14 @@ async def ai_generate_stream(
     user_id_for_usage = current_user.id
     provider_id_for_usage = prov.id if prov else None
     target_mb_id = (payload.target_element or {}).get("mbId")
-    patch_mode = "element" if (payload.target_element and (target_mb_id or payload.target_element.get("outerHtml"))) else "full"
+    patch_mode = (
+        "element"
+        if (
+            payload.target_element
+            and (target_mb_id or payload.target_element.get("outerHtml"))
+        )
+        else "full"
+    )
 
     timeout = httpx.Timeout(
         float(settings.AI_LLM_READ_TIMEOUT),
@@ -539,7 +718,14 @@ async def ai_generate_stream(
         finish = {"reason": None}
         messages = list(req_body["messages"])
 
-        yield sse({"type": "meta", "model": selected_model, "provider": p_type, "endpoint": resolved_base_url})
+        yield sse(
+            {
+                "type": "meta",
+                "model": selected_model,
+                "provider": p_type,
+                "endpoint": resolved_base_url,
+            }
+        )
 
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -556,11 +742,17 @@ async def ai_generate_stream(
                     ) as response:
                         if response.status_code != 200:
                             err_text = await response.aread()
-                            hint = " Verifique a chave/URL/modelo em Configurações → LLM." if response.status_code in (401, 403, 404) else ""
-                            yield sse({
-                                "type": "error",
-                                "detail": f"Provedor '{p_type}' retornou {response.status_code}: {err_text.decode(errors='replace')[:300]}.{hint}",
-                            })
+                            hint = (
+                                " Verifique a chave/URL/modelo em Configurações → LLM."
+                                if response.status_code in (401, 403, 404)
+                                else ""
+                            )
+                            yield sse(
+                                {
+                                    "type": "error",
+                                    "detail": f"Provedor '{p_type}' retornou {response.status_code}: {err_text.decode(errors='replace')[:300]}.{hint}",
+                                }
+                            )
                             return
 
                         async for line in response.aiter_lines():
@@ -575,16 +767,24 @@ async def ai_generate_stream(
                                 delta = choice.get("delta") or {}
                                 if choice.get("finish_reason"):
                                     finish["reason"] = choice["finish_reason"]
-                                reasoning_chunk = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                                reasoning_chunk = (
+                                    delta.get("reasoning_content")
+                                    or delta.get("reasoning")
+                                    or ""
+                                )
                                 content_chunk = delta.get("content") or ""
 
                                 if reasoning_chunk:
                                     accumulated_reasoning.append(reasoning_chunk)
-                                    yield sse({"type": "thinking", "text": reasoning_chunk})
+                                    yield sse(
+                                        {"type": "thinking", "text": reasoning_chunk}
+                                    )
 
                                 if content_chunk:
                                     accumulated_content.append(content_chunk)
-                                    yield sse({"type": "content", "text": content_chunk})
+                                    yield sse(
+                                        {"type": "content", "text": content_chunk}
+                                    )
                             except Exception:
                                 continue
 
@@ -592,7 +792,12 @@ async def ai_generate_stream(
                     if finish["reason"] != "length" or not partial or round_index == 1:
                         break
 
-                    yield sse({"type": "thinking", "text": "\n\nResposta truncada; continuando exatamente do ponto de parada...\n\n"})
+                    yield sse(
+                        {
+                            "type": "thinking",
+                            "text": "\n\nResposta truncada; continuando exatamente do ponto de parada...\n\n",
+                        }
+                    )
                     messages = messages + [
                         {"role": "assistant", "content": partial},
                         {
@@ -616,50 +821,67 @@ async def ai_generate_stream(
                     if finish["reason"] == "length"
                     else "o modelo respondeu sem bloco de código HTML"
                 )
-                yield sse({
-                    "type": "error",
-                    "detail": f"Nenhum HTML foi gerado: {motivo}. Tente um pedido mais específico ou outro modelo.",
-                })
+                yield sse(
+                    {
+                        "type": "error",
+                        "detail": f"Nenhum HTML foi gerado: {motivo}. Tente um pedido mais específico ou outro modelo.",
+                    }
+                )
                 return
 
-            validation = validate_and_repair(raw_html, mode=patch_mode, mb_id=target_mb_id)
-            yield sse({"type": "validation_result", "scope": patch_mode, **validation.to_event()})
+            validation = validate_and_repair(
+                raw_html, mode=patch_mode, mb_id=target_mb_id
+            )
+            yield sse(
+                {
+                    "type": "validation_result",
+                    "scope": patch_mode,
+                    **validation.to_event(),
+                }
+            )
 
             if not validation.ok:
-                yield sse({
-                    "type": "error",
-                    "detail": (
-                        "O HTML gerado não passou na validação: "
-                        + "; ".join(validation.errors[:3])
-                        + ". Nada foi aplicado no canvas."
-                    ),
-                })
+                yield sse(
+                    {
+                        "type": "error",
+                        "detail": (
+                            "O HTML gerado não passou na validação: "
+                            + "; ".join(validation.errors[:3])
+                            + ". Nada foi aplicado no canvas."
+                        ),
+                    }
+                )
                 return
 
             # Registra uso estimado (o stream SSE nem sempre devolve usage)
             await charge_usage(
                 user_id_for_usage,
                 provider_id_for_usage,
-                estimate_tokens(payload.prompt) + estimate_tokens(payload.current_html or ""),
+                estimate_tokens(payload.prompt)
+                + estimate_tokens(payload.current_html or ""),
                 estimate_tokens(validation.html),
             )
 
-            yield sse({
-                "type": "done",
-                "patch": validation.html,
-                "patch_type": patch_mode,
-                "model": selected_model,
-                "validation": validation.to_event(),
-            })
+            yield sse(
+                {
+                    "type": "done",
+                    "patch": validation.html,
+                    "patch_type": patch_mode,
+                    "model": selected_model,
+                    "validation": validation.to_event(),
+                }
+            )
 
         except httpx.TimeoutException:
-            yield sse({
-                "type": "error",
-                "detail": (
-                    f"O provedor não respondeu em {int(settings.AI_LLM_READ_TIMEOUT)}s. "
-                    "Modelos locais podem ser lentos; tente uma seção menor ou outro modelo."
-                ),
-            })
+            yield sse(
+                {
+                    "type": "error",
+                    "detail": (
+                        f"O provedor não respondeu em {int(settings.AI_LLM_READ_TIMEOUT)}s. "
+                        "Modelos locais podem ser lentos; tente uma seção menor ou outro modelo."
+                    ),
+                }
+            )
         except Exception as e:
             logger.exception("chat/stream: falha no stream")
             yield sse({"type": "error", "detail": f"Falha no stream: {str(e)}"})
@@ -671,11 +893,15 @@ async def ai_generate_stream(
 async def ai_generate_or_modify(
     payload: AIChatRequest,
     current_user: User = Depends(require_editor),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    prov = await get_active_provider(db, current_user.organization_id, payload.provider_id)
+    prov = await get_active_provider(
+        db, current_user.organization_id, payload.provider_id
+    )
     await enforce_ai_quota_for(db, current_user, prov)
-    selected_model, raw_base_url, p_type, is_local_or_custom = resolve_endpoint(prov, payload.model_name)
+    selected_model, raw_base_url, p_type, is_local_or_custom = resolve_endpoint(
+        prov, payload.model_name
+    )
 
     api_key_plain = _get_provider_api_key(prov)
     if not prov or (not is_local_or_custom and not api_key_plain):
@@ -689,20 +915,33 @@ async def ai_generate_or_modify(
                 f'  <h3 class="text-xl font-bold text-[var(--color-text)]">{payload.prompt}</h3>\n'
                 '  <p class="text-sm opacity-80 text-[var(--color-text)]">Gerado pelo assistente de IA respeitando as variáveis de Design Tokens do projeto.</p>\n'
                 '  <button class="px-4 py-2 bg-[var(--color-primary)] text-white text-xs font-semibold rounded-lg shadow-sm" data-toast="Ação Executada!">Botão de Ação</button>\n'
-                '</div>'
-            )
+                "</div>"
+            ),
         }
 
     validate_ai_endpoint_url(raw_base_url)
     resolved_base_url = resolve_docker_base_url(raw_base_url)
-    logger.info("AI chat: url=%s modelo=%s prompt=%r", resolved_base_url, selected_model, payload.prompt[:60])
+    logger.info(
+        "AI chat: url=%s modelo=%s prompt=%r",
+        resolved_base_url,
+        selected_model,
+        payload.prompt[:60],
+    )
 
     system_prompt = build_system_prompt()
-    user_msg = f"Instrução: {payload.prompt}\nHTML Atual da Tela:\n{payload.current_html}"
-    chat_mode = "element" if (payload.target_element and payload.target_element.get("mbId")) else "full"
+    user_msg = (
+        f"Instrução: {payload.prompt}\nHTML Atual da Tela:\n{payload.current_html}"
+    )
+    chat_mode = (
+        "element"
+        if (payload.target_element and payload.target_element.get("mbId"))
+        else "full"
+    )
     chat_mb_id = (payload.target_element or {}).get("mbId")
 
-    def _validated_patch(raw_text: str, reasoning: str = "") -> tuple[str, str | None, dict]:
+    def _validated_patch(
+        raw_text: str, reasoning: str = ""
+    ) -> tuple[str, str | None, dict]:
         raw = raw_text or ""
         if not extract_html(raw) and "```" in (reasoning or ""):
             raw = reasoning
@@ -724,7 +963,7 @@ async def ai_generate_or_modify(
                 headers = {
                     "x-api-key": api_key_plain or "dummy",
                     "anthropic-version": "2023-06-01",
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json",
                 }
                 res = await client.post(
                     f"{resolved_base_url.rstrip('/')}/messages",
@@ -733,17 +972,26 @@ async def ai_generate_or_modify(
                         "model": selected_model,
                         "max_tokens": 4096,
                         "system": system_prompt,
-                        "messages": [{"role": "user", "content": user_msg}]
-                    }
+                        "messages": [{"role": "user", "content": user_msg}],
+                    },
                 )
                 if res.status_code == 200:
                     data = res.json()
                     raw_html = data["content"][0]["text"]
                     clean_html, failure, validation_meta = _validated_patch(raw_html)
                     prompt_t, completion_t = extract_usage(data)
-                    await charge_usage(current_user.id, prov.id if prov else None, prompt_t, completion_t)
+                    await charge_usage(
+                        current_user.id,
+                        prov.id if prov else None,
+                        prompt_t,
+                        completion_t,
+                    )
                     if failure:
-                        return {"status": "error", "detail": f"HTML inválido: {failure}", "validation": validation_meta}
+                        return {
+                            "status": "error",
+                            "detail": f"HTML inválido: {failure}",
+                            "validation": validation_meta,
+                        }
                     return {
                         "status": "success",
                         "suggested_patch": clean_html,
@@ -752,7 +1000,10 @@ async def ai_generate_or_modify(
                         "validation": validation_meta,
                     }
                 else:
-                    return {"status": "error", "detail": f"Erro retornado por Anthropic ({res.status_code}): {res.text[:300]}"}
+                    return {
+                        "status": "error",
+                        "detail": f"Erro retornado por Anthropic ({res.status_code}): {res.text[:300]}",
+                    }
             else:
                 headers = {"Content-Type": "application/json"}
                 if api_key_plain:
@@ -764,20 +1015,27 @@ async def ai_generate_or_modify(
                     "model": selected_model,
                     "messages": [
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_msg}
+                        {"role": "user", "content": user_msg},
                     ],
                     "temperature": 0.5,
                     "max_tokens": int(settings.AI_LLM_MAX_TOKENS),
                 }
-                if is_local_endpoint(resolved_base_url) and settings.AI_DISABLE_THINKING:
+                if (
+                    is_local_endpoint(resolved_base_url)
+                    and settings.AI_DISABLE_THINKING
+                ):
                     req_body["chat_template_kwargs"] = {"enable_thinking": False}
 
                 res = await client.post(
                     f"{resolved_base_url.rstrip('/')}/chat/completions",
                     headers=headers,
-                    json=req_body
+                    json=req_body,
                 )
-                logger.info("AI chat: resposta de %s status=%s", resolved_base_url, res.status_code)
+                logger.info(
+                    "AI chat: resposta de %s status=%s",
+                    resolved_base_url,
+                    res.status_code,
+                )
 
                 if res.status_code == 200:
                     data = res.json()
@@ -785,12 +1043,27 @@ async def ai_generate_or_modify(
                     raw_content = (msg.get("content") or "").strip()
                     reasoning = (msg.get("reasoning_content") or "").strip()
 
-                    clean_html, failure, validation_meta = _validated_patch(raw_content, reasoning)
+                    clean_html, failure, validation_meta = _validated_patch(
+                        raw_content, reasoning
+                    )
                     prompt_t, completion_t = extract_usage(data)
-                    await charge_usage(current_user.id, prov.id if prov else None, prompt_t, completion_t)
-                    logger.info("AI chat: HTML validado (%s chars) modelo=%s", len(clean_html), selected_model)
+                    await charge_usage(
+                        current_user.id,
+                        prov.id if prov else None,
+                        prompt_t,
+                        completion_t,
+                    )
+                    logger.info(
+                        "AI chat: HTML validado (%s chars) modelo=%s",
+                        len(clean_html),
+                        selected_model,
+                    )
                     if failure:
-                        return {"status": "error", "detail": f"HTML inválido: {failure}", "validation": validation_meta}
+                        return {
+                            "status": "error",
+                            "detail": f"HTML inválido: {failure}",
+                            "validation": validation_meta,
+                        }
                     return {
                         "status": "success",
                         "suggested_patch": clean_html,
@@ -811,16 +1084,25 @@ async def ai_generate_or_modify(
 def audit_html_design_defects(html: str, prompt: str) -> List[str]:
     defects = []
     lower_html = (html or "").lower()
-    
+
     # 1. Imagens reais e de alta resolução
     if "unsplash.com" not in lower_html and "<img" not in lower_html:
-        defects.append("Layout sem fotografias reais em alta resolução (visual vazio ou com placeholders genéricos)")
+        defects.append(
+            "Layout sem fotografias reais em alta resolução (visual vazio ou com placeholders genéricos)"
+        )
     elif "unsplash.com" not in lower_html:
-        defects.append("Imagens sem acabamento fotográfico profissional ou parâmetros de resolução adequados")
+        defects.append(
+            "Imagens sem acabamento fotográfico profissional ou parâmetros de resolução adequados"
+        )
 
     # 2. Seções fundamentais da página
     has_nav = "<nav" in lower_html or "navbar" in lower_html or "header" in lower_html
-    has_hero = "hero" in lower_html or "text-4xl" in lower_html or "text-5xl" in lower_html or "text-6xl" in lower_html
+    has_hero = (
+        "hero" in lower_html
+        or "text-4xl" in lower_html
+        or "text-5xl" in lower_html
+        or "text-6xl" in lower_html
+    )
     has_grid = "grid" in lower_html or "flex-wrap" in lower_html or "card" in lower_html
     has_footer = "footer" in lower_html
 
@@ -828,7 +1110,9 @@ def audit_html_design_defects(html: str, prompt: str) -> List[str]:
     if not has_nav:
         missing.append("Navbar com marca, links e botão de contato")
     if not has_hero:
-        missing.append("Hero Section monumental com badge translúcido e chamada de ação")
+        missing.append(
+            "Hero Section monumental com badge translúcido e chamada de ação"
+        )
     if not has_grid:
         missing.append("Grade de modelos ou catálogo com cards estilizados")
     if not has_footer:
@@ -838,20 +1122,50 @@ def audit_html_design_defects(html: str, prompt: str) -> List[str]:
         defects.append(f"Seções anatômicas essenciais ausentes: {', '.join(missing)}")
 
     # 3. Contexto específico (ex: automotivo / carros)
-    if any(k in prompt.lower() for k in ["carro", "honda", "veículo", "automóvel", "auto", "moto"]):
-        if not any(k in lower_html for k in ["cv", "hp", "km/h", "0-100", "turbo", "híbrido", "torque", "r$", "preço", "civic", "hr-v"]):
-            defects.append("Falta de dados técnicos automotivos reais (potência em cv, aceleração 0-100 km/h, motorização híbrida/turbo e faixas de valor)")
+    if any(
+        k in prompt.lower()
+        for k in ["carro", "honda", "veículo", "automóvel", "auto", "moto"]
+    ):
+        if not any(
+            k in lower_html
+            for k in [
+                "cv",
+                "hp",
+                "km/h",
+                "0-100",
+                "turbo",
+                "híbrido",
+                "torque",
+                "r$",
+                "preço",
+                "civic",
+                "hr-v",
+            ]
+        ):
+            defects.append(
+                "Falta de dados técnicos automotivos reais (potência em cv, aceleração 0-100 km/h, motorização híbrida/turbo e faixas de valor)"
+            )
 
     # 4. Acabamento visual moderno (bordas sutis, glassmorphism e dark mode neutro)
-    if "backdrop-blur" not in lower_html and "bg-white/" not in lower_html and "border-white/" not in lower_html:
-        defects.append("Falta de acabamento moderno em glassmorphism (backdrop-blur-md) e bordas finas sutis (border-white/10)")
+    if (
+        "backdrop-blur" not in lower_html
+        and "bg-white/" not in lower_html
+        and "border-white/" not in lower_html
+    ):
+        defects.append(
+            "Falta de acabamento moderno em glassmorphism (backdrop-blur-md) e bordas finas sutis (border-white/10)"
+        )
 
     # 5. data-mb-id para direct manipulation
     if "data-mb-id" not in lower_html:
-        defects.append("Ausência de atributos data-mb-id nos elementos para inspeção no canvas")
+        defects.append(
+            "Ausência de atributos data-mb-id nos elementos para inspeção no canvas"
+        )
 
     if not defects:
-        defects.append("Ajuste de ritmo vertical, proporções de tipografia e refinamento de botões de conversão primários")
+        defects.append(
+            "Ajuste de ritmo vertical, proporções de tipografia e refinamento de botões de conversão primários"
+        )
 
     return defects
 
@@ -860,14 +1174,18 @@ def audit_html_design_defects(html: str, prompt: str) -> List[str]:
 async def ai_vision_critique(
     payload: AIVisionCritiqueRequest,
     current_user: User = Depends(require_editor),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     """Loop de Auto-Validação Visual (Vision Self-Correction Loop):
     Analisa o screenshot do canvas e o HTML atual, identifica defeitos estéticos
     e reescreve o código HTML com acabamento de alto nível."""
-    prov = await get_active_provider(db, current_user.organization_id, payload.provider_id)
+    prov = await get_active_provider(
+        db, current_user.organization_id, payload.provider_id
+    )
     await enforce_ai_quota_for(db, current_user, prov)
-    selected_model, raw_base_url, p_type, is_local_or_custom = resolve_endpoint(prov, payload.model_name)
+    selected_model, raw_base_url, p_type, is_local_or_custom = resolve_endpoint(
+        prov, payload.model_name
+    )
 
     validate_ai_endpoint_url(raw_base_url)
     resolved_base_url = resolve_docker_base_url(raw_base_url)
@@ -881,14 +1199,14 @@ async def ai_vision_critique(
     has_valid_image = bool(clean_b64 and len(clean_b64) > 100)
 
     # Decide se o modelo é multimodal nativo
-    supports_native_vision = (
-        not is_local_or_custom and
-        any(v in selected_model.lower() for v in ["gpt-4o", "claude-3", "gemini", "vision", "vl"])
+    supports_native_vision = not is_local_or_custom and any(
+        v in selected_model.lower()
+        for v in ["gpt-4o", "claude-3", "gemini", "vision", "vl"]
     )
 
     critique_intro = (
         f"Auditoria Visual Mockbird v2:\n"
-        f"Com base na análise da tela atual para \"{payload.prompt}\", foram detectados e sanados os seguintes pontos:\n"
+        f'Com base na análise da tela atual para "{payload.prompt}", foram detectados e sanados os seguintes pontos:\n'
         f"{defects_list_text}"
     )
 
@@ -898,14 +1216,17 @@ async def ai_vision_critique(
         meta = report.to_event()
         if not report.ok:
             meta["fallback_to_current"] = True
-            logger.warning("Vision critique: HTML refinado reprovado (%s)", "; ".join(report.errors[:2]))
+            logger.warning(
+                "Vision critique: HTML refinado reprovado (%s)",
+                "; ".join(report.errors[:2]),
+            )
             return payload.current_html, meta
         return report.html, meta
 
     system_prompt = build_system_prompt()
     user_instruction = (
         f"DIRETRIZ DE AUTO-CORREÇÃO VISUAL:\n"
-        f"Objetivo do usuário: \"{payload.prompt}\"\n\n"
+        f'Objetivo do usuário: "{payload.prompt}"\n\n'
         f"DEFEITOS ESTÉTICOS E ESTRUTURAIS DETECTADOS NA TELA ATUAL:\n"
         f"{defects_list_text}\n\n"
         f"HTML Atual Analisado:\n{payload.current_html}\n\n"
@@ -919,7 +1240,12 @@ async def ai_vision_critique(
     )
 
     timeout_val = float(settings.AI_LLM_READ_TIMEOUT)
-    logger.info("Vision critique: modelo=%s endpoint=%s timeout=%s", selected_model, resolved_base_url, timeout_val)
+    logger.info(
+        "Vision critique: modelo=%s endpoint=%s timeout=%s",
+        selected_model,
+        resolved_base_url,
+        timeout_val,
+    )
 
     try:
         async with httpx.AsyncClient(timeout=timeout_val) as client:
@@ -929,7 +1255,7 @@ async def ai_vision_critique(
                 headers = {
                     "x-api-key": api_key_plain or "dummy",
                     "anthropic-version": "2023-06-01",
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json",
                 }
                 res = await client.post(
                     f"{resolved_base_url.rstrip('/')}/messages",
@@ -947,25 +1273,29 @@ async def ai_vision_critique(
                                         "source": {
                                             "type": "base64",
                                             "media_type": "image/png",
-                                            "data": clean_b64
-                                        }
+                                            "data": clean_b64,
+                                        },
                                     },
-                                    {
-                                        "type": "text",
-                                        "text": user_instruction
-                                    }
-                                ]
+                                    {"type": "text", "text": user_instruction},
+                                ],
                             }
-                        ]
-                    }
+                        ],
+                    },
                 )
                 if res.status_code == 200:
                     data = res.json()
                     raw_text = data["content"][0]["text"]
                     clean_html, validation_meta = _refine(raw_text)
-                    logger.info("Vision critique (Anthropic): %s chars", len(clean_html))
+                    logger.info(
+                        "Vision critique (Anthropic): %s chars", len(clean_html)
+                    )
                     prompt_t, completion_t = extract_usage(data)
-                    await charge_usage(current_user.id, prov.id if prov else None, prompt_t, completion_t)
+                    await charge_usage(
+                        current_user.id,
+                        prov.id if prov else None,
+                        prompt_t,
+                        completion_t,
+                    )
                     return {
                         "status": "success",
                         "vision_critique": critique_intro,
@@ -991,17 +1321,22 @@ async def ai_vision_critique(
                             "role": "user",
                             "content": [
                                 {"type": "text", "text": user_instruction},
-                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{clean_b64}"}}
-                            ]
-                        }
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/png;base64,{clean_b64}"
+                                    },
+                                },
+                            ],
+                        },
                     ],
                     "temperature": 0.4,
-                    "max_tokens": 4096
+                    "max_tokens": 4096,
                 }
                 res = await client.post(
                     f"{resolved_base_url.rstrip('/')}/chat/completions",
                     headers=headers,
-                    json=req_body
+                    json=req_body,
                 )
                 if res.status_code == 200:
                     data = res.json()
@@ -1009,11 +1344,19 @@ async def ai_vision_critique(
                     raw_content = (msg.get("content") or "").strip()
                     reasoning = (msg.get("reasoning_content") or "").strip()
                     clean_html, validation_meta = _refine(
-                        extract_html(raw_content) or (extract_html(reasoning) if "```" in reasoning else "")
+                        extract_html(raw_content)
+                        or (extract_html(reasoning) if "```" in reasoning else "")
                     )
-                    logger.info("Vision critique (multimodal): %s chars", len(clean_html))
+                    logger.info(
+                        "Vision critique (multimodal): %s chars", len(clean_html)
+                    )
                     prompt_t, completion_t = extract_usage(data)
-                    await charge_usage(current_user.id, prov.id if prov else None, prompt_t, completion_t)
+                    await charge_usage(
+                        current_user.id,
+                        prov.id if prov else None,
+                        prompt_t,
+                        completion_t,
+                    )
                     return {
                         "status": "success",
                         "vision_critique": critique_intro,
@@ -1034,7 +1377,7 @@ async def ai_vision_critique(
                 "model": selected_model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_instruction}
+                    {"role": "user", "content": user_instruction},
                 ],
                 "temperature": 0.4,
                 "max_tokens": int(settings.AI_VISION_MAX_TOKENS),
@@ -1044,20 +1387,27 @@ async def ai_vision_critique(
             res = await client.post(
                 f"{resolved_base_url.rstrip('/')}/chat/completions",
                 headers=headers,
-                json=req_body
+                json=req_body,
             )
-            logger.info("Vision critique: resposta de %s status=%s", resolved_base_url, res.status_code)
+            logger.info(
+                "Vision critique: resposta de %s status=%s",
+                resolved_base_url,
+                res.status_code,
+            )
             if res.status_code == 200:
                 data = res.json()
                 msg = data["choices"][0]["message"]
                 raw_content = (msg.get("content") or "").strip()
                 reasoning = (msg.get("reasoning_content") or "").strip()
                 clean_html, validation_meta = _refine(
-                    extract_html(raw_content) or (extract_html(reasoning) if "```" in reasoning else "")
+                    extract_html(raw_content)
+                    or (extract_html(reasoning) if "```" in reasoning else "")
                 )
                 logger.info("Vision critique: %s chars de HTML gerado", len(clean_html))
                 prompt_t, completion_t = extract_usage(data)
-                await charge_usage(current_user.id, prov.id if prov else None, prompt_t, completion_t)
+                await charge_usage(
+                    current_user.id, prov.id if prov else None, prompt_t, completion_t
+                )
                 return {
                     "status": "success",
                     "vision_critique": critique_intro,
@@ -1069,11 +1419,14 @@ async def ai_vision_critique(
             else:
                 return {
                     "status": "error",
-                    "detail": f"Servidor retornou status {res.status_code}: {res.text[:300]}"
+                    "detail": f"Servidor retornou status {res.status_code}: {res.text[:300]}",
                 }
 
     except Exception as e:
-        logger.warning("Vision critique: falha na conexão com LLM (%s), aplicando fallback heurístico", e)
+        logger.warning(
+            "Vision critique: falha na conexão com LLM (%s), aplicando fallback heurístico",
+            e,
+        )
         return {
             "status": "success",
             "vision_critique": critique_intro,
@@ -1089,7 +1442,7 @@ async def ai_vision_critique(
 async def ai_agent_graph_stream(
     payload: AIChatRequest,
     current_user: User = Depends(require_editor),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     """Executa o Grafo de Estados (LangGraph) do Agente Autônomo do Mockbird v2 e streama eventos em tempo real."""
     # 1. Resolução Segura de Tela (carrega o HTML oficial diretamente do banco se screen_id informado)
@@ -1098,10 +1451,29 @@ async def ai_agent_graph_stream(
         screen = await authorize_screen(payload.screen_id, current_user, "edit", db)
         active_html = screen.html_content
 
+    if payload.project_id:
+        proj_res = await db.execute(
+            select(Project)
+            .join(Workspace, Workspace.id == Project.workspace_id)
+            .where(
+                Project.id == payload.project_id,
+                Workspace.organization_id == current_user.organization_id,
+            )
+        )
+        if not proj_res.scalars().first():
+            raise HTTPException(
+                status_code=404,
+                detail="Projeto não encontrado ou acesso não autorizado",
+            )
+
     # 2. Provedor, cota e endpoint (resolução única)
-    prov = await get_active_provider(db, current_user.organization_id, payload.provider_id)
+    prov = await get_active_provider(
+        db, current_user.organization_id, payload.provider_id
+    )
     await enforce_ai_quota_for(db, current_user, prov)
-    selected_model, raw_base_url, p_type, _is_local = resolve_endpoint(prov, payload.model_name)
+    selected_model, raw_base_url, p_type, _is_local = resolve_endpoint(
+        prov, payload.model_name
+    )
 
     # Validação rigorosa anti-SSRF
     validate_ai_endpoint_url(raw_base_url)
@@ -1121,11 +1493,15 @@ async def ai_agent_graph_stream(
         except Exception as e:
             logger.warning("AI agent: erro ao interpretar target_element: %s", e)
 
+    project_ctx = await get_project_mock_context(db, payload.project_id)
     state = AgentState(
         prompt=payload.prompt,
         current_html=active_html,
         target_element=target_info,
-        model_name=selected_model
+        model_name=selected_model,
+        project_id=payload.project_id,
+        screen_id=payload.screen_id,
+        project_context=project_ctx,
     )
     graph = MockbirdAgentGraph(
         base_url=resolved_base_url,
@@ -1155,49 +1531,92 @@ async def ai_agent_graph_stream(
             logger.exception("AI agent: falha no grafo")
             yield f"data: {json.dumps({'type': 'error', 'detail': f'Falha no grafo do agente: {error_msg}'}, ensure_ascii=False)}\n\n"
 
-        # Contabilização de tokens e histórico após streaming
-        tokens_consumed = estimate_tokens(payload.prompt) + (estimate_tokens(done_ev.get("patch", "")) if done_ev else 0)
-        await charge_usage(current_user.id, prov.id if prov else None, estimate_tokens(payload.prompt), tokens_consumed)
-        if payload.conversation_id:
-            user_msg = AIMessage(
-                conversation_id=payload.conversation_id,
-                role="user",
-                content=payload.prompt,
-                tokens_used=len(payload.prompt) // 4
-            )
-            bot_msg = AIMessage(
-                conversation_id=payload.conversation_id,
-                role="assistant",
-                content=done_ev.get("summary", "") if done_ev else "Concluído",
-                patch=done_ev.get("patch") if done_ev else None,
-                patch_type=done_ev.get("patch_type", "none") if done_ev else "none",
-                tokens_used=tokens_consumed
-            )
-            db.add(user_msg)
-            db.add(bot_msg)
-
-        # Registro de Telemetria e Diagnóstico da IA
-        duration_ms = int((utcnow() - start_time).total_seconds() * 1000)
-        conversed = bool(done_ev and (done_ev.get("patch") or done_ev.get("patch_type") in ("none", None)))
-        log_status = "success" if (conversed and not error_msg) else ("error" if error_msg else "incomplete")
-        raw_snippet = (done_ev.get("summary", "") if done_ev else (error_msg or ""))[:500]
-        if validation_meta and validation_meta.get("errors"):
-            raw_snippet = (raw_snippet + " | validação: " + "; ".join(validation_meta["errors"][:2]))[:500]
-        gen_log = AIGenerationLog(
-            user_id=current_user.id,
-            screen_id=payload.screen_id,
-            model_name=selected_model,
-            prompt=payload.prompt,
-            status=log_status,
-            tokens_prompt=estimate_tokens(payload.prompt),
-            tokens_completion=tokens_consumed,
-            duration_ms=duration_ms,
-            finish_reason="stop" if log_status == "success" else ("error" if error_msg else "incomplete"),
-            raw_snippet=raw_snippet,
-            error_message=error_msg
+        # Contabilização de tokens e histórico após streaming usando sessão assíncrona dedicada
+        tokens_consumed = estimate_tokens(payload.prompt) + (
+            estimate_tokens(done_ev.get("patch", "")) if done_ev else 0
         )
-        db.add(gen_log)
-        await db.commit()
+        await charge_usage(
+            current_user.id,
+            prov.id if prov else None,
+            estimate_tokens(payload.prompt),
+            tokens_consumed,
+        )
+
+        try:
+            async with AsyncSessionLocal() as session:
+                if payload.conversation_id:
+                    conv_res = await session.execute(
+                        select(AIConversation).where(
+                            AIConversation.id == payload.conversation_id,
+                            AIConversation.user_id == current_user.id,
+                        )
+                    )
+                    if conv_res.scalars().first():
+                        user_msg = AIMessage(
+                            conversation_id=payload.conversation_id,
+                            role="user",
+                            content=payload.prompt,
+                            tokens_used=len(payload.prompt) // 4,
+                        )
+                        bot_msg = AIMessage(
+                            conversation_id=payload.conversation_id,
+                            role="assistant",
+                            content=(
+                                done_ev.get("summary", "") if done_ev else "Concluído"
+                            ),
+                            patch=done_ev.get("patch") if done_ev else None,
+                            patch_type=(
+                                done_ev.get("patch_type", "none") if done_ev else "none"
+                            ),
+                            tokens_used=tokens_consumed,
+                        )
+                        session.add(user_msg)
+                        session.add(bot_msg)
+
+                # Registro de Telemetria e Diagnóstico da IA
+                duration_ms = int((utcnow() - start_time).total_seconds() * 1000)
+                conversed = bool(
+                    done_ev
+                    and (
+                        done_ev.get("patch")
+                        or done_ev.get("patch_type") in ("none", None)
+                    )
+                )
+                log_status = (
+                    "success"
+                    if (conversed and not error_msg)
+                    else ("error" if error_msg else "incomplete")
+                )
+                raw_snippet = (
+                    done_ev.get("summary", "") if done_ev else (error_msg or "")
+                )[:500]
+                if validation_meta and validation_meta.get("errors"):
+                    raw_snippet = (
+                        raw_snippet
+                        + " | validação: "
+                        + "; ".join(validation_meta["errors"][:2])
+                    )[:500]
+                gen_log = AIGenerationLog(
+                    user_id=current_user.id,
+                    screen_id=payload.screen_id,
+                    model_name=selected_model,
+                    prompt=payload.prompt,
+                    status=log_status,
+                    tokens_prompt=estimate_tokens(payload.prompt),
+                    tokens_completion=tokens_consumed,
+                    duration_ms=duration_ms,
+                    finish_reason=(
+                        "stop"
+                        if log_status == "success"
+                        else ("error" if error_msg else "incomplete")
+                    ),
+                    raw_snippet=raw_snippet,
+                    error_message=error_msg,
+                )
+                session.add(gen_log)
+                await session.commit()
+        except Exception:
+            logger.exception("AI agent: falha ao persistir mensagens e telemetria")
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -1207,17 +1626,23 @@ async def list_ai_generation_logs(
     limit: int = 20,
     offset: int = 0,
     current_user: User = Depends(require_editor),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     """Consulta a telemetria de IA **restrita ao tenant** (e ao próprio usuário,
     exceto para owner/admin da organização)."""
-    stmt = select(AIGenerationLog).join(User, User.id == AIGenerationLog.user_id).where(
-        User.organization_id == current_user.organization_id
+    stmt = (
+        select(AIGenerationLog)
+        .join(User, User.id == AIGenerationLog.user_id)
+        .where(User.organization_id == current_user.organization_id)
     )
     if current_user.role not in ["owner", "admin"]:
         stmt = stmt.where(AIGenerationLog.user_id == current_user.id)
 
-    stmt = stmt.order_by(AIGenerationLog.created_at.desc()).offset(max(0, offset)).limit(min(max(1, limit), 50))
+    stmt = (
+        stmt.order_by(AIGenerationLog.created_at.desc())
+        .offset(max(0, offset))
+        .limit(min(max(1, limit), 50))
+    )
     res = await db.execute(stmt)
     logs = res.scalars().all()
     return [
@@ -1231,8 +1656,7 @@ async def list_ai_generation_logs(
             "tokens_completion": log.tokens_completion,
             "finish_reason": log.finish_reason,
             "raw_snippet": log.raw_snippet,
-            "error_message": log.error_message
+            "error_message": log.error_message,
         }
         for log in logs
     ]
-

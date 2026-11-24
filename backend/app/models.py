@@ -65,6 +65,7 @@ class User(Base):
     email_verified_at = Column(DateTime, nullable=True)
     monthly_token_limit = Column(BigInteger, default=200000, nullable=False)
     tokens_used_month = Column(BigInteger, default=0, nullable=False)
+    usage_period = Column(String(7), nullable=True)  # ex: '2026-11'
     created_at = Column(DateTime, default=utcnow, nullable=False)
 
     organization = relationship("Organization", back_populates="users")
@@ -413,6 +414,7 @@ class AIProvider(Base):
     is_active = Column(Boolean, default=True, nullable=False)
     monthly_token_limit = Column(BigInteger, default=1000000, nullable=False)
     tokens_used_month = Column(BigInteger, default=0, nullable=False)
+    usage_period = Column(String(7), nullable=True)  # ex: '2026-11'
     created_at = Column(DateTime, default=utcnow, nullable=False)
 
     organization = relationship("Organization", back_populates="ai_providers")
@@ -506,7 +508,7 @@ class EmailSettings(Base):
 
     __tablename__ = "email_settings"
 
-    id = Column(String(36), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=lambda: "singleton")
     provider = Column(String(20), default="disabled", nullable=False)  # disabled, smtp, resend
     from_email = Column(String(255), default="", nullable=False)
     from_name = Column(String(120), default="Mockbird", nullable=False)

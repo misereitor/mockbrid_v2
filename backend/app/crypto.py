@@ -58,6 +58,10 @@ def decrypt_secret(cipher_text: Optional[str]) -> str:
         except (InvalidToken, Exception):
             pass
 
-    # 3. Fallback se for legado em plain-text
+        # Se for um token Fernet (começa com gAAAAA) e falhou em ambas as chaves,
+        # nunca expor o ciphertext bruto como chave de API
+        return ""
+
+    # 3. Fallback se for legado em plain-text (não criptografado)
     return text
 

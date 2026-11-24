@@ -4,6 +4,7 @@ from sqlalchemy.future import select
 from pydantic import BaseModel, EmailStr
 from typing import List, Optional
 from datetime import datetime, timedelta
+import hashlib
 import secrets
 
 import logging
@@ -92,6 +93,9 @@ async def invite_member(
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
+    if payload.role not in ["admin", "editor", "viewer"]:
+        raise HTTPException(status_code=400, detail="Papel de convite inválido. Permitidos: admin, editor, viewer")
+
     existing = await db.execute(select(User).where(User.email == payload.email))
     if existing.scalars().first():
         raise HTTPException(status_code=400, detail="Usuário com este e-mail já existe")
@@ -111,12 +115,13 @@ async def invite_member(
     db.add(new_user)
     await db.flush()
 
-    invite_token = secrets.token_urlsafe(32)
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
     invite = OrganizationInvite(
         organization_id=current_user.organization_id,
         email=payload.email,
         role=payload.role,
-        token=invite_token,
+        token=token_hash,
         expires_at=utcnow() + timedelta(hours=48)
     )
     db.add(invite)
@@ -124,8 +129,8 @@ async def invite_member(
     await db.refresh(new_user)
 
     out = MemberOut.model_validate(new_user)
-    out.invite_token = invite_token
-    out.invite_url = f"/accept-invite?token={invite_token}"
+    out.invite_token = raw_token
+    out.invite_url = f"/accept-invite?token={raw_token}"
     out.email_sent = False
 
     # Envio best-effort: se o e-mail falhar, o admin ainda recebe o link.
@@ -139,7 +144,7 @@ async def invite_member(
                 inviter_name=current_user.name,
                 organization_name=org.name if org else "sua organização",
                 role=payload.role,
-                url=build_link(email_settings, f"/accept-invite?token={invite_token}"),
+                url=build_link(email_settings, f"/accept-invite?token={raw_token}"),
             )
             out.email_sent = True
     except (EmailNotConfigured, EmailDeliveryError) as exc:
@@ -155,9 +160,10 @@ async def accept_invite(
     payload: AcceptInviteRequest,
     db: AsyncSession = Depends(get_db)
 ):
+    token_hash = hashlib.sha256(payload.token.strip().encode("utf-8")).hexdigest()
     res = await db.execute(
         select(OrganizationInvite).where(
-            OrganizationInvite.token == payload.token,
+            OrganizationInvite.token == token_hash,
             OrganizationInvite.used_at.is_(None)
         )
     )
@@ -202,7 +208,7 @@ async def list_workspaces(
 @router.post("/workspaces", response_model=WorkspaceOut)
 async def create_workspace(
     payload: WorkspaceCreate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
     ws_slug = payload.name.lower().replace(" ", "-") + f"-{secrets.token_hex(2)}"
