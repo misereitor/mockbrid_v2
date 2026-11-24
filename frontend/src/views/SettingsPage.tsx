@@ -20,16 +20,26 @@ import {
   FileCode,
   Database,
   Wrench,
-  FolderKanban
+  FolderKanban,
+  Edit2,
+  Folder
 } from 'lucide-react';
 import { EmailSettingsPanel } from '../components/EmailSettingsPanel';
 import { withBasePath } from '../lib/basePath';
+
+interface MCPKeyProject {
+  id: string;
+  name: string;
+}
 
 interface MCPKey {
   id: string;
   name: string;
   prefix: string;
   project_id: string | null;
+  project_ids?: string[];
+  projects?: MCPKeyProject[];
+  project_name?: string | null;
   scopes: string[];
   last_used_at: string | null;
   expires_at: string | null;
@@ -98,19 +108,45 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
   // MCP State
   const [mcpKeys, setMcpKeys] = useState<MCPKey[]>([]);
   const [loadingMcpKeys, setLoadingMcpKeys] = useState(false);
+  const [availableProjects, setAvailableProjects] = useState<{ id: string; name: string }[]>([]);
   const [showCreateMcpKey, setShowCreateMcpKey] = useState(false);
   const [newKeyName, setNewKeyName] = useState('');
-  const [newKeyScopes, setNewKeyScopes] = useState<string[]>(['project:read', 'screen:write', 'export:read']);
+  const [newKeyProjectMode, setNewKeyProjectMode] = useState<'global' | 'restricted'>('restricted');
+  const [newKeySelectedProjects, setNewKeySelectedProjects] = useState<string[]>([]);
+  const [newKeyScopes, setNewKeyScopes] = useState<string[]>([
+    'project:read',
+    'screen:write',
+    'export:read',
+  ]);
   const [createdKey, setCreatedKey] = useState<MCPKey | null>(null);
   const [generatingKey, setGeneratingKey] = useState(false);
+
+  // Estado para Edição de Chave Existente
+  const [editingKey, setEditingKey] = useState<MCPKey | null>(null);
+  const [editKeyName, setEditKeyName] = useState('');
+  const [editKeyProjectMode, setEditKeyProjectMode] = useState<'global' | 'restricted'>('global');
+  const [editKeySelectedProjects, setEditKeySelectedProjects] = useState<string[]>([]);
+  const [editKeyScopes, setEditKeyScopes] = useState<string[]>([]);
+  const [savingEditKey, setSavingEditKey] = useState(false);
 
   const loadMcpKeys = async () => {
     setLoadingMcpKeys(true);
     try {
-      const res = await fetch('/api/mcp/keys');
-      if (res.ok) setMcpKeys(await res.json());
+      const [resKeys, resProjects] = await Promise.all([
+        fetch('/api/mcp/keys'),
+        fetch('/api/projects'),
+      ]);
+      if (resKeys.ok) setMcpKeys(await resKeys.json());
+      if (resProjects.ok) {
+        const projs = await resProjects.json();
+        const pList = projs.map((p: any) => ({ id: p.id, name: p.name }));
+        setAvailableProjects(pList);
+        if (pList.length > 0 && newKeySelectedProjects.length === 0) {
+          setNewKeySelectedProjects([pList[0].id]);
+        }
+      }
     } catch (err) {
-      console.error('Erro ao ler chaves MCP:', err);
+      console.error('Erro ao ler chaves MCP e projetos:', err);
     } finally {
       setLoadingMcpKeys(false);
     }
@@ -123,6 +159,10 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
   const handleCreateMcpKey = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newKeyName.trim() || generatingKey) return;
+    if (newKeyProjectMode === 'restricted' && newKeySelectedProjects.length === 0) {
+      alert('Selecione ao menos um projeto para associar a esta chave, ou mude para o modo Global.');
+      return;
+    }
     setGeneratingKey(true);
     try {
       const res = await fetch('/api/mcp/keys', {
@@ -130,6 +170,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: newKeyName.trim(),
+          project_ids: newKeyProjectMode === 'global' ? [] : newKeySelectedProjects,
           scopes: newKeyScopes,
         }),
       });
@@ -146,6 +187,57 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
       alert(err.message || 'Erro ao criar chave MCP');
     } finally {
       setGeneratingKey(false);
+    }
+  };
+
+  const handleOpenEditKey = (key: MCPKey) => {
+    setEditingKey(key);
+    setEditKeyName(key.name);
+    setEditKeyScopes(key.scopes || ['project:read', 'screen:write', 'export:read']);
+    const pids =
+      key.project_ids && key.project_ids.length > 0
+        ? key.project_ids
+        : key.project_id
+        ? [key.project_id]
+        : [];
+    if (pids.length > 0) {
+      setEditKeyProjectMode('restricted');
+      setEditKeySelectedProjects(pids);
+    } else {
+      setEditKeyProjectMode('global');
+      setEditKeySelectedProjects([]);
+    }
+  };
+
+  const handleSaveEditKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingKey || savingEditKey) return;
+    if (editKeyProjectMode === 'restricted' && editKeySelectedProjects.length === 0) {
+      alert('Selecione ao menos um projeto para associar a esta chave, ou mude para o modo Global.');
+      return;
+    }
+    setSavingEditKey(true);
+    try {
+      const res = await fetch(`/api/mcp/keys/${editingKey.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: editKeyName.trim(),
+          project_ids: editKeyProjectMode === 'global' ? [] : editKeySelectedProjects,
+          scopes: editKeyScopes,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Falha ao atualizar chave MCP');
+      }
+      const updated = await res.json();
+      setMcpKeys((prev) => prev.map((k) => (k.id === updated.id ? updated : k)));
+      setEditingKey(null);
+    } catch (err: any) {
+      alert(err.message || 'Erro ao editar chave MCP');
+    } finally {
+      setSavingEditKey(false);
     }
   };
 
@@ -773,6 +865,81 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
                   />
                 </div>
 
+                {/* Seleção de Permissão por Projeto */}
+                <div className="space-y-2">
+                  <label className="text-xs text-slate-300 font-medium">Permissão em Projetos</label>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setNewKeyProjectMode('restricted')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
+                        newKeyProjectMode === 'restricted'
+                          ? 'bg-purple-600 text-white'
+                          : 'bg-mockbird-bg text-slate-400 border border-mockbird-border hover:text-white'
+                      }`}
+                    >
+                      <Folder size={13} />
+                      <span>Projetos Específicos</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setNewKeyProjectMode('global')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
+                        newKeyProjectMode === 'global'
+                          ? 'bg-sky-600 text-white'
+                          : 'bg-mockbird-bg text-slate-400 border border-mockbird-border hover:text-white'
+                      }`}
+                    >
+                      <Globe size={13} />
+                      <span>Global (Todos os Projetos)</span>
+                    </button>
+                  </div>
+
+                  {newKeyProjectMode === 'restricted' && (
+                    <div className="bg-mockbird-bg border border-mockbird-border p-3 rounded-lg space-y-2">
+                      <span className="text-[11px] text-slate-400 block">
+                        Selecione quais projetos esta chave MCP terá permissão para acessar:
+                      </span>
+                      {availableProjects.length === 0 ? (
+                        <span className="text-xs text-slate-500 italic">Nenhum projeto encontrado.</span>
+                      ) : (
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-48 overflow-y-auto pr-1">
+                          {availableProjects.map((proj) => {
+                            const isSel = newKeySelectedProjects.includes(proj.id);
+                            return (
+                              <label
+                                key={proj.id}
+                                className={`flex items-center gap-2 p-2 rounded border cursor-pointer text-xs transition ${
+                                  isSel
+                                    ? 'bg-purple-500/15 border-purple-500/40 text-purple-200'
+                                    : 'bg-mockbird-surface border-mockbird-border text-slate-400 hover:text-white'
+                                }`}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={isSel}
+                                  onChange={(e) => {
+                                    if (e.target.checked) {
+                                      setNewKeySelectedProjects([...newKeySelectedProjects, proj.id]);
+                                    } else {
+                                      setNewKeySelectedProjects(
+                                        newKeySelectedProjects.filter((id) => id !== proj.id)
+                                      );
+                                    }
+                                  }}
+                                  className="accent-purple-500"
+                                />
+                                <Folder size={12} className={isSel ? 'text-purple-400' : 'text-slate-500'} />
+                                <span className="truncate">{proj.name}</span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
                 <div className="space-y-2">
                   <label className="text-xs text-slate-300 font-medium">Permissões e Escopos</label>
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
@@ -830,6 +997,157 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
               </form>
             )}
 
+            {/* Formulário de Edição de Chave MCP Existente */}
+            {editingKey && (
+              <form onSubmit={handleSaveEditKey} className="bg-mockbird-surface border border-sky-500/40 p-4 rounded-xl space-y-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xs font-bold text-sky-400 uppercase tracking-wider flex items-center gap-1.5">
+                    <Edit2 size={13} />
+                    <span>Editar Chave MCP: "{editingKey.name}"</span>
+                  </h3>
+                  <span className="text-[11px] text-slate-400 font-mono">{editingKey.prefix}••••••••</span>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="text-xs text-slate-300 font-medium">Nome identificador da chave</label>
+                  <input
+                    type="text"
+                    value={editKeyName}
+                    onChange={(e) => setEditKeyName(e.target.value)}
+                    required
+                    className="w-full bg-mockbird-bg border border-mockbird-border text-white text-xs px-3 py-2 rounded-lg outline-none focus:border-mockbird-cyan"
+                  />
+                </div>
+
+                {/* Permissão de Projetos na Edição */}
+                <div className="space-y-2">
+                  <label className="text-xs text-slate-300 font-medium">Permissão em Projetos</label>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setEditKeyProjectMode('restricted')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
+                        editKeyProjectMode === 'restricted'
+                          ? 'bg-purple-600 text-white'
+                          : 'bg-mockbird-bg text-slate-400 border border-mockbird-border hover:text-white'
+                      }`}
+                    >
+                      <Folder size={13} />
+                      <span>Projetos Específicos</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditKeyProjectMode('global')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
+                        editKeyProjectMode === 'global'
+                          ? 'bg-sky-600 text-white'
+                          : 'bg-mockbird-bg text-slate-400 border border-mockbird-border hover:text-white'
+                      }`}
+                    >
+                      <Globe size={13} />
+                      <span>Global (Todos os Projetos)</span>
+                    </button>
+                  </div>
+
+                  {editKeyProjectMode === 'restricted' && (
+                    <div className="bg-mockbird-bg border border-mockbird-border p-3 rounded-lg space-y-2">
+                      <span className="text-[11px] text-slate-400 block">
+                        Marque ou desmarque os projetos para adicionar ou remover da chave:
+                      </span>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-48 overflow-y-auto pr-1">
+                        {availableProjects.map((proj) => {
+                          const isSel = editKeySelectedProjects.includes(proj.id);
+                          return (
+                            <label
+                              key={proj.id}
+                              className={`flex items-center gap-2 p-2 rounded border cursor-pointer text-xs transition ${
+                                isSel
+                                  ? 'bg-purple-500/15 border-purple-500/40 text-purple-200'
+                                  : 'bg-mockbird-surface border-mockbird-border text-slate-400 hover:text-white'
+                              }`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={isSel}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setEditKeySelectedProjects([...editKeySelectedProjects, proj.id]);
+                                  } else {
+                                    setEditKeySelectedProjects(
+                                      editKeySelectedProjects.filter((id) => id !== proj.id)
+                                    );
+                                  }
+                                }}
+                                className="accent-purple-500"
+                              />
+                              <Folder size={12} className={isSel ? 'text-purple-400' : 'text-slate-500'} />
+                              <span className="truncate">{proj.name}</span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Permissões e Escopos na Edição */}
+                <div className="space-y-2">
+                  <label className="text-xs text-slate-300 font-medium">Permissões e Escopos</label>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+                    {[
+                      { id: 'project:read', label: 'project:read', desc: 'Ler mapa de telas e tokens' },
+                      { id: 'screen:write', label: 'screen:write', desc: 'Aplicar patches e atualizar HTML' },
+                      { id: 'export:read', label: 'export:read', desc: 'Gerar bundle de implantação' },
+                    ].map((scope) => {
+                      const isChecked = editKeyScopes.includes(scope.id);
+                      return (
+                        <label
+                          key={scope.id}
+                          className={`p-2.5 rounded-lg border cursor-pointer flex flex-col gap-1 transition ${
+                            isChecked ? 'bg-mockbird-blue/15 border-mockbird-cyan text-white' : 'bg-mockbird-bg border-mockbird-border text-slate-400'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              onChange={(e) => {
+                                if (e.target.checked) {
+                                  setEditKeyScopes([...editKeyScopes, scope.id]);
+                                } else {
+                                  setEditKeyScopes(editKeyScopes.filter((s) => s !== scope.id));
+                                }
+                              }}
+                              className="accent-mockbird-blue"
+                            />
+                            <span className="font-mono font-bold text-[11px] text-mockbird-cyan">{scope.label}</span>
+                          </div>
+                          <span className="text-[10px] text-slate-400">{scope.desc}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setEditingKey(null)}
+                    className="px-3 py-1.5 rounded-lg text-xs text-slate-400 hover:text-white"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={savingEditKey || !editKeyName.trim()}
+                    className="bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs px-4 py-1.5 rounded-lg transition disabled:opacity-50"
+                  >
+                    {savingEditKey ? 'Salvando...' : 'Salvar Alterações'}
+                  </button>
+                </div>
+              </form>
+            )}
+
             {/* Lista de Chaves MCP */}
             <div className="space-y-3">
               <div className="flex items-center justify-between">
@@ -859,13 +1177,26 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
                     return (
                       <div key={k.id} className="p-3.5 bg-mockbird-surface flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
                         <div className="space-y-1">
-                          <div className="flex items-center gap-2">
+                          <div className="flex items-center gap-2 flex-wrap">
                             <span className="font-semibold text-white">{k.name}</span>
                             <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${
                               isRevoked ? 'bg-rose-500/10 text-rose-400 border border-rose-500/30' : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
                             }`}>
                               {isRevoked ? 'Revogada' : 'Ativa'}
                             </span>
+                            {k.projects && k.projects.length > 0 ? (
+                              <span className="text-[10px] px-2 py-0.5 rounded-full font-bold bg-purple-500/10 text-purple-300 border border-purple-500/30 flex items-center gap-1">
+                                <Folder size={11} />
+                                {k.projects.length === 1
+                                  ? `Projeto: ${k.projects[0].name}`
+                                  : `${k.projects.length} Projetos: ${k.projects.map((p) => p.name).join(', ')}`}
+                              </span>
+                            ) : (
+                              <span className="text-[10px] px-2 py-0.5 rounded-full font-bold bg-sky-500/10 text-sky-300 border border-sky-500/30 flex items-center gap-1">
+                                <Globe size={11} />
+                                Global (Todos os Projetos)
+                              </span>
+                            )}
                           </div>
                           <div className="flex items-center gap-2 text-[11px] text-slate-400 font-mono">
                             <span>Prefixo: <strong className="text-slate-300">{k.prefix}••••••••</strong></span>
@@ -888,14 +1219,24 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
                         </div>
 
                         {!isRevoked && (
-                          <button
-                            type="button"
-                            onClick={() => handleRevokeMcpKey(k.id, k.name)}
-                            className="text-xs text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 px-2.5 py-1 rounded transition self-start sm:self-auto flex items-center gap-1"
-                          >
-                            <Trash2 size={13} />
-                            <span>Revogar</span>
-                          </button>
+                          <div className="flex items-center gap-2 self-start sm:self-auto">
+                            <button
+                              type="button"
+                              onClick={() => handleOpenEditKey(k)}
+                              className="text-xs text-sky-400 hover:text-sky-300 hover:bg-sky-500/10 px-2.5 py-1 rounded transition flex items-center gap-1 border border-sky-500/20"
+                            >
+                              <Edit2 size={13} />
+                              <span>Editar Projetos</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleRevokeMcpKey(k.id, k.name)}
+                              className="text-xs text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 px-2.5 py-1 rounded transition flex items-center gap-1"
+                            >
+                              <Trash2 size={13} />
+                              <span>Revogar</span>
+                            </button>
+                          </div>
                         )}
                       </div>
                     );

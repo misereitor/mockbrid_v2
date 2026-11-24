@@ -442,6 +442,7 @@ class MCPApiKey(Base):
         nullable=True,
         index=True,
     )
+    project_ids = Column(JSONB, default=list, nullable=True)
     name = Column(String(100), nullable=False)
     prefix = Column(String(20), nullable=False)
     key_hash = Column(String(128), unique=True, nullable=False, index=True)

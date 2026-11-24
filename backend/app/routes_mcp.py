@@ -43,22 +43,37 @@ def hash_mcp_key(raw_key: str) -> str:
 # ============================================================================
 
 
+class MCPKeyProjectOut(BaseModel):
+    id: str
+    name: str
+
+
 class MCPKeyCreate(BaseModel):
     name: str = Field(..., min_length=2, max_length=100)
     project_id: Optional[str] = None
+    project_ids: Optional[List[str]] = None
     scopes: Optional[List[str]] = ["project:read", "screen:write", "export:read"]
     expires_in_days: Optional[int] = 90
+
+
+class MCPKeyUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=2, max_length=100)
+    project_ids: Optional[List[str]] = None
+    scopes: Optional[List[str]] = None
 
 
 class MCPKeyOut(BaseModel):
     id: str
     name: str
     prefix: str
-    project_id: Optional[str]
+    project_id: Optional[str] = None
+    project_ids: List[str] = []
+    projects: List[MCPKeyProjectOut] = []
+    project_name: Optional[str] = None
     scopes: List[str]
-    last_used_at: Optional[datetime]
-    expires_at: Optional[datetime]
-    revoked_at: Optional[datetime]
+    last_used_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
     created_at: datetime
     raw_key: Optional[str] = None
 
@@ -279,12 +294,81 @@ async def get_mcp_auth(
     mcp_key.last_used_at = utcnow()
     await db.commit()
 
+    effective_project_ids = list(mcp_key.project_ids or [])
+    if not effective_project_ids and mcp_key.project_id:
+        effective_project_ids = [mcp_key.project_id]
+
     return {
         "key": mcp_key,
         "user": user,
-        "project_id": mcp_key.project_id,
+        "project_id": mcp_key.project_id or (effective_project_ids[0] if len(effective_project_ids) == 1 else None),
+        "project_ids": effective_project_ids,
         "scopes": mcp_key.scopes or [],
     }
+
+
+def validate_mcp_project_access(auth: Dict[str, Any], target_project_id: Optional[str]) -> None:
+    """Valida se o projeto solicitado está na lista autorizada da chave MCP."""
+    allowed = auth.get("project_ids") or []
+    if not allowed and auth.get("project_id"):
+        allowed = [auth["project_id"]]
+    if allowed:
+        if not target_project_id or target_project_id not in allowed:
+            raise HTTPException(
+                status_code=403, detail="Esta chave MCP está restrita a outro projeto"
+            )
+
+
+def get_effective_mcp_project_id(auth: Dict[str, Any], requested_id: Optional[str]) -> Optional[str]:
+    """Retorna o project_id informado ou infere automaticamente caso a chave tenha escopo unívoco."""
+    if requested_id:
+        return requested_id
+    allowed = auth.get("project_ids") or []
+    if not allowed and auth.get("project_id"):
+        allowed = [auth["project_id"]]
+    if len(allowed) == 1:
+        return allowed[0]
+    return auth.get("project_id")
+
+
+async def _build_mcp_key_out(
+    mcp_key: MCPApiKey, db: AsyncSession, raw_key: Optional[str] = None
+) -> MCPKeyOut:
+    pids = list(mcp_key.project_ids or [])
+    if not pids and mcp_key.project_id:
+        pids = [mcp_key.project_id]
+
+    project_list: List[MCPKeyProjectOut] = []
+    project_name = None
+    if pids:
+        p_query = await db.execute(
+            select(Project.id, Project.name)
+            .join(Workspace, Workspace.id == Project.workspace_id)
+            .where(
+                Project.id.in_(pids),
+                Workspace.organization_id == mcp_key.organization_id,
+            )
+        )
+        for pid, pname in p_query.all():
+            project_list.append(MCPKeyProjectOut(id=pid, name=pname))
+        if project_list:
+            project_name = ", ".join([p.name for p in project_list])
+
+    return MCPKeyOut(
+        id=mcp_key.id,
+        name=mcp_key.name,
+        prefix=mcp_key.prefix,
+        project_id=mcp_key.project_id,
+        project_ids=pids,
+        projects=project_list,
+        project_name=project_name,
+        scopes=mcp_key.scopes or [],
+        last_used_at=mcp_key.last_used_at,
+        expires_at=mcp_key.expires_at,
+        revoked_at=mcp_key.revoked_at,
+        created_at=mcp_key.created_at,
+        raw_key=raw_key,
+    )
 
 
 # ============================================================================
@@ -306,7 +390,54 @@ async def list_mcp_keys(
         .order_by(MCPApiKey.created_at.desc())
     )
     keys = query.scalars().all()
-    return [MCPKeyOut.model_validate(k) for k in keys]
+
+    all_pids = set()
+    for k in keys:
+        if k.project_ids:
+            all_pids.update(k.project_ids)
+        if k.project_id:
+            all_pids.add(k.project_id)
+
+    proj_map = {}
+    if all_pids:
+        p_res = await db.execute(
+            select(Project.id, Project.name)
+            .join(Workspace, Workspace.id == Project.workspace_id)
+            .where(
+                Project.id.in_(all_pids),
+                Workspace.organization_id == current_user.organization_id,
+            )
+        )
+        proj_map = {row[0]: row[1] for row in p_res.all()}
+
+    results = []
+    for k in keys:
+        pids = list(k.project_ids or [])
+        if not pids and k.project_id:
+            pids = [k.project_id]
+        project_list = [
+            MCPKeyProjectOut(id=pid, name=proj_map.get(pid, f"Projeto {pid[:8]}"))
+            for pid in pids
+            if pid in proj_map
+        ]
+        pname = ", ".join([p.name for p in project_list]) if project_list else None
+        results.append(
+            MCPKeyOut(
+                id=k.id,
+                name=k.name,
+                prefix=k.prefix,
+                project_id=k.project_id,
+                project_ids=pids,
+                projects=project_list,
+                project_name=pname,
+                scopes=k.scopes or [],
+                last_used_at=k.last_used_at,
+                expires_at=k.expires_at,
+                revoked_at=k.revoked_at,
+                created_at=k.created_at,
+            )
+        )
+    return results
 
 
 @router.post("/api/mcp/keys", response_model=MCPKeyOut)
@@ -317,8 +448,14 @@ async def create_mcp_key(
 ):
     """Gera uma nova chave de API para conexão de agentes MCP.
     A chave em texto claro é retornada uma única vez no campo 'raw_key'."""
-    if payload.project_id:
-        await authorize_project(payload.project_id, current_user, "read", db)
+    target_project_ids = []
+    if payload.project_ids is not None:
+        target_project_ids = [pid.strip() for pid in payload.project_ids if pid and pid.strip()]
+    elif payload.project_id:
+        target_project_ids = [payload.project_id.strip()]
+
+    for pid in target_project_ids:
+        await authorize_project(pid, current_user, "read", db)
 
     random_secret = secrets.token_hex(24)
     raw_key = f"mb_live_{random_secret}"
@@ -326,11 +463,13 @@ async def create_mcp_key(
     key_hash = hash_mcp_key(raw_key)
 
     expires_at = utcnow() + timedelta(days=payload.expires_in_days or 90)
+    primary_project_id = target_project_ids[0] if target_project_ids else None
 
     mcp_key = MCPApiKey(
         user_id=current_user.id,
         organization_id=current_user.organization_id,
-        project_id=payload.project_id,
+        project_id=primary_project_id,
+        project_ids=target_project_ids,
         name=payload.name.strip(),
         prefix=prefix,
         key_hash=key_hash,
@@ -341,9 +480,59 @@ async def create_mcp_key(
     await db.commit()
     await db.refresh(mcp_key)
 
-    out = MCPKeyOut.model_validate(mcp_key)
-    out.raw_key = raw_key
-    return out
+    return await _build_mcp_key_out(mcp_key, db, raw_key=raw_key)
+
+
+@router.patch("/api/mcp/keys/{key_id}", response_model=MCPKeyOut)
+async def update_mcp_key(
+    key_id: str,
+    payload: MCPKeyUpdate,
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Atualiza metadados, projetos permitidos e escopos de uma chave MCP existente."""
+    query = await db.execute(
+        select(MCPApiKey).where(
+            MCPApiKey.id == key_id,
+            MCPApiKey.organization_id == current_user.organization_id,
+        )
+    )
+    mcp_key = query.scalars().first()
+    if not mcp_key:
+        raise HTTPException(status_code=404, detail="Chave MCP não encontrada")
+
+    if mcp_key.user_id != current_user.id and current_user.role not in (
+        "admin",
+        "owner",
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Apenas o criador da chave ou um administrador pode editá-la",
+        )
+
+    if mcp_key.revoked_at is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Não é possível editar uma chave MCP revogada",
+        )
+
+    if payload.name is not None:
+        mcp_key.name = payload.name.strip()
+
+    if payload.scopes is not None:
+        mcp_key.scopes = payload.scopes
+
+    if payload.project_ids is not None:
+        target_project_ids = [pid.strip() for pid in payload.project_ids if pid and pid.strip()]
+        for pid in target_project_ids:
+            await authorize_project(pid, current_user, "read", db)
+        mcp_key.project_ids = target_project_ids
+        mcp_key.project_id = target_project_ids[0] if target_project_ids else None
+
+    await db.commit()
+    await db.refresh(mcp_key)
+
+    return await _build_mcp_key_out(mcp_key, db)
 
 
 @router.delete("/api/mcp/keys/{key_id}")
@@ -600,18 +789,25 @@ async def mcp_list_projects(
     user = auth["user"]
     limit = (payload.limit if payload else 50) or 50
 
-    if auth["project_id"]:
-        proj = await authorize_project(auth["project_id"], user, "read", db)
-        return [
-            {
-                "id": proj.id,
-                "name": proj.name,
-                "slug": proj.slug,
-                "visibility": proj.visibility,
-                "entry_screen_id": proj.entry_screen_id,
-                "created_at": proj.created_at.isoformat() if proj.created_at else None,
-            }
-        ]
+    allowed = auth.get("project_ids") or ([] if not auth.get("project_id") else [auth["project_id"]])
+    if allowed:
+        accessible = []
+        for pid in allowed:
+            try:
+                proj = await authorize_project(pid, user, "read", db)
+                accessible.append(
+                    {
+                        "id": proj.id,
+                        "name": proj.name,
+                        "slug": proj.slug,
+                        "visibility": proj.visibility,
+                        "entry_screen_id": proj.entry_screen_id,
+                        "created_at": proj.created_at.isoformat() if proj.created_at else None,
+                    }
+                )
+            except HTTPException:
+                continue
+        return accessible
 
     query = await db.execute(
         select(Project)
@@ -652,10 +848,7 @@ async def mcp_get_project_map(
             status_code=403, detail="Chave MCP sem escopo 'project:read'"
         )
 
-    if auth["project_id"] and auth["project_id"] != project_id:
-        raise HTTPException(
-            status_code=403, detail="Esta chave MCP está restrita a outro projeto"
-        )
+    validate_mcp_project_access(auth, project_id)
 
     user = auth["user"]
     project = await authorize_project(project_id, user, "read", db)
@@ -735,10 +928,7 @@ async def mcp_get_screen(
     if not canvas:
         raise HTTPException(status_code=404, detail="Canvas da tela não encontrado")
 
-    if auth["project_id"] and canvas.project_id != auth["project_id"]:
-        raise HTTPException(
-            status_code=403, detail="Esta chave MCP está restrita a outro projeto"
-        )
+    validate_mcp_project_access(auth, canvas.project_id)
 
     t_query = await db.execute(
         select(DesignTokens).where(DesignTokens.project_id == canvas.project_id)
@@ -779,7 +969,7 @@ async def mcp_create_screen(
             status_code=403, detail="Chave MCP sem escopo 'screen:write'"
         )
 
-    proj_id = payload.project_id or auth["project_id"]
+    proj_id = get_effective_mcp_project_id(auth, payload.project_id)
     if not proj_id and payload.canvas_id:
         c_res = await db.execute(select(Canvas).where(Canvas.id == payload.canvas_id))
         c = c_res.scalars().first()
@@ -791,10 +981,7 @@ async def mcp_create_screen(
             status_code=400, detail="project_id é obrigatório para criar uma tela"
         )
 
-    if auth["project_id"] and auth["project_id"] != proj_id:
-        raise HTTPException(
-            status_code=403, detail="Esta chave MCP está restrita a outro projeto"
-        )
+    validate_mcp_project_access(auth, proj_id)
 
     user = auth["user"]
     project = await authorize_project(proj_id, user, "edit", db)
@@ -884,15 +1071,13 @@ async def mcp_duplicate_screen(
     user = auth["user"]
     orig_screen = await authorize_screen(payload.screen_id, user, "edit", db)
 
-    if auth["project_id"]:
-        c_res = await db.execute(
-            select(Canvas).where(Canvas.id == orig_screen.canvas_id)
-        )
-        canvas = c_res.scalars().first()
-        if not canvas or canvas.project_id != auth["project_id"]:
-            raise HTTPException(
-                status_code=403, detail="Esta chave MCP está restrita a outro projeto"
-            )
+    c_res = await db.execute(
+        select(Canvas).where(Canvas.id == orig_screen.canvas_id)
+    )
+    canvas = c_res.scalars().first()
+    if not canvas:
+        raise HTTPException(status_code=404, detail="Canvas não encontrado")
+    validate_mcp_project_access(auth, canvas.project_id)
 
     dup_name = (payload.new_name or f"{orig_screen.name} (Cópia)").strip()
     new_screen = Screen(
@@ -962,10 +1147,7 @@ async def mcp_delete_screen(
     if not canvas:
         raise HTTPException(status_code=404, detail="Canvas da tela não encontrado")
 
-    if auth["project_id"] and canvas.project_id != auth["project_id"]:
-        raise HTTPException(
-            status_code=403, detail="Esta chave MCP está restrita a outro projeto"
-        )
+    validate_mcp_project_access(auth, canvas.project_id)
 
     p_res = await db.execute(select(Project).where(Project.id == canvas.project_id))
     project = p_res.scalars().first()
@@ -1011,15 +1193,13 @@ async def mcp_patch_screen_element(
     user = auth["user"]
     screen = await authorize_screen(payload.screen_id, user, "edit", db)
 
-    if auth["project_id"]:
-        canvas_res = await db.execute(
-            select(Canvas).where(Canvas.id == screen.canvas_id)
-        )
-        canvas = canvas_res.scalars().first()
-        if not canvas or canvas.project_id != auth["project_id"]:
-            raise HTTPException(
-                status_code=403, detail="Esta chave MCP está restrita a outro projeto"
-            )
+    canvas_res = await db.execute(
+        select(Canvas).where(Canvas.id == screen.canvas_id)
+    )
+    canvas = canvas_res.scalars().first()
+    if not canvas:
+        raise HTTPException(status_code=404, detail="Canvas não encontrado")
+    validate_mcp_project_access(auth, canvas.project_id)
 
     clean_id = payload.element_mb_id.lstrip("#").strip()
     if not clean_id:
@@ -1142,13 +1322,11 @@ async def mcp_update_screen_html(
     user = auth["user"]
     screen = await authorize_screen(payload.screen_id, user, "edit", db)
 
-    if auth["project_id"]:
-        c_res = await db.execute(select(Canvas).where(Canvas.id == screen.canvas_id))
-        canvas = c_res.scalars().first()
-        if not canvas or canvas.project_id != auth["project_id"]:
-            raise HTTPException(
-                status_code=403, detail="Esta chave MCP está restrita a outro projeto"
-            )
+    c_res = await db.execute(select(Canvas).where(Canvas.id == screen.canvas_id))
+    canvas = c_res.scalars().first()
+    if not canvas:
+        raise HTTPException(status_code=404, detail="Canvas não encontrado")
+    validate_mcp_project_access(auth, canvas.project_id)
 
     screen.html_content = payload.html_content
     if payload.css_content is not None:
@@ -1210,10 +1388,7 @@ async def mcp_update_design_tokens(
             status_code=403, detail="Chave MCP sem escopo de escrita"
         )
 
-    if auth["project_id"] and auth["project_id"] != payload.project_id:
-        raise HTTPException(
-            status_code=403, detail="Esta chave MCP está restrita a outro projeto"
-        )
+    validate_mcp_project_access(auth, payload.project_id)
 
     user = auth["user"]
     await authorize_project(payload.project_id, user, "edit", db)
@@ -1270,10 +1445,7 @@ async def mcp_list_project_assets(
             status_code=403, detail="Chave MCP sem escopo 'project:read'"
         )
 
-    if auth["project_id"] and auth["project_id"] != payload.project_id:
-        raise HTTPException(
-            status_code=403, detail="Esta chave MCP está restrita a outro projeto"
-        )
+    validate_mcp_project_access(auth, payload.project_id)
 
     user = auth["user"]
     await authorize_project(payload.project_id, user, "read", db)
@@ -1311,10 +1483,7 @@ async def mcp_list_scenarios(
             status_code=403, detail="Chave MCP sem escopo 'project:read'"
         )
 
-    if auth["project_id"] and auth["project_id"] != payload.project_id:
-        raise HTTPException(
-            status_code=403, detail="Esta chave MCP está restrita a outro projeto"
-        )
+    validate_mcp_project_access(auth, payload.project_id)
 
     user = auth["user"]
     await authorize_project(payload.project_id, user, "read", db)
@@ -1351,10 +1520,7 @@ async def mcp_set_scenario_data(
             status_code=403, detail="Chave MCP sem escopo 'screen:write'"
         )
 
-    if auth["project_id"] and auth["project_id"] != payload.project_id:
-        raise HTTPException(
-            status_code=403, detail="Esta chave MCP está restrita a outro projeto"
-        )
+    validate_mcp_project_access(auth, payload.project_id)
 
     user = auth["user"]
     await authorize_project(payload.project_id, user, "edit", db)
@@ -1445,15 +1611,13 @@ async def mcp_get_implementation_bundle(
     user = auth["user"]
     screen = await authorize_screen(screen_id, user, "read", db)
 
-    if auth["project_id"]:
-        canvas_res = await db.execute(
-            select(Canvas).where(Canvas.id == screen.canvas_id)
-        )
-        canvas = canvas_res.scalars().first()
-        if not canvas or canvas.project_id != auth["project_id"]:
-            raise HTTPException(
-                status_code=403, detail="Esta chave MCP está restrita a outro projeto"
-            )
+    canvas_res = await db.execute(
+        select(Canvas).where(Canvas.id == screen.canvas_id)
+    )
+    canvas = canvas_res.scalars().first()
+    if not canvas:
+        raise HTTPException(status_code=404, detail="Canvas não encontrado")
+    validate_mcp_project_access(auth, canvas.project_id)
 
     return {
         "screen_id": screen.id,
@@ -1517,7 +1681,7 @@ async def mcp_jsonrpc_endpoint(
                 res = await mcp_list_projects(req_obj, auth, db)
 
             elif tool_name == "get_project_map":
-                proj_id = arguments.get("project_id") or auth["project_id"]
+                proj_id = get_effective_mcp_project_id(auth, arguments.get("project_id"))
                 if not proj_id:
                     return {
                         "jsonrpc": "2.0",
