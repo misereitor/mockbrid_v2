@@ -6,7 +6,6 @@ erros de scripts/listeners e validem a integridade das telas contra regras de de
 """
 
 import base64
-import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -668,7 +667,7 @@ def audit_screen_rules(
     """Aplica regras de validação estruturais (equivalente a validate.mjs) na tela publicada."""
     html = html_content or ""
     css = css_content or ""
-    js = js_content or ""
+    _ = js_content
 
     issues: List[Dict[str, Any]] = []
     checks: Dict[str, Any] = {}

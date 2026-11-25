@@ -432,13 +432,17 @@ class MockbirdAgentGraph:
         intent = self._determine_intent(state)
         state.intent = intent
         if intent == "explanation":
-            async for event in self._run_explanation(state): yield event
+            async for event in self._run_explanation(state):
+                yield event
         elif intent == "surgical_edit":
-            async for event in self._run_surgical(state): yield event
+            async for event in self._run_surgical(state):
+                yield event
         elif intent == "layout_repair":
-            async for event in self._run_layout_repair(state): yield event
+            async for event in self._run_layout_repair(state):
+                yield event
         else:
-            async for event in self._run_full_page(state): yield event
+            async for event in self._run_full_page(state):
+                yield event
 
     def _determine_intent(self, state: AgentState) -> str:
         if state.target_element and (
