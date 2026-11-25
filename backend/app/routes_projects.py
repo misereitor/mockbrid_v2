@@ -223,61 +223,34 @@ async def create_project(
     return project
 
 
-@router.post("/import/design", response_model=DesignImportOut)
-async def import_design_corpus(
-    file: UploadFile = File(...),
-    name: Optional[str] = Form(None),
-    project_id: Optional[str] = Form(None),
-    current_user: User = Depends(require_editor),
-    db: AsyncSession = Depends(get_db),
-):
-    """Importa um ZIP com a pasta `design/` do Mockbird v1 criando um novo projeto ou atualizando um existente."""
-    blob = await file.read()
-    try:
-        parsed = parse_design_corpus(blob)
-    except DesignCorpusError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    tokens = parsed["tokens"]
-
-    if project_id:
-        project = await authorize_project(project_id, current_user, "edit", db)
-        if any(tokens.values()):
-            tok_res = await db.execute(
-                select(DesignTokens).where(DesignTokens.project_id == project.id)
-            )
-            tokens_row = tok_res.scalars().first()
-            if not tokens_row:
-                tokens_row = DesignTokens(project_id=project.id)
-                db.add(tokens_row)
-            if tokens.get("light"):
-                tokens_row.light_tokens = tokens["light"]
-            if tokens.get("dark"):
-                tokens_row.dark_tokens = tokens["dark"]
-            if tokens.get("shared"):
-                tokens_row.shared_tokens = tokens["shared"]
-    else:
-        raw_name = (name or "").strip()
-        if not raw_name:
-            raw_name = (
-                Path(file.filename or "").stem.replace("_", " ").replace("-", " ").strip()
-            )
-        if not raw_name or raw_name.lower() in {"design", "zip", "corpus"}:
-            raw_name = "Projeto importado"
-
-        project = await _create_project_shell(
-            db,
-            current_user,
-            raw_name,
-            "Importado do corpus design/ do Mockbird v1.",
-            tokens_light=tokens["light"] or None,
-            tokens_dark=tokens["dark"] or None,
-            tokens_shared=tokens["shared"] or None,
-        )
-
-    imported_assets: Dict[str, str] = {}
+async def apply_design_corpus_to_project(
+    parsed: Dict[str, Any],
+    project: Project,
+    actor_name: str,
+    user_id: str,
+    db: AsyncSession,
+    change_summary: str = "Atualização via ZIP Import",
+) -> Dict[str, Any]:
+    """Aplica o conteúdo de um corpus design/ importado (tokens, assets, telas) a um projeto existente."""
     from urllib.parse import quote
 
+    tokens = parsed.get("tokens") or {}
+    if any(tokens.values()):
+        tok_res = await db.execute(
+            select(DesignTokens).where(DesignTokens.project_id == project.id)
+        )
+        tokens_row = tok_res.scalars().first()
+        if not tokens_row:
+            tokens_row = DesignTokens(project_id=project.id)
+            db.add(tokens_row)
+        if tokens.get("light"):
+            tokens_row.light_tokens = tokens["light"]
+        if tokens.get("dark"):
+            tokens_row.dark_tokens = tokens["dark"]
+        if tokens.get("shared"):
+            tokens_row.shared_tokens = tokens["shared"]
+
+    imported_assets: Dict[str, str] = {}
     for asset_path_in_zip, asset_bytes in parsed.get("assets", {}).items():
         content_type = sniff_image_type(asset_bytes[:512])
         if not content_type:
@@ -299,7 +272,7 @@ async def import_design_corpus(
         base_name = Path(asset_path_in_zip).name[:255]
         asset_obj = Asset(
             project_id=project.id,
-            uploaded_by=current_user.id,
+            uploaded_by=user_id,
             filename=filename,
             original_name=base_name,
             content_type=content_type,
@@ -317,7 +290,6 @@ async def import_design_corpus(
         imported_assets[f"../{encoded_base}"] = new_url
         imported_assets[f"./{encoded_base}"] = new_url
 
-    # Mapeia canvases e telas existentes no projeto para atualização inteligente
     canv_res = await db.execute(select(Canvas).where(Canvas.project_id == project.id))
     existing_canvases = {c.name.lower().strip(): c for c in canv_res.scalars().all()}
     existing_canvas_ids = [c.id for c in existing_canvases.values()]
@@ -329,6 +301,9 @@ async def import_design_corpus(
 
     entry_screen_id: Optional[str] = project.entry_screen_id
     screen_total = 0
+    updated_count = 0
+    created_count = 0
+
     for order, canvas_data in enumerate(parsed["canvases"]):
         c_name = canvas_data["name"][:255]
         canvas = existing_canvases.get(c_name.lower().strip())
@@ -364,10 +339,11 @@ async def import_design_corpus(
                     html_content=screen_html,
                     css_content=existing_s.css_content or "",
                     js_content=existing_s.js_content or "",
-                    actor=current_user.name,
-                    change_summary="Atualização via ZIP Import",
+                    actor=actor_name,
+                    change_summary=change_summary,
                 )
                 db.add(rev)
+                updated_count += 1
                 if first_screen is None:
                     first_screen = existing_s
             else:
@@ -393,11 +369,12 @@ async def import_design_corpus(
                     html_content=screen_html,
                     css_content="",
                     js_content="",
-                    actor=current_user.name,
-                    change_summary="Importado via ZIP",
+                    actor=actor_name,
+                    change_summary=change_summary,
                 )
                 db.add(rev)
                 screens_by_name[s_name.lower().strip()] = screen
+                created_count += 1
                 if first_screen is None:
                     first_screen = screen
             screen_total += 1
@@ -419,15 +396,72 @@ async def import_design_corpus(
         {
             "type": "project_updated",
             "project_id": project.id,
-            "origin": current_user.id,
+            "origin": user_id,
         },
     )
 
-    return DesignImportOut(
+    return {
+        "project": project,
+        "canvases": len(existing_canvases),
+        "screens": screen_total,
+        "updated_screens": updated_count,
+        "created_screens": created_count,
+        "warnings": parsed.get("warnings", []),
+    }
+
+
+@router.post("/import/design", response_model=DesignImportOut)
+async def import_design_corpus(
+    file: UploadFile = File(...),
+    name: Optional[str] = Form(None),
+    project_id: Optional[str] = Form(None),
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Importa um ZIP com a pasta `design/` do Mockbird v1 criando um novo projeto ou atualizando um existente."""
+    blob = await file.read()
+    try:
+        parsed = parse_design_corpus(blob)
+    except DesignCorpusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    tokens = parsed["tokens"]
+
+    if project_id:
+        project = await authorize_project(project_id, current_user, "edit", db)
+    else:
+        raw_name = (name or "").strip()
+        if not raw_name:
+            raw_name = (
+                Path(file.filename or "").stem.replace("_", " ").replace("-", " ").strip()
+            )
+        if not raw_name or raw_name.lower() in {"design", "zip", "corpus"}:
+            raw_name = "Projeto importado"
+
+        project = await _create_project_shell(
+            db,
+            current_user,
+            raw_name,
+            "Importado do corpus design/ do Mockbird v1.",
+            tokens_light=tokens["light"] or None,
+            tokens_dark=tokens["dark"] or None,
+            tokens_shared=tokens["shared"] or None,
+        )
+
+    res = await apply_design_corpus_to_project(
+        parsed=parsed,
         project=project,
-        canvases=len(existing_canvases),
-        screens=screen_total,
-        warnings=parsed["warnings"],
+        actor_name=current_user.name,
+        user_id=current_user.id,
+        db=db,
+        change_summary="Atualização via ZIP Import",
+    )
+
+    return DesignImportOut(
+        project=res["project"],
+        canvases=res["canvases"],
+        screens=res["screens"],
+        warnings=res["warnings"],
     )
 
 
@@ -677,8 +711,21 @@ async def create_project_screen(
         html_content=payload.get("html_content") or "",
         css_content=payload.get("css_content") or "",
         js_content=payload.get("js_content") or "",
+        current_revision=1,
     )
     db.add(screen)
+    await db.flush()
+
+    rev = ScreenRevision(
+        screen_id=screen.id,
+        revision_number=1,
+        html_content=screen.html_content,
+        css_content=screen.css_content or "",
+        js_content=screen.js_content or "",
+        actor=current_user.name,
+        change_summary="Criação da tela",
+    )
+    db.add(rev)
     await db.commit()
     await db.refresh(screen)
     return screen

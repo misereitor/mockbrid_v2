@@ -4,6 +4,7 @@ from sqlalchemy.future import select
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
+import base64
 import hashlib
 import json
 import logging
@@ -34,7 +35,12 @@ from app.ws import broadcaster
 from app.screen_renderer import (
     render_screen_screenshot,
     simulate_element_interaction,
+    simulate_sequence_interactions,
+    diagnose_screen_structure,
+    audit_screen_rules,
 )
+from app.design_corpus import parse_design_corpus, DesignCorpusError
+from app.routes_projects import apply_design_corpus_to_project
 
 router = APIRouter(tags=["mcp"])
 logger = logging.getLogger(__name__)
@@ -106,6 +112,40 @@ class MCPListProjectsRequest(BaseModel):
 
 class MCPGetScreenRequest(BaseModel):
     screen_id: str
+    include_html: Optional[bool] = True
+    include_css: Optional[bool] = True
+    include_js: Optional[bool] = True
+    include_tokens: Optional[bool] = True
+    fields: Optional[List[str]] = None
+
+
+class MCPRestoreScreenRevisionRequest(BaseModel):
+    screen_id: str
+    revision: int
+
+
+class MCPRenderScreenStateRequest(BaseModel):
+    screen_id: str
+    actions: List[Dict[str, Any]]
+    viewport: Optional[str] = "desktop"
+    theme: Optional[str] = "light"
+    full_page: Optional[bool] = False
+
+
+class MCPDiagnoseScreenRequest(BaseModel):
+    screen_id: str
+    viewport: Optional[str] = "desktop"
+    theme: Optional[str] = "light"
+
+
+class MCPValidateScreenRequest(BaseModel):
+    screen_id: str
+
+
+class MCPImportProjectZipRequest(BaseModel):
+    project_id: str
+    zip_base64: str
+    change_summary: Optional[str] = "Atualização via MCP ZIP Import"
 
 
 class MCPCreateScreenRequest(BaseModel):
@@ -636,22 +676,33 @@ MCP_TOOLS_SPEC = [
     },
     {
         "name": "get_project_map",
-        "description": "Retorna o mapa completo do projeto (canvases, telas, IDs, dimensões e tokens de design).",
+        "description": "Retorna o mapa do projeto (canvases, telas, IDs, dimensões). Suporta modo resumo (summary_only) e exclusão de tokens para reduzir o tamanho da resposta.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "project_id": {"type": "string", "description": "ID do projeto Mockbird."}
+                "project_id": {"type": "string", "description": "ID do projeto Mockbird."},
+                "include_tokens": {"type": "boolean", "description": "Se falso, omite o bloco de tokens de design. Default: true."},
+                "summary_only": {"type": "boolean", "description": "Se verdadeiro, omite tokens e retorna lista compacta de telas. Default: false."}
             },
             "required": ["project_id"],
         },
     },
     {
         "name": "get_screen",
-        "description": "Retorna o código HTML, CSS, JS, dimensões, tokens e metadados completos de uma tela específica.",
+        "description": "Retorna o código HTML, CSS, JS, dimensões, tokens e metadados de uma tela. Suporta filtros para reduzir tráfego (ex: include_html=false ou fields=['id', 'current_revision']).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "screen_id": {"type": "string", "description": "ID da tela Mockbird."}
+                "screen_id": {"type": "string", "description": "ID da tela Mockbird."},
+                "include_html": {"type": "boolean", "description": "Se falso, não inclui html_content. Default: true."},
+                "include_css": {"type": "boolean", "description": "Se falso, não inclui css_content. Default: true."},
+                "include_js": {"type": "boolean", "description": "Se falso, não inclui js_content. Default: true."},
+                "include_tokens": {"type": "boolean", "description": "Se falso, não inclui tokens. Default: true."},
+                "fields": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Lista de campos específicos desejados (ex: ['id', 'name', 'current_revision']).",
+                },
             },
             "required": ["screen_id"],
         },
@@ -897,6 +948,83 @@ MCP_TOOLS_SPEC = [
             "required": ["screen_id"],
         },
     },
+    {
+        "name": "restore_screen_revision",
+        "description": "Restaura o HTML, CSS e JS de uma tela para uma revisão anterior do seu histórico.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "screen_id": {"type": "string", "description": "ID da tela."},
+                "revision": {"type": "integer", "description": "Número da revisão anterior a restaurar."}
+            },
+            "required": ["screen_id", "revision"],
+        },
+    },
+    {
+        "name": "render_screen_state",
+        "description": "Executa uma sequência ordenada de ações interativas (click, input, hover, wait) e captura a screenshot do estado final.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "screen_id": {"type": "string", "description": "ID da tela."},
+                "actions": {
+                    "type": "array",
+                    "description": "Lista de passos. Ex: [{'action': 'click', 'selector': '#open-btn'}, {'action': 'wait', 'ms': 300}].",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["click", "input", "hover", "wait"]},
+                            "selector": {"type": "string"},
+                            "element_mb_id": {"type": "string"},
+                            "value": {"type": "string"},
+                            "ms": {"type": "integer"}
+                        }
+                    }
+                },
+                "viewport": {"type": "string", "enum": ["desktop", "tablet", "mobile"]},
+                "theme": {"type": "string", "enum": ["light", "dark"]},
+                "full_page": {"type": "boolean"}
+            },
+            "required": ["screen_id", "actions"],
+        },
+    },
+    {
+        "name": "diagnose_screen",
+        "description": "Inspeciona scripts, ordem de carga, elementos interativos e erros de console do navegador para a tela.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "screen_id": {"type": "string", "description": "ID da tela."},
+                "viewport": {"type": "string", "enum": ["desktop", "tablet", "mobile"]},
+                "theme": {"type": "string", "enum": ["light", "dark"]}
+            },
+            "required": ["screen_id"],
+        },
+    },
+    {
+        "name": "validate_screen",
+        "description": "Valida uma tela publicada aplicando regras estruturais (suporte a Dark Mode, variantes de viewport, interatividade mínima e integridade estrutural).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "screen_id": {"type": "string", "description": "ID da tela para validação."}
+            },
+            "required": ["screen_id"],
+        },
+    },
+    {
+        "name": "import_project_zip",
+        "description": "Importa ou atualiza telas e tokens de um projeto existente a partir de um arquivo ZIP em base64.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "ID do projeto existente a atualizar."},
+                "zip_base64": {"type": "string", "description": "Conteúdo do arquivo ZIP codificado em base64."},
+                "change_summary": {"type": "string", "description": "Descrição da alteração para o histórico de revisões."}
+            },
+            "required": ["project_id", "zip_base64"],
+        },
+    },
 ]
 
 
@@ -990,6 +1118,8 @@ async def mcp_list_projects(
 @router.post("/mcp/tools/get_project_map")
 async def mcp_get_project_map(
     project_id: str,
+    include_tokens: bool = True,
+    summary_only: bool = False,
     auth: Dict[str, Any] = Depends(get_mcp_auth),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1004,10 +1134,12 @@ async def mcp_get_project_map(
     user = auth["user"]
     project = await authorize_project(project_id, user, "read", db)
 
-    t_query = await db.execute(
-        select(DesignTokens).where(DesignTokens.project_id == project_id)
-    )
-    tokens = t_query.scalars().first()
+    tokens = None
+    if include_tokens and not summary_only:
+        t_query = await db.execute(
+            select(DesignTokens).where(DesignTokens.project_id == project_id)
+        )
+        tokens = t_query.scalars().first()
 
     c_query = await db.execute(
         select(Canvas)
@@ -1035,6 +1167,7 @@ async def mcp_get_project_map(
                         "is_entry": s.is_entry,
                         "width": s.width,
                         "height": s.height,
+                        "device_type": s.device_type,
                         "current_revision": s.current_revision,
                     }
                     for s in screens
@@ -1042,7 +1175,7 @@ async def mcp_get_project_map(
             }
         )
 
-    return {
+    result = {
         "project": {
             "id": project.id,
             "name": project.name,
@@ -1050,13 +1183,15 @@ async def mcp_get_project_map(
             "visibility": project.visibility,
             "entry_screen_id": project.entry_screen_id,
         },
-        "tokens": {
+        "canvases": canvases_data,
+    }
+    if include_tokens and not summary_only:
+        result["tokens"] = {
             "light": tokens.light_tokens if tokens else {},
             "dark": tokens.dark_tokens if tokens else {},
             "shared": tokens.shared_tokens if tokens else {},
-        },
-        "canvases": canvases_data,
-    }
+        }
+    return result
 
 
 @router.post("/mcp/tools/get_screen")
@@ -1065,7 +1200,7 @@ async def mcp_get_screen(
     auth: Dict[str, Any] = Depends(get_mcp_auth),
     db: AsyncSession = Depends(get_db),
 ):
-    """Retorna o código HTML, CSS, JS, dimensões e tokens completos de uma tela específica."""
+    """Retorna o código HTML, CSS, JS, dimensões e tokens completos ou filtrados de uma tela específica."""
     if "project:read" not in auth["scopes"] and "screen:read" not in auth["scopes"]:
         raise HTTPException(
             status_code=403, detail="Chave MCP sem escopo de leitura de projeto/tela"
@@ -1081,12 +1216,14 @@ async def mcp_get_screen(
 
     validate_mcp_project_access(auth, canvas.project_id)
 
-    t_query = await db.execute(
-        select(DesignTokens).where(DesignTokens.project_id == canvas.project_id)
-    )
-    tokens = t_query.scalars().first()
+    tokens = None
+    if payload.include_tokens:
+        t_query = await db.execute(
+            select(DesignTokens).where(DesignTokens.project_id == canvas.project_id)
+        )
+        tokens = t_query.scalars().first()
 
-    return {
+    full_data = {
         "id": screen.id,
         "name": screen.name,
         "canvas_id": screen.canvas_id,
@@ -1097,15 +1234,21 @@ async def mcp_get_screen(
         "screen_kind": screen.screen_kind,
         "device_type": screen.device_type,
         "current_revision": screen.current_revision,
-        "html_content": screen.html_content,
-        "css_content": screen.css_content,
-        "js_content": screen.js_content,
+        "html_content": screen.html_content if payload.include_html else None,
+        "css_content": screen.css_content if payload.include_css else None,
+        "js_content": screen.js_content if payload.include_js else None,
         "tokens": {
             "light": tokens.light_tokens if tokens else {},
             "dark": tokens.dark_tokens if tokens else {},
             "shared": tokens.shared_tokens if tokens else {},
-        },
+        } if payload.include_tokens else None,
     }
+
+    if payload.fields:
+        filtered = {k: v for k, v in full_data.items() if k in payload.fields}
+        return filtered
+
+    return full_data
 
 
 @router.post("/mcp/tools/create_screen")
@@ -2092,6 +2235,263 @@ async def mcp_interact_screen_element(
     return interaction_res
 
 
+@router.post("/mcp/tools/restore_screen_revision")
+async def mcp_restore_screen_revision(
+    payload: MCPRestoreScreenRevisionRequest,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Restaura o HTML, CSS e JS de uma tela para uma revisão anterior do seu histórico."""
+    if "screen:write" not in auth["scopes"]:
+        raise HTTPException(status_code=403, detail="Chave MCP sem escopo 'screen:write'")
+
+    user = auth["user"]
+    screen = await authorize_screen(payload.screen_id, user, "edit", db)
+
+    canvas_res = await db.execute(select(Canvas).where(Canvas.id == screen.canvas_id))
+    canvas = canvas_res.scalars().first()
+    if not canvas:
+        raise HTTPException(status_code=404, detail="Canvas não encontrado")
+    validate_mcp_project_access(auth, canvas.project_id)
+
+    rev_res = await db.execute(
+        select(ScreenRevision).where(
+            ScreenRevision.screen_id == screen.id,
+            ScreenRevision.revision_number == payload.revision,
+        )
+    )
+    target_rev = rev_res.scalars().first()
+    if not target_rev:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Revisão {payload.revision} não encontrada para a tela {screen.id}",
+        )
+
+    screen.html_content = target_rev.html_content
+    screen.css_content = target_rev.css_content or ""
+    screen.js_content = target_rev.js_content or ""
+    screen.current_revision += 1
+
+    key_name = auth.get("key_name") or "mcp_key"
+    new_rev = ScreenRevision(
+        screen_id=screen.id,
+        revision_number=screen.current_revision,
+        html_content=screen.html_content,
+        css_content=screen.css_content,
+        js_content=screen.js_content,
+        actor=f"mcp:{key_name}",
+        change_summary=f"Restaurado para a revisão {payload.revision} via MCP",
+    )
+    db.add(new_rev)
+    await db.commit()
+    await db.refresh(screen)
+
+    await broadcaster.broadcast(
+        canvas.project_id,
+        {
+            "type": "screen_updated",
+            "screen_id": screen.id,
+            "project_id": canvas.project_id,
+            "revision": screen.current_revision,
+        },
+    )
+
+    return {
+        "status": "success",
+        "message": f"Tela '{screen.name}' restaurada com sucesso para a revisão {payload.revision}.",
+        "screen_id": screen.id,
+        "restored_from_revision": payload.revision,
+        "new_current_revision": screen.current_revision,
+    }
+
+
+@router.post("/mcp/tools/render_screen_state")
+async def mcp_render_screen_state(
+    payload: MCPRenderScreenStateRequest,
+    request: Request,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Executa uma sequência ordenada de ações interativas na tela e extrai screenshot do estado resultante."""
+    if "project:read" not in auth["scopes"] and "screen:read" not in auth["scopes"]:
+        raise HTTPException(status_code=403, detail="Chave MCP sem escopo de leitura de telas/projetos")
+
+    user = auth["user"]
+    screen = await authorize_screen(payload.screen_id, user, "read", db)
+
+    canvas_res = await db.execute(select(Canvas).where(Canvas.id == screen.canvas_id))
+    canvas = canvas_res.scalars().first()
+    if not canvas:
+        raise HTTPException(status_code=404, detail="Canvas não encontrado")
+    validate_mcp_project_access(auth, canvas.project_id)
+
+    tok_res = await db.execute(select(DesignTokens).where(DesignTokens.project_id == canvas.project_id))
+    tokens_row = tok_res.scalars().first()
+    tokens = {
+        "light": tokens_row.light_tokens if tokens_row else {},
+        "dark": tokens_row.dark_tokens if tokens_row else {},
+        "shared": tokens_row.shared_tokens if tokens_row else {},
+    } if tokens_row else {}
+
+    state_res = await simulate_sequence_interactions(
+        html_content=screen.html_content or "",
+        actions=payload.actions,
+        css_content=screen.css_content or "",
+        js_content=screen.js_content or "",
+        tokens=tokens,
+        viewport_name=payload.viewport or "desktop",
+        theme=payload.theme or "light",
+        full_page=payload.full_page or False,
+    )
+
+    raw_bytes = state_res.pop("screenshot_bytes", None)
+    asset_url = None
+    if raw_bytes:
+        try:
+            fn = save_asset(canvas.project_id, raw_bytes, "image/png")
+            clean_screen_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", screen.name or "screen")
+            asset_obj = Asset(
+                project_id=canvas.project_id,
+                filename=fn,
+                original_name=f"state_{clean_screen_name}_{len(payload.actions)}steps.png",
+                content_type="image/png",
+                size_bytes=len(raw_bytes),
+            )
+            db.add(asset_obj)
+            await db.commit()
+            await db.refresh(asset_obj)
+            sig = generate_asset_signature(asset_obj.id)
+            asset_url = build_public_url(request, f"/api/assets/{asset_obj.id}?sig={sig}")
+        except Exception as asset_err:
+            logger.warning(f"Falha ao persistir asset do estado: {asset_err}")
+
+    state_res["screen_id"] = screen.id
+    state_res["screen_name"] = screen.name
+    state_res["screenshot_url"] = asset_url
+    return state_res
+
+
+@router.post("/mcp/tools/diagnose_screen")
+async def mcp_diagnose_screen(
+    payload: MCPDiagnoseScreenRequest,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Diagnostica scripts, ordem de carga, elementos interativos e erros de console da tela."""
+    if "project:read" not in auth["scopes"] and "screen:read" not in auth["scopes"]:
+        raise HTTPException(status_code=403, detail="Chave MCP sem escopo de leitura de telas/projetos")
+
+    user = auth["user"]
+    screen = await authorize_screen(payload.screen_id, user, "read", db)
+
+    canvas_res = await db.execute(select(Canvas).where(Canvas.id == screen.canvas_id))
+    canvas = canvas_res.scalars().first()
+    if not canvas:
+        raise HTTPException(status_code=404, detail="Canvas não encontrado")
+    validate_mcp_project_access(auth, canvas.project_id)
+
+    tok_res = await db.execute(select(DesignTokens).where(DesignTokens.project_id == canvas.project_id))
+    tokens_row = tok_res.scalars().first()
+    tokens = {
+        "light": tokens_row.light_tokens if tokens_row else {},
+        "dark": tokens_row.dark_tokens if tokens_row else {},
+        "shared": tokens_row.shared_tokens if tokens_row else {},
+    } if tokens_row else {}
+
+    diag = await diagnose_screen_structure(
+        html_content=screen.html_content or "",
+        css_content=screen.css_content or "",
+        js_content=screen.js_content or "",
+        tokens=tokens,
+        viewport_name=payload.viewport or "desktop",
+        theme=payload.theme or "light",
+    )
+    diag["screen_id"] = screen.id
+    diag["screen_name"] = screen.name
+    diag["current_revision"] = screen.current_revision
+    return diag
+
+
+@router.post("/mcp/tools/validate_screen")
+async def mcp_validate_screen(
+    payload: MCPValidateScreenRequest,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Valida a tela com as regras estruturais (equivalente a validate.mjs: dark mode, variantes, interatividade)."""
+    if "project:read" not in auth["scopes"] and "screen:read" not in auth["scopes"]:
+        raise HTTPException(status_code=403, detail="Chave MCP sem escopo de leitura de telas/projetos")
+
+    user = auth["user"]
+    screen = await authorize_screen(payload.screen_id, user, "read", db)
+
+    canvas_res = await db.execute(select(Canvas).where(Canvas.id == screen.canvas_id))
+    canvas = canvas_res.scalars().first()
+    if not canvas:
+        raise HTTPException(status_code=404, detail="Canvas não encontrado")
+    validate_mcp_project_access(auth, canvas.project_id)
+
+    audit = audit_screen_rules(
+        html_content=screen.html_content or "",
+        css_content=screen.css_content or "",
+        js_content=screen.js_content or "",
+    )
+    audit["screen_id"] = screen.id
+    audit["screen_name"] = screen.name
+    audit["current_revision"] = screen.current_revision
+    return audit
+
+
+@router.post("/mcp/tools/import_project_zip")
+async def mcp_import_project_zip(
+    payload: MCPImportProjectZipRequest,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Importa ou atualiza telas e tokens de um projeto existente a partir de um arquivo ZIP em base64."""
+    if "project:write" not in auth["scopes"] and "screen:write" not in auth["scopes"]:
+        raise HTTPException(status_code=403, detail="Chave MCP sem escopo de escrita de projeto/tela")
+
+    proj_id = get_effective_mcp_project_id(auth, payload.project_id)
+    if not proj_id:
+        raise HTTPException(status_code=400, detail="project_id é obrigatório")
+    validate_mcp_project_access(auth, proj_id)
+
+    user = auth["user"]
+    project = await authorize_project(proj_id, user, "edit", db)
+
+    try:
+        raw_zip = base64.b64decode(payload.zip_base64)
+    except Exception as b64_err:
+        raise HTTPException(status_code=400, detail=f"Base64 do ZIP inválido: {str(b64_err)}")
+
+    try:
+        parsed = parse_design_corpus(raw_zip)
+    except DesignCorpusError as dce:
+        raise HTTPException(status_code=400, detail=str(dce))
+
+    key_name = auth.get("key_name") or "mcp_key"
+    res = await apply_design_corpus_to_project(
+        parsed=parsed,
+        project=project,
+        actor_name=f"mcp:{key_name}",
+        user_id=user.id,
+        db=db,
+        change_summary=payload.change_summary or "Atualização via MCP ZIP Import",
+    )
+
+    return {
+        "status": "success",
+        "message": f"ZIP importado com sucesso para o projeto '{project.name}'.",
+        "project_id": project.id,
+        "canvases": res["canvases"],
+        "screens": res["screens"],
+        "updated_screens": res["updated_screens"],
+        "created_screens": res["created_screens"],
+        "warnings": res["warnings"],
+    }
+
+
 # ============================================================================
 # Handler do Protocolo MCP JSON-RPC 2.0 Padrão (/mcp)
 # ============================================================================
@@ -2154,7 +2554,9 @@ async def mcp_jsonrpc_endpoint(
                         "id": msg_id,
                         "error": {"code": -32602, "message": "project_id é obrigatório"},
                     }
-                res = await mcp_get_project_map(proj_id, auth, db)
+                inc_tokens = arguments.get("include_tokens", True)
+                sum_only = arguments.get("summary_only", False)
+                res = await mcp_get_project_map(proj_id, inc_tokens, sum_only, auth, db)
 
             elif tool_name == "get_screen":
                 req_obj = MCPGetScreenRequest(**arguments)
@@ -2245,6 +2647,38 @@ async def mcp_jsonrpc_endpoint(
                     "id": msg_id,
                     "result": {"content": content},
                 }
+
+            elif tool_name == "restore_screen_revision":
+                req_obj = MCPRestoreScreenRevisionRequest(**arguments)
+                res = await mcp_restore_screen_revision(req_obj, auth, db)
+
+            elif tool_name == "render_screen_state":
+                req_obj = MCPRenderScreenStateRequest(**arguments)
+                res = await mcp_render_screen_state(req_obj, request, auth, db)
+                img_b64 = res.pop("image_base64", None)
+                res.pop("screenshot_bytes", None)
+                res.pop("image_data_uri", None)
+                res_text = json.dumps(res, ensure_ascii=False, indent=2, default=str)
+                content = [{"type": "text", "text": res_text}]
+                if img_b64:
+                    content.append({"type": "image", "data": img_b64, "mimeType": "image/png"})
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {"content": content},
+                }
+
+            elif tool_name == "diagnose_screen":
+                req_obj = MCPDiagnoseScreenRequest(**arguments)
+                res = await mcp_diagnose_screen(req_obj, auth, db)
+
+            elif tool_name == "validate_screen":
+                req_obj = MCPValidateScreenRequest(**arguments)
+                res = await mcp_validate_screen(req_obj, auth, db)
+
+            elif tool_name == "import_project_zip":
+                req_obj = MCPImportProjectZipRequest(**arguments)
+                res = await mcp_import_project_zip(req_obj, auth, db)
 
             else:
                 return {
