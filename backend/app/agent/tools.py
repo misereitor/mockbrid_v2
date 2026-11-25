@@ -1,6 +1,7 @@
 import re
 from typing import Optional, List
 from app.agent.state import QualityAudit
+from app.agent.htmlkit import LAZY_PATTERNS, find_lazy_markers
 
 
 def extract_dom_structure(html: str) -> str:
@@ -100,22 +101,6 @@ def patch_canvas_section(full_html: str, target_selector: str, new_snippet: str)
     return full_html
 
 
-# Palavras que denunciam que a IA teve preguiça e resumiu o código em vez de programar
-LAZY_OUTLINE_PATTERNS = [
-    r'noise\s+overlay\s+div',
-    r'hero\s+(?:section\s+)?div',
-    r'marquee\s+(?:section\s+)?div',
-    r'modelos\s+\(bento\s+grid\)',
-    r'engenharia\s+\(sticky',
-    r'financas\s+\(simulator\)',
-    r'test-drive\s+\(CTA',
-    r'footer\s+div',
-    r'<!--\s*(?:insira|adicione|adicione aqui|coloque aqui|todo|restante|código continua)\s*-->',
-    r'\[\s*(?:insira|coloque|todo|placeholder)\s*\]',
-    r'Lorem\s+ipsum\s+dolor',
-]
-
-
 def verify_ui_quality(html: str) -> QualityAudit:
     """Valida a qualidade do código gerado, garantindo que não seja resumo ou pseudo-código."""
     issues = []
@@ -131,8 +116,8 @@ def verify_ui_quality(html: str) -> QualityAudit:
         )
 
     # 1. Verifica resumos preguiçosos
-    for pat in LAZY_OUTLINE_PATTERNS:
-        if re.search(pat, html, re.IGNORECASE):
+    for pat in find_lazy_markers(html):
+        if pat in LAZY_PATTERNS or pat:
             issues.append(f"Detectado resumo/pseudo-código preguiçoso compatível com padrão '{pat}'.")
             score -= 30
 

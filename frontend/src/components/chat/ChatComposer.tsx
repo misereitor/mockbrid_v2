@@ -1,5 +1,5 @@
 import React from 'react';
-import { Loader2, Send, Target, Workflow, X } from 'lucide-react';
+import { Loader2, Target, Workflow, X } from 'lucide-react';
 import type { SelectedElementInfo } from '../../CanvasEditor';
 
 interface ChatComposerProps {
@@ -7,7 +7,7 @@ interface ChatComposerProps {
   onPromptChange: (value: string) => void;
   onSubmit: () => void;
   loading: boolean;
-  executionMode: 'agent' | 'chat';
+  executionMode?: 'agent' | 'chat';
   selectedElement?: SelectedElementInfo | null;
   onClearSelectedElement?: () => void;
 }
@@ -18,7 +18,6 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
   onPromptChange,
   onSubmit,
   loading,
-  executionMode,
   selectedElement,
   onClearSelectedElement,
 }) => {
@@ -28,7 +27,7 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
         e.preventDefault();
         onSubmit();
       }}
-      className="p-3 border-t border-mockbird-border bg-mockbird-card/40 space-y-2 shrink-0"
+      className="p-3 border-t border-white/[0.08] bg-[#11131b] space-y-2 shrink-0"
     >
       {selectedElement && (
         <div className="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-indigo-500/15 border border-indigo-500/30 text-[11px] text-indigo-300 animate-in fade-in">
@@ -67,39 +66,32 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
         placeholder={
           selectedElement
             ? `Descreva o que alterar no elemento <${selectedElement.tag}> (ex: trocar texto, mudar cor)...`
-            : executionMode === 'agent'
-            ? 'Instrua o Agente (ele analisa a intenção, inspeciona e valida o código)...'
-            : 'Ex: Cria uma landing page para concessionária Honda com hero e grid...'
+             : 'Descreva o que você precisa. O agente analisa a intenção e escolhe o fluxo automaticamente...'
         }
         rows={3}
         disabled={loading}
-        className="w-full bg-mockbird-bg border border-mockbird-border focus:border-mockbird-blue rounded-xl p-2.5 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none resize-none transition leading-relaxed disabled:opacity-60"
+        className="w-full bg-[#090b10] border border-white/[0.1] focus:border-cyan-400/60 rounded-xl p-3 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none resize-none transition leading-relaxed disabled:opacity-60"
       />
 
       <button
         type="submit"
         disabled={loading || !prompt.trim()}
-        className="w-full py-2.5 bg-mockbird-blue hover:bg-mockbird-bluedark disabled:opacity-50 text-white rounded-xl text-xs font-semibold flex items-center justify-center gap-2 transition-all shadow-md"
+        className="w-full py-2.5 bg-[#5865dc] hover:bg-[#6975ed] disabled:opacity-50 text-white rounded-lg text-xs font-semibold flex items-center justify-center gap-2 transition-all"
       >
         {loading ? (
           <>
             <Loader2 className="h-4 w-4 animate-spin text-mockbird-cyan" />
-            <span>{executionMode === 'agent' ? 'Agente em Execução...' : 'Gerando Código...'}</span>
+             <span>Agente analisando e executando...</span>
           </>
         ) : selectedElement ? (
           <>
             <Target size={14} className="text-mockbird-cyan" />
             <span>Modificar Elemento Selecionado</span>
           </>
-        ) : executionMode === 'agent' ? (
-          <>
-            <Workflow size={14} />
-            <span>Executar Agente Autônomo</span>
-          </>
         ) : (
           <>
-            <Send size={14} />
-            <span>Enviar Instrução</span>
+            <Workflow size={14} />
+            <span>Executar automaticamente</span>
           </>
         )}
       </button>

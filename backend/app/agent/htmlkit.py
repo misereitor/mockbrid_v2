@@ -38,21 +38,24 @@ ID_TARGET_TAGS = {
     "h3", "h4", "p", "li", "ul", "ol", "table", "dialog",
 }
 
-LAZY_OUTLINE_PATTERNS = [
-    r"noise\s+overlay\s+div",
-    r"hero\s+(?:section\s+)?div",
-    r"marquee\s+(?:section\s+)?div",
-    r"modelos\s+\(bento\s+grid\)",
-    r"engenharia\s+\(sticky",
-    r"financas\s+\(simulator\)",
-    r"test-drive\s+\(CTA",
-    r"footer\s+div",
+# Padrões de pseudo-código independentes do domínio/projeto. Não coloque aqui
+# nomes de seções de uma demo específica: a auditoria deve funcionar para
+# qualquer tela gerada.
+LAZY_PATTERNS = [
     r"<!--\s*(?:insira|adicione|coloque aqui|todo|restante|código continua)\s*-->",
-    r"\[\s*(?:insira|coloque|todo|placeholder)\s*\]",
-    r"lorem\s+ipsum\s+dolor",
-    r"\.\.\.\s*(?:resto|demais|outros|continua)",
+    r"\[\s*(?:insira|coloque|todo|placeholder|seu texto|seu título)\s*\]",
+    r"\b(?:lorem\s+ipsum|texto\s+de\s+exemplo|sample\s+text)\b",
+    r"(?:TODO|FIXME|IMPLEMENT(?:AR|ATION)?)\s*[:\-]",
+    r"\.\.\.\s*(?:resto|demais|outros|continua|more|remaining)",
+    r"\b(?:coming\s+soon|em\s+breve)\b",
 ]
-_LAZY_RE = [re.compile(p, re.IGNORECASE) for p in LAZY_OUTLINE_PATTERNS]
+LAZY_OUTLINE_PATTERNS = LAZY_PATTERNS  # compatibilidade com importadores antigos
+_LAZY_RE = [re.compile(p, re.IGNORECASE) for p in LAZY_PATTERNS]
+
+
+def find_lazy_markers(html: str) -> List[str]:
+    """Retorna os padrões de pseudo-código encontrados no HTML."""
+    return [pattern.pattern for pattern in _LAZY_RE if pattern.search(html or "")]
 
 QUALITY_SCORE_MIN = 70
 

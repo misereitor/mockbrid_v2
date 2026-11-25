@@ -88,15 +88,18 @@ export function AIChatPanel({
   const [currentSessionId, setCurrentSessionId] = useState<string>(() => sessions[0]?.id || 'sess_default');
   const [prompt, setPrompt] = useState(initialPrompt || '');
   const [loading, setLoading] = useState(false);
-  const [executionMode, setExecutionMode] = useState<'agent' | 'chat'>('agent');
+  // A conversa é sempre automática: o agente decide internamente se deve
+  // explicar, inspecionar, editar ou gerar código.
+  const executionMode: 'agent' = 'agent';
 
-  // Estados do Agente (LangGraph)
+  // Estados do Agente Autônomo
   const [agentStep, setAgentStep] = useState<{ node: string; title: string; detail: string } | null>(null);
+  const [agentTimeline, setAgentTimeline] = useState<Array<{ node: string; title: string; detail?: string; status: string }>>([]);
   const [agentPlan, setAgentPlan] = useState<PlanItem[]>([]);
   const [activeTool, setActiveTool] = useState<string | null>(null);
   const [agentAudit, setAgentAudit] = useState<QualityAuditInfo | null>(null);
 
-  // Estados do Chat Rápido
+  // Estado transitório do streaming
   const [streamingThought, setStreamingThought] = useState('');
   const [streamingContent, setStreamingContent] = useState('');
   const [showThought, setShowThought] = useState(false);
@@ -124,6 +127,9 @@ export function AIChatPanel({
     'gemini-2.0-flash'
   ]);
   const [selectedModel, setSelectedModel] = useState<string>('bonsai-27b');
+  const [providerInfo, setProviderInfo] = useState<{ provider_type: string; base_url?: string; is_active?: boolean; tokens_used_month?: number; monthly_token_limit?: number } | null>(null);
+  const [usageInfo, setUsageInfo] = useState<{ tokens_used_month: number; monthly_token_limit: number; plan?: { name?: string } | null } | null>(null);
+  const [providerLoading, setProviderLoading] = useState(true);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const thoughtEndRef = useRef<HTMLDivElement>(null);
@@ -140,6 +146,7 @@ export function AIChatPanel({
     setStreamingContent('');
     setStreamingThought('');
     setAgentStep(null);
+    setAgentTimeline([]);
     setAgentPlan([]);
     setAgentAudit(null);
     setErrorMessage(null);
@@ -164,22 +171,24 @@ export function AIChatPanel({
     }
   }, [initialPrompt]);
 
-  // Busca modelos reais configurados no backend
+  // Busca configuração real do provedor e consumo da organização.
   useEffect(() => {
-    fetch('/api/ai/providers')
-      .then(r => r.json())
-      .then(data => {
-        if (data && data.length > 0) {
-          const active = data[0];
-          if (active.custom_models && active.custom_models.length > 0) {
-            setAvailableModels(active.custom_models);
-          }
-          if (active.default_model) {
-            setSelectedModel(active.default_model);
+    setProviderLoading(true);
+    Promise.all([fetch('/api/ai/providers'), fetch('/api/org/ai-usage')])
+      .then(async ([providersResponse, usageResponse]) => {
+        if (providersResponse.ok) {
+          const data = await providersResponse.json();
+          if (Array.isArray(data) && data.length > 0) {
+            const active = data.find((item: { is_active?: boolean }) => item.is_active) || data[0];
+            setProviderInfo(active);
+            if (active.custom_models?.length) setAvailableModels(active.custom_models);
+            if (active.default_model) setSelectedModel(active.default_model);
           }
         }
+        if (usageResponse.ok) setUsageInfo(await usageResponse.json());
       })
-      .catch(console.error);
+      .catch(console.error)
+      .finally(() => setProviderLoading(false));
   }, []);
 
   // Scroll automático
@@ -214,6 +223,7 @@ export function AIChatPanel({
     setStreamingContent('');
     setStreamingThought('');
     setAgentStep(null);
+    setAgentTimeline([]);
     setAgentPlan([]);
     setAgentAudit(null);
     setErrorMessage(null);
@@ -282,7 +292,7 @@ export function AIChatPanel({
     setAgentAudit(null);
     setErrorMessage(null);
 
-    // FLUXO 1: AGENTE AUTÔNOMO (LangGraph)
+    // FLUXO 1: AGENTE AUTÔNOMO
     if (executionMode === 'agent') {
       try {
         const response = await fetch('/api/ai/agent/stream', {
@@ -341,6 +351,9 @@ export function AIChatPanel({
 
               if (ev.type === 'node_start') {
                 setAgentStep({ node: ev.node, title: ev.title, detail: ev.detail });
+                setAgentTimeline(prev => [...prev, { node: ev.node, title: ev.title, detail: ev.detail, status: 'running' }]);
+              } else if (ev.type === 'node_end') {
+                setAgentTimeline(prev => prev.map(item => item.node === ev.node ? { ...item, status: ev.status || 'completed' } : item));
               } else if (ev.type === 'node_progress') {
                 if (ev.detail && agentStep) {
                   setAgentStep({ ...agentStep, detail: ev.detail });
@@ -348,8 +361,15 @@ export function AIChatPanel({
               } else if (ev.type === 'plan_ready') {
                 collectedPlan = ev.plan || [];
                 setAgentPlan(collectedPlan);
+              } else if (ev.type === 'plan') {
+                collectedPlan = ev.plan || [];
+                setAgentPlan(collectedPlan);
               } else if (ev.type === 'tool_call') {
                 setActiveTool(ev.tool);
+              } else if (ev.type === 'tool_result') {
+                setActiveTool(null);
+              } else if (ev.type === 'content_chunk') {
+                setStreamingContent(prev => prev + (ev.text || ''));
               } else if (ev.type === 'audit_result') {
                 collectedAudit = {
                   score: ev.score,
@@ -725,26 +745,29 @@ export function AIChatPanel({
     setTimeout(() => setCopiedId(null), 2000);
   };
 
+  const estimatedContextTokens = Math.ceil((currentHtml.length + prompt.length) / 4);
+  const responseLimit = 8192;
+  const usagePercent = usageInfo?.monthly_token_limit
+    ? Math.min(100, Math.round((usageInfo.tokens_used_month / usageInfo.monthly_token_limit) * 100))
+    : 0;
+  const providerLabel = providerInfo?.provider_type || (providerLoading ? 'conectando' : 'não configurado');
+  const compactNumber = (value?: number) => value == null ? '—' : new Intl.NumberFormat('pt-BR', { notation: 'compact', maximumFractionDigits: 1 }).format(value);
+
   return (
-    <div className="w-full flex flex-col h-full bg-mockbird-surface text-slate-100 select-none overflow-hidden relative">
+    <div className="w-full flex flex-col h-full bg-[#0b0c10] text-slate-100 select-none overflow-hidden relative">
       {/* Header com Seletor de Modelo e Histórico */}
-      <div className="p-3 border-b border-mockbird-border flex items-center justify-between gap-2 shrink-0 bg-mockbird-card/40">
+      <div className="px-4 py-3 border-b border-white/[0.08] flex items-center justify-between gap-3 shrink-0 bg-[#11131b]">
         <div className="flex items-center gap-2 min-w-0">
-          <div className="p-1.5 rounded-lg bg-mockbird-blue/20 text-mockbird-cyan shrink-0">
-            {executionMode === 'agent' ? <Workflow size={16} /> : <Sparkles size={16} />}
+          <div className="relative p-2 rounded-xl bg-[#1a2030] text-cyan-300 shrink-0 border border-cyan-300/15">
+            <Workflow size={17} />
+            <span className="absolute -right-0.5 -bottom-0.5 h-2 w-2 rounded-full bg-emerald-400 ring-2 ring-[#11131d]" />
           </div>
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">
-              <span className="text-xs font-bold text-white truncate">
-                {executionMode === 'agent' ? 'Agente Autônomo' : 'Assistente IA'}
-              </span>
-              <span className={`text-[10px] px-1.5 py-0.2 rounded-full font-medium ${
-                executionMode === 'agent' ? 'bg-indigo-500/10 text-indigo-400' : 'bg-emerald-500/10 text-emerald-400'
-              }`}>
-                {executionMode === 'agent' ? 'LangGraph' : 'Chat'}
-              </span>
+              <span className="text-[13px] font-semibold tracking-tight text-white truncate">Agente Autônomo</span>
+              <span className="text-[9px] px-1.5 py-0.5 rounded-md font-medium bg-emerald-400/10 text-emerald-300">online</span>
             </div>
-            <p className="text-[10px] text-slate-400 truncate">Edição cirúrgica, reversão e diff visual</p>
+            <p className="text-[10px] text-slate-400 truncate">Analisa, executa e valida alterações no canvas</p>
           </div>
         </div>
 
@@ -752,7 +775,7 @@ export function AIChatPanel({
           <button
             type="button"
             onClick={() => setShowSessionsDrawer(!showSessionsDrawer)}
-            className={`p-1.5 rounded-lg border transition-all text-xs flex items-center gap-1 ${
+              className={`p-2 rounded-lg border transition-all text-xs flex items-center gap-1.5 ${
               showSessionsDrawer
                 ? 'bg-mockbird-blue/20 border-mockbird-blue text-white'
                 : 'bg-mockbird-surface border-mockbird-border text-slate-300 hover:text-white'
@@ -766,7 +789,7 @@ export function AIChatPanel({
           <button
             type="button"
             onClick={handleCreateSession}
-            className="p-1.5 rounded-lg bg-mockbird-surface border border-mockbird-border hover:bg-mockbird-card text-slate-300 hover:text-white transition"
+              className="p-2 rounded-lg bg-white/[0.03] border border-white/[0.08] hover:bg-white/[0.08] text-slate-300 hover:text-white transition"
             title="Nova Conversa"
           >
             <Plus size={14} />
@@ -774,40 +797,14 @@ export function AIChatPanel({
         </div>
       </div>
 
-      {/* Seletor de Modo: Agente (LangGraph) vs Chat Rápido */}
-      <div className="px-3 py-1.5 bg-[#0a0a0c] border-b border-mockbird-border flex items-center justify-between text-xs">
-        <div className="flex items-center gap-1 p-0.5 rounded-lg bg-mockbird-surface border border-mockbird-border text-[11px]">
-          <button
-            type="button"
-            onClick={() => setExecutionMode('agent')}
-            className={`px-2 py-0.5 rounded-md font-semibold flex items-center gap-1.5 transition-all ${
-              executionMode === 'agent'
-                ? 'bg-mockbird-blue text-white shadow-sm'
-                : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            <Workflow size={12} />
-            <span>Agente LangGraph</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setExecutionMode('chat')}
-            className={`px-2 py-0.5 rounded-md font-semibold flex items-center gap-1.5 transition-all ${
-              executionMode === 'chat'
-                ? 'bg-mockbird-blue text-white shadow-sm'
-                : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            <Zap size={12} />
-            <span>Chat Rápido</span>
-          </button>
-        </div>
+      {/* O agente escolhe o fluxo automaticamente; não há modo manual. */}
+      <div className="px-4 py-1.5 bg-[#0d0f15] border-b border-white/[0.06] flex items-center justify-end text-xs">
 
         {/* Modelo Selecionado */}
         <select
           value={selectedModel}
           onChange={(e) => setSelectedModel(e.target.value)}
-          className="bg-mockbird-bg border border-mockbird-border rounded-md px-2 py-0.5 text-[11px] text-slate-200 focus:outline-none focus:border-mockbird-blue cursor-pointer"
+          className="bg-transparent border-0 rounded-md px-1.5 py-0.5 text-[10px] text-slate-500 focus:outline-none focus:text-slate-200 cursor-pointer"
         >
           {availableModels.map(m => (
             <option key={m} value={m}>{m}</option>
@@ -863,16 +860,17 @@ export function AIChatPanel({
       )}
 
       {/* Lista de Mensagens do Chat */}
-      <div className="flex-1 overflow-y-auto p-3.5 space-y-3.5 text-xs">
+      <div className="flex-1 overflow-y-auto p-3.5 space-y-3 text-xs scrollbar-thin scrollbar-thumb-white/10">
         {currentMessages.length === 0 && !loading && (
-          <div className="h-full flex flex-col items-center justify-center text-center p-6 text-slate-400 space-y-3">
-            <div className="p-3 rounded-2xl bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-              <Workflow size={28} />
+          <div className="h-full flex flex-col items-center justify-center text-center p-6 text-slate-400 space-y-4">
+          <div className="relative p-3.5 rounded-2xl bg-[#151b2a] text-cyan-300 border border-cyan-300/15">
+              <Workflow size={30} />
+              <Sparkles size={13} className="absolute -right-1 -top-1 text-indigo-300" />
             </div>
             <div className="space-y-1">
-              <h4 className="text-xs font-bold text-white">Agente Inteligente do Mockbird v2</h4>
+              <h4 className="text-sm font-semibold text-white tracking-tight">Como posso melhorar sua tela?</h4>
               <p className="text-[11px] text-slate-400 max-w-[260px] leading-relaxed">
-                Você pode pedir alterações, comparar diffs visuais, reverter qualquer mudança e voltar mensagens com um clique.
+                Descreva a mudança em linguagem natural. Eu inspeciono o canvas, faço a alteração e valido o resultado.
               </p>
             </div>
 
@@ -881,14 +879,14 @@ export function AIChatPanel({
               <button
                 type="button"
                 onClick={() => setPrompt('Cria uma landing page para concessionária Honda com hero do Civic Type R, grid bento de modelos e simulador de financiamento')}
-                className="w-full p-2 rounded-lg bg-mockbird-card hover:bg-mockbird-card/80 border border-mockbird-border text-[11px] text-slate-300 transition text-left"
+                 className="w-full p-2.5 rounded-lg bg-[#11131b] hover:bg-[#181b26] border border-white/[0.08] text-[11px] text-slate-300 transition text-left"
               >
                 🏎️ Concessionária Honda com Bento Grid
               </button>
               <button
                 type="button"
                 onClick={() => setPrompt('O layout tá com alinhamento quebrado no cabeçalho e nos cards. Poderia consertar a estrutura mantendo os elementos?')}
-                className="w-full p-2 rounded-lg bg-mockbird-card hover:bg-mockbird-card/80 border border-mockbird-border text-[11px] text-slate-300 transition text-left"
+                 className="w-full p-2.5 rounded-lg bg-[#11131b] hover:bg-[#181b26] border border-white/[0.08] text-[11px] text-slate-300 transition text-left"
               >
                 🛠️ Consertar alinhamento e layout quebrado
               </button>
@@ -921,7 +919,7 @@ export function AIChatPanel({
                   <div className="flex items-center justify-between gap-2 text-[10px] text-blue-200">
                     <div className="flex items-center gap-1.5">
                       {msg.mode === 'agent' ? <Workflow size={11} /> : <Zap size={11} />}
-                      <span>{msg.mode === 'agent' ? 'Agente LangGraph' : 'Chat Direto'}</span>
+                      <span>{msg.mode === 'agent' ? 'Agente' : 'Chat Direto'}</span>
                       {msg.targetTag && (
                         <span className="ml-1 px-1.5 py-0.2 bg-black/20 rounded font-mono text-emerald-300">
                           alvo: &lt;{msg.targetTag}&gt;
@@ -1136,15 +1134,15 @@ export function AIChatPanel({
           );
         })}
 
-        {/* Execução Ativa do Agente LangGraph */}
+        {/* Execução Ativa do Agente Autônomo */}
         {loading && executionMode === 'agent' && (
           <div className="space-y-2.5 max-w-[96%] animate-in fade-in">
             {/* Card do Nó Ativo */}
-            <div className="p-3 rounded-xl bg-indigo-950/30 border border-indigo-500/30 text-xs space-y-2">
+            <div className="p-3 rounded-xl bg-[#151827] border border-indigo-400/20 text-xs space-y-2.5">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2 text-indigo-300 font-bold">
                   <Loader2 size={14} className="animate-spin text-mockbird-cyan" />
-                  <span>{agentStep?.title || 'Inicializando Grafo do Agente...'}</span>
+                  <span className="text-white">{agentStep?.title || 'Inicializando agente...'}</span>
                 </div>
                 {activeTool && (
                   <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-mono flex items-center gap-1">
@@ -1163,9 +1161,21 @@ export function AIChatPanel({
               )}
             </div>
 
+            {agentTimeline.length > 0 && (
+              <div className="p-3 rounded-xl border border-white/[0.08] bg-[#11131b] space-y-2">
+                <div className="flex items-center gap-1.5 text-[11px] font-semibold text-mockbird-cyan"><Workflow size={13} /><span>Linha do tempo</span></div>
+                {agentTimeline.map((item, index) => (
+                  <div key={`${item.node}-${index}`} className="flex items-center gap-2 text-[10px] text-slate-300">
+                    <span className={`h-2 w-2 rounded-full ${item.status === 'running' ? 'bg-cyan-400 animate-pulse' : item.status === 'failed' ? 'bg-red-400' : 'bg-emerald-400'}`} />
+                    <span>{item.title}</span>
+                    <span className="ml-auto text-slate-500">{item.status === 'running' ? 'executando' : item.status === 'failed' ? 'falhou' : 'concluído'}</span>
+                  </div>
+                ))}
+              </div>
+            )}
             {/* Plano de Ação em Andamento */}
             {agentPlan.length > 0 && (
-              <div className="p-2.5 rounded-xl border border-mockbird-border bg-[#0a0a0c] space-y-1.5">
+              <div className="p-3 rounded-xl border border-white/[0.08] bg-[#11131b] space-y-2">
                 <div className="flex items-center gap-1.5 text-[11px] font-semibold text-mockbird-cyan">
                   <Workflow size={13} />
                   <span>Plano Arquitetural ({agentPlan.length} etapas)</span>
@@ -1173,7 +1183,7 @@ export function AIChatPanel({
                 <div className="space-y-1">
                   {agentPlan.map((p) => (
                     <div key={p.id} className="flex items-start gap-2 text-[10px] text-slate-300 bg-mockbird-surface p-1.5 rounded-lg border border-mockbird-border/40">
-                      <span className="font-mono font-bold text-mockbird-cyan shrink-0">{p.id}.</span>
+                       <span className={`font-mono font-bold shrink-0 ${p.status === 'completed' ? 'text-emerald-400' : p.status === 'failed' ? 'text-red-400' : 'text-mockbird-cyan'}`}>{p.status === 'completed' ? '✓' : p.status === 'failed' ? '!' : `${p.id}.`}</span>
                       <div>
                         <strong className="text-white">{p.title}:</strong> <span className="text-slate-400">{p.description}</span>
                       </div>
@@ -1186,7 +1196,7 @@ export function AIChatPanel({
         )}
 
         {/* Streaming Ativo do Chat Direto */}
-        {loading && executionMode === 'chat' && (
+        {loading && false && (
           <div className="space-y-2 max-w-[96%] animate-in fade-in">
             {streamingThought && (
               <div className="rounded-xl border border-mockbird-border bg-[#0a0a0c] p-2.5">
@@ -1255,6 +1265,18 @@ export function AIChatPanel({
         selectedElement={selectedElement}
         onClearSelectedElement={onClearSelectedElement}
       />
+
+      <div className="shrink-0 border-t border-white/[0.06] bg-[#090b10] px-3 py-1.5 font-mono text-[9px] text-slate-500">
+        <div className="flex items-center gap-x-3 gap-y-1 flex-wrap">
+          <span className="flex items-center gap-1 text-slate-400"><span className={`h-1.5 w-1.5 rounded-full ${providerLoading ? 'bg-amber-400' : providerInfo ? 'bg-emerald-400' : 'bg-rose-400'}`} />{providerLabel}</span>
+          <span className="text-slate-300">{selectedModel}</span>
+          <span title="Estimativa: caracteres divididos por 4">ctx ~{compactNumber(estimatedContextTokens)} / {compactNumber(responseLimit)}</span>
+          <span className="ml-auto flex items-center gap-1.5" title="Consumo mensal da organização">
+            uso {compactNumber(usageInfo?.tokens_used_month)} / {compactNumber(usageInfo?.monthly_token_limit)}
+            {usageInfo?.monthly_token_limit ? <span className="h-1 w-12 overflow-hidden rounded-full bg-white/10"><span className="block h-full bg-cyan-400" style={{ width: `${usagePercent}%` }} /></span> : null}
+          </span>
+        </div>
+      </div>
 
       {rewindTarget && (
         <RewindModal

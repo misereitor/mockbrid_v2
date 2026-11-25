@@ -103,6 +103,15 @@ interface ContextMenuState {
 const ZOOM_MIN = 0.2;
 const ZOOM_MAX = 3.0;
 
+// Largura mínima da "janela" do navegador desenhada no canvas.
+// No Chrome (DevTools) a UI do navegador — aba, omnibox, barra de dispositivos —
+// não encolhe junto com o viewport: só o DOM emulado fica menor. Aqui é a mesma
+// ideia: o chrome nunca cai abaixo disso, e o conteúdo é centralizado numa faixa.
+const CHROME_MIN_WIDTH = 860;
+// Altura da barra do Chrome (abas + omnibox + barra de dispositivos + réguas)
+// mais o rodapé de status: usada para encaixar o artboard na área disponível.
+const BROWSER_UI_HEIGHT = 145;
+
 export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
   initialHtml,
   tokens,
@@ -132,6 +141,8 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
   const [docVersion, setDocVersion] = useState(0);
   const [canvasWidth, setCanvasWidth] = useState(width);
   const [canvasHeight, setCanvasHeight] = useState(height);
+  // Largura da janela do navegador (chrome + rodapé). Só o DOM recebe canvasWidth.
+  const chromeWidth = Math.max(canvasWidth, CHROME_MIN_WIDTH);
   const [navigationEvent, setNavigationEvent] = useState<{ target: string; id: number }>();
   const navigationIdRef = useRef(0);
 
@@ -187,10 +198,10 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
     if (!el) return;
     const availW = el.clientWidth - 80;
     const availH = el.clientHeight - 100;
-    const next = Math.min(1.2, Math.max(ZOOM_MIN, Math.min(availW / width, availH / (height + 36))));
+    const next = Math.min(1.2, Math.max(ZOOM_MIN, Math.min(availW / chromeWidth, availH / (canvasHeight + BROWSER_UI_HEIGHT))));
     setScale(Math.floor(next * 100) / 100);
     setPan({ x: 0, y: 0 });
-  }, [width, height]);
+  }, [chromeWidth, canvasHeight]);
 
   // Zoom centralizado ou em coordenadas específicas
   const zoomAtPoint = useCallback((factor: number, clientX?: number, clientY?: number) => {
@@ -271,11 +282,11 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
     },
   }), [fitToScreen]);
 
-  // Ajuste automático inicial
+  // Ajuste automático inicial (e a cada troca de viewport)
   useEffect(() => {
     fitToScreen();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [width, height]);
+  }, [canvasWidth, canvasHeight]);
 
   // Script injetado no iframe: monta o documento do canvas com o runtime de seleção/edição embutido
   const initialThemeRef = useRef(theme);
@@ -804,6 +815,7 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
           {/* Barra de Navegador (Chrome Bar Completa) */}
           <CanvasChromeBar
             width={canvasWidth}
+            chromeWidth={chromeWidth}
             height={canvasHeight}
             zoom={scale}
             iframeRef={iframeRef}
@@ -819,35 +831,45 @@ export const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({
             navigationEvent={navigationEvent}
           />
 
-          {/* Iframe com key dinâmica para renderização imediata do patch */}
+          {/* Área do conteúdo: só o DOM recebe a largura emulada. A janela do
+              navegador mantém chromeWidth, então a barra (aba, omnibox, barra de
+              dispositivos) nunca encolhe nem quebra ao trocar para tablet/celular
+              — igual ao modo de dispositivo do Chrome. */}
           <div
-            style={{ width: `${canvasWidth}px`, height: `${canvasHeight}px` }}
-            className="bg-[#09090b] border-x border-[#3c4043] overflow-hidden relative shadow-inner"
+            style={{ width: `${chromeWidth}px` }}
+            className="flex justify-center bg-[#202124] border-x border-[#3c4043]"
           >
-            {/* Overlay transparente ativo durante Pan ou modo Mão para capturar arrasto sem engolir mouse no iframe */}
-            {(isPanning || spacePressed || canvasMode === 'hand') && (
-              <div
-                onMouseDown={handleMouseDown}
-                className="absolute inset-0 z-30 cursor-grab active:cursor-grabbing bg-transparent"
+            <div
+              style={{ width: `${canvasWidth}px`, height: `${canvasHeight}px` }}
+              className={`bg-[#09090b] border-x border-[#3c4043] overflow-hidden relative shrink-0 ${
+                chromeWidth > canvasWidth ? 'shadow-2xl' : 'shadow-inner'
+              }`}
+            >
+              {/* Overlay transparente ativo durante Pan ou modo Mão para capturar arrasto sem engolir mouse no iframe */}
+              {(isPanning || spacePressed || canvasMode === 'hand') && (
+                <div
+                  onMouseDown={handleMouseDown}
+                  className="absolute inset-0 z-30 cursor-grab active:cursor-grabbing bg-transparent"
+                />
+              )}
+              {/* Sem allow-same-origin: HTML gerado por IA/MCP roda em origem opaca
+                  e não consegue ler cookies nem chamar a API do app. */}
+              <iframe
+                key={`canvas_iframe_${docVersion}`}
+                ref={iframeRef}
+                data-mockbird-canvas="frame"
+                srcDoc={builtHtmlDoc}
+                title="Mockbird Canvas"
+                sandbox="allow-scripts allow-forms allow-modals"
+                onLoad={syncMode}
+                className="w-full h-full border-0 bg-[#09090b]"
               />
-            )}
-            {/* Sem allow-same-origin: HTML gerado por IA/MCP roda em origem opaca
-                e não consegue ler cookies nem chamar a API do app. */}
-            <iframe
-              key={`canvas_iframe_${docVersion}`}
-              ref={iframeRef}
-              data-mockbird-canvas="frame"
-              srcDoc={builtHtmlDoc}
-              title="Mockbird Canvas"
-              sandbox="allow-scripts allow-forms allow-modals"
-              onLoad={syncMode}
-              className="w-full h-full border-0 bg-[#09090b]"
-            />
+            </div>
           </div>
 
           {/* Barra de Status da Janela do Navegador (Rodapé) */}
           <div
-            style={{ width: `${canvasWidth}px` }}
+            style={{ width: `${chromeWidth}px` }}
             className="h-7 px-3 bg-[#202124] border-x border-b border-[#3c4043] rounded-b-xl flex items-center justify-between text-[11px] text-[#9aa0a6] select-none"
           >
             <span className="font-medium text-slate-300 flex items-center gap-2">

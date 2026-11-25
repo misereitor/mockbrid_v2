@@ -117,6 +117,8 @@ class MockbirdAgentGraph:
         self.section_max_tokens = int(getattr(settings, "AI_SECTION_MAX_TOKENS", 2600))
         self.max_attempts = max(1, int(getattr(settings, "AI_LLM_MAX_ATTEMPTS", 2)))
         self.max_repairs = max(0, int(getattr(settings, "AI_AGENT_MAX_REPAIRS", 1)))
+        self.dynamic_enabled = bool(getattr(settings, "AI_AGENT_DYNAMIC", True))
+        self.max_iterations = max(1, int(getattr(settings, "AI_AGENT_MAX_ITERATIONS", 10)))
 
     # ------------------------------------------------------------------
     # Camada de transporte / streaming
@@ -303,6 +305,12 @@ class MockbirdAgentGraph:
                 out["error"] = event.get("detail")
             elif event["type"] == "node_progress":
                 yield event
+            elif event["type"] == "content_chunk":
+                # Mantém o streaming disponível para o painel; o conteúdo
+                # completo continua sendo consolidado no evento completed.
+                yield event
+            elif event["type"] == "thinking_chunk":
+                yield event
 
     async def _continue(
         self,
@@ -338,6 +346,100 @@ class MockbirdAgentGraph:
     # ------------------------------------------------------------------
     # Intenção
     # ------------------------------------------------------------------
+    async def _run_dynamic(self, state: AgentState) -> AsyncGenerator[Dict[str, Any], None]:
+        """Executa o agente como um loop de decisões, com fallback seguro.
+
+        A resposta do modelo é deliberadamente pequena: uma decisão JSON por
+        turno. A geração pesada continua usando os validadores/receitas legados,
+        portanto modelos fracos não conseguem aplicar HTML sem validação.
+        """
+        yield {"type": "node_start", "node": "agent", "title": "Agente Autônomo", "detail": "Decidindo a próxima ação..."}
+        system = (
+            "Você é um agente autônomo de UI. Trabalhe em turnos e escolha UMA ação por vez. "
+            "Responda SOMENTE um JSON válido no formato {\"thought\":\"...\",\"action\":\"...\",\"args\":{}}. "
+            "Ações: inspect_element, get_dom_slice, diagnose_layout, set_plan, generate_element_patch, "
+            "generate_full_patch, generate_section, finish. Use as ferramentas antes de gerar."
+        )
+        context = f"PEDIDO: {state.prompt}\nDOM: {extract_dom_structure(state.current_html) if state.current_html else 'vazio'}"
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": context}]
+        for iteration in range(self.max_iterations):
+            out: Dict[str, Any] = {}
+            async for event in self._collect(messages, out, max_tokens=700, temperature=0.2, detail="Pensando"):
+                yield event
+            if out.get("error"):
+                state.error = out["error"]
+                yield {"type": "error", "detail": out["error"]}
+                return
+            raw = (out.get("content") or "").strip()
+            match = re.search(r"\{[\s\S]*\}", raw)
+            decision: Optional[Dict[str, Any]] = None
+            if match:
+                try:
+                    parsed = json.loads(match.group(0))
+                    if isinstance(parsed, dict) and isinstance(parsed.get("action"), str):
+                        decision = parsed
+                except (json.JSONDecodeError, TypeError):
+                    decision = None
+            if not decision:
+                # Protocolo não suportado: preserva os fluxos testados e seguros.
+                yield {"type": "node_progress", "chars": 0, "detail": "Modelo sem protocolo de ferramentas; usando fluxo compatível."}
+                async for event in self._run_deterministic(state):
+                    yield event
+                return
+
+            action = decision["action"]
+            args = decision.get("args") or {}
+            thought = str(decision.get("thought") or "")[:500]
+            yield {"type": "node_progress", "chars": 0, "detail": thought or f"Executando {action}"}
+            if action == "inspect_element":
+                identifier = str(args.get("target") or args.get("mbId") or state.target_mb_id or "")
+                result = extract_element_snippet(state.current_html, identifier) or "Elemento não localizado."
+                summary = f"Elemento inspecionado ({len(result)} caracteres)."
+                state.tools_history.append(ToolCallRecord(tool=action, args=args, result=summary, success=bool(result)))
+                yield {"type": "tool_call", "tool": action, "summary": summary}
+                yield {"type": "tool_result", "tool": action, "ok": bool(result), "summary": summary}
+            elif action in ("get_dom_slice", "diagnose_layout"):
+                result = extract_dom_structure(state.current_html) if action == "get_dom_slice" else diagnose_layout_issues(state.current_html)
+                summary = f"{action}: {len(result)} item(ns)."
+                state.tools_history.append(ToolCallRecord(tool=action, args=args, result=summary))
+                yield {"type": "tool_call", "tool": action, "summary": summary}
+                yield {"type": "tool_result", "tool": action, "ok": True, "summary": summary, "data": result}
+            elif action == "set_plan":
+                state.plan = [PlanStep(id=i + 1, title=str(item.get("title", f"Etapa {i + 1}")), description=str(item.get("description", ""))) for i, item in enumerate(args.get("steps", [])) if isinstance(item, dict)]
+                if not state.plan:
+                    state.plan = [step.model_copy() for step in PLANNER_FALLBACK]
+                yield {"type": "plan_ready", "plan": [s.model_dump() for s in state.plan]}
+                yield {"type": "plan", "plan": [s.model_dump() for s in state.plan]}
+            elif action == "generate_element_patch":
+                async for event in self._run_surgical(state):
+                    yield event
+                return
+            elif action in ("generate_full_patch", "generate_section"):
+                async for event in (self._run_layout_repair(state) if action == "generate_full_patch" else self._run_full_page(state)):
+                    yield event
+                return
+            elif action == "finish":
+                state.is_complete = True
+                state.final_summary = str(args.get("summary") or thought or "Execução concluída.")
+                yield {"type": "agent_done", "patch": state.accumulated_patch, "patch_type": state.patch_type, "summary": state.final_summary, "reasoning": out.get("reasoning"), "plan": [s.model_dump() for s in state.plan]}
+                return
+            else:
+                yield {"type": "tool_result", "tool": action, "ok": False, "summary": "Ferramenta desconhecida."}
+            messages += [{"role": "assistant", "content": raw}, {"role": "user", "content": "Continue com a próxima ação. Responda somente JSON."}]
+        yield {"type": "error", "detail": "O agente atingiu o limite de iterações sem concluir."}
+
+    async def _run_deterministic(self, state: AgentState) -> AsyncGenerator[Dict[str, Any], None]:
+        intent = self._determine_intent(state)
+        state.intent = intent
+        if intent == "explanation":
+            async for event in self._run_explanation(state): yield event
+        elif intent == "surgical_edit":
+            async for event in self._run_surgical(state): yield event
+        elif intent == "layout_repair":
+            async for event in self._run_layout_repair(state): yield event
+        else:
+            async for event in self._run_full_page(state): yield event
+
     def _determine_intent(self, state: AgentState) -> str:
         if state.target_element and (
             state.target_element.mbId or state.target_element.selector or state.target_element.outerHtml
@@ -379,9 +481,15 @@ class MockbirdAgentGraph:
     # Execução
     # ------------------------------------------------------------------
     async def run(self, state: AgentState) -> AsyncGenerator[Dict[str, Any], None]:
+        # O loop dinâmico também usa `_collect`, que precisa do modelo antes
+        # de qualquer decisão ou fallback.
+        self.model = state.model_name
+        if self.dynamic_enabled:
+            async for event in self._run_dynamic(state):
+                yield event
+            return
         intent = self._determine_intent(state)
         state.intent = intent
-        self.model = state.model_name
 
         if intent == "explanation":
             async for event in self._run_explanation(state):

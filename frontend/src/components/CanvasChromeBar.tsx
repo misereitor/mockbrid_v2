@@ -16,6 +16,9 @@ import {
 
 export interface CanvasChromeBarProps {
   width: number;
+  /** Largura da janela do navegador. Normalmente igual a `width`, mas nunca
+   *  cai abaixo do mínimo em que a barra fica confortável: só o DOM encolhe. */
+  chromeWidth?: number;
   height: number;
   zoom: number;
   iframeRef: React.RefObject<HTMLIFrameElement | null>;
@@ -40,8 +43,13 @@ const DEVICES = {
 
 type NetworkProfile = 'off' | 'slow3g' | '4g';
 
+// Abaixo disso a barra de dispositivos do Chrome começa a espremer os controles
+// (mesma lógica da largura mínima da janela no CanvasEditor).
+const COMPACT_BELOW = 900;
+
 export function CanvasChromeBar({
   width,
+  chromeWidth,
   height,
   zoom,
   iframeRef,
@@ -67,6 +75,10 @@ export function CanvasChromeBar({
   const [device, setDevice] = useState('desktop');
   const [network, setNetwork] = useState<NetworkProfile>('off');
   const [, setHistoryVersion] = useState(0);
+
+  // Largura real da janela desenhada: a UI do Chrome não acompanha o viewport.
+  const barWidth = chromeWidth ?? width;
+  const compact = barWidth < COMPACT_BELOW;
 
   useEffect(() => {
     try {
@@ -150,7 +162,7 @@ export function CanvasChromeBar({
     <div
       data-testid="canvas-chrome-bar"
       className="flex flex-col rounded-t-xl bg-[#202124] text-slate-200 select-none overflow-hidden border border-[#3c4043] border-b-0 shadow-2xl"
-      style={{ width: `${width}px` }}
+      style={{ width: `${barWidth}px` }}
     >
       {/* 1. Chrome Tab Strip (Abas do Navegador) */}
       <div className="h-9 bg-[#1f1f1f] flex items-center justify-between px-2 pt-1 border-b border-[#292a2d]">
@@ -370,10 +382,12 @@ export function CanvasChromeBar({
           <option value="4g">4G</option>
         </select>
 
-        {/* Save Data tag */}
-        <span className="text-[11px] text-slate-400 hidden sm:inline">
-          'Save-Data': default
-        </span>
+        {/* Save Data tag (some em janelas estreitas para não quebrar a linha) */}
+        {!compact && (
+          <span className="text-[11px] text-slate-400 hidden sm:inline">
+            'Save-Data': default
+          </span>
+        )}
 
         {/* Botão de Rotacionar Dispositivo (Fiel ao ícone do Chrome DevTools na Imagem 2) */}
         <button

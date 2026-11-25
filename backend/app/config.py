@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     AI_SECTION_MAX_TOKENS: int = 2600
     AI_LLM_MAX_ATTEMPTS: int = 2
     AI_AGENT_MAX_REPAIRS: int = 1
+    # Motor autônomo: habilitado por padrão, com fallback determinístico para
+    # modelos que não entendem o protocolo de ferramentas.
+    AI_AGENT_DYNAMIC: bool = True
+    AI_AGENT_MAX_ITERATIONS: int = 10
     # Refino visual: precisa devolver a tela inteira, mas sem estourar o
     # tempo de resposta de modelos locais mais lentos.
     AI_VISION_MAX_TOKENS: int = 2400
@@ -62,4 +66,3 @@ class Settings(BaseSettings):
 
 settings = Settings()
 settings.validate_production_secrets()
-

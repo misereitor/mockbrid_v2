@@ -4,6 +4,7 @@ export interface PlanItem {
   id: number;
   title: string;
   description: string;
+  status?: 'pending' | 'running' | 'completed' | 'failed';
 }
 
 export interface QualityAuditInfo {

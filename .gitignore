@@ -49,3 +49,5 @@ backend/assets_storage/
 
 # Harness state (ulw plans/ledger/evidence)
 .omo/
+
+pendencias.txt
