@@ -162,6 +162,21 @@ class ScreenUpdate(BaseModel):
     transition: Optional[str] = None
 
 
+class BatchScreenUpdateItem(BaseModel):
+    screen_id: Optional[str] = None
+    screen_name: Optional[str] = None
+    canvas_name: Optional[str] = None
+    html_content: str
+    css_content: Optional[str] = None
+    js_content: Optional[str] = None
+    viewport: Optional[str] = None
+    change_summary: Optional[str] = "Atualização em lote"
+
+
+class BatchScreensUpdateRequest(BaseModel):
+    screens: List[BatchScreenUpdateItem]
+
+
 class ScreenOut(BaseModel):
     id: str
     canvas_id: str

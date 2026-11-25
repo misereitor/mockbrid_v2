@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import delete, func
 from datetime import timedelta
+import hashlib
 import logging
 import secrets
 
@@ -30,7 +31,7 @@ from app.mailer import (
     send_password_reset_email,
     send_verification_email,
 )
-from app.models import User, Organization, Workspace, Session
+from app.models import User, Organization, Workspace, Session, MCPApiKey
 from app.schemas import (
     ForgotPasswordRequest,
     ResetPasswordRequest,
@@ -61,6 +62,41 @@ async def get_current_user(request: Request, db: AsyncSession = Depends(get_db))
 
     if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Não autenticado")
+
+    # Suporte nativo à chave de API MCP (Bearer mb_live_...) para scripts de automação e integração REST
+    if token.startswith(("mb_live_", "mb_mcp_", "mb_")):
+        key_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        mcp_res = await db.execute(
+            select(MCPApiKey, User)
+            .join(User, User.id == MCPApiKey.user_id)
+            .where(
+                MCPApiKey.key_hash == key_hash,
+                MCPApiKey.revoked_at.is_(None),
+            )
+        )
+        row = mcp_res.first()
+        if not row:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Chave MCP de API inválida ou revogada",
+            )
+        mcp_key, user = row[0], row[1]
+        if mcp_key.expires_at and mcp_key.expires_at < utcnow():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Chave MCP de API expirada",
+            )
+
+        if not user or not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Usuário associado à chave MCP está inativo ou inexistente",
+            )
+
+        mcp_key.last_used_at = utcnow()
+        await db.commit()
+        request.state.mcp_key = mcp_key
+        return user
 
     payload = decode_access_token(token)
     if not payload or "sub" not in payload:

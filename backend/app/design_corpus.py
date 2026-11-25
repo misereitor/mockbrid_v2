@@ -269,66 +269,104 @@ def parse_design_corpus(blob: bytes) -> Dict[str, Any]:
         for path in files
         if posixpath.basename(path) == "canvas.json" and not _is_ignored_path(path)
     )
-    if not canvas_files:
-        raise DesignCorpusError(
-            "Nenhum canvas.json encontrado. Envie a pasta design/ do projeto antigo "
-            "(design/tokens.json + design/<tela>/canvas.json + os .html)."
-        )
-
     light, dark, shared = extract_tokens(files)
     canvases: List[Dict[str, Any]] = []
     warnings: List[str] = []
     screen_count = 0
 
-    for canvas_path in canvas_files:
-        try:
-            raw = json.loads(_decode(files[canvas_path]))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            warnings.append(f"{canvas_path}: JSON inválido, canvas ignorado.")
-            continue
-        if not isinstance(raw, dict):
-            continue
-
-        folder = posixpath.dirname(canvas_path)
-        name = str(raw.get("title") or raw.get("name") or posixpath.basename(folder) or "Canvas")
-        screens: List[Dict[str, Any]] = []
-        for item in raw.get("screens") or []:
-            if not isinstance(item, dict):
-                continue
-            file_ref = str(item.get("file") or "")
-            if not file_ref:
-                warnings.append(f"{canvas_path}: tela sem arquivo, ignorada.")
-                continue
-            html_path = posixpath.normpath(posixpath.join(folder, file_ref))
-            if html_path not in files:
-                warnings.append(f"{html_path}: arquivo da tela não está no ZIP.")
-                continue
-            if screen_count >= MAX_SCREENS:
-                warnings.append("Limite de telas por importação atingido; restante ignorado.")
-                break
-            try:
-                width = int(item.get("width") or 1440)
-                height = int(item.get("height") or 900)
-            except (TypeError, ValueError):
-                width, height = 1440, 900
-            html = inline_assets(_decode(files[html_path]), html_path, files)
-            screens.append(
-                {
-                    "name": str(item.get("name") or item.get("id") or posixpath.basename(html_path)),
-                    "html_content": html,
-                    "width": width,
-                    "height": height,
-                    "device_type": _device_type(item.get("device"), width),
-                    "screen_kind": "modal_overlay" if "modal" in str(item.get("id", "")).lower() else "page",
-                    "group": item.get("group"),
-                }
+    if not canvas_files:
+        # Fallback inteligente: auto-detecta arquivos .html no ZIP quando canvas.json não está presente
+        html_files = sorted(
+            path
+            for path in files
+            if path.lower().endswith(".html") and not _is_ignored_path(path)
+        )
+        if not html_files:
+            raise DesignCorpusError(
+                "Nenhum arquivo .html ou canvas.json encontrado no arquivo ZIP."
             )
-            screen_count += 1
 
-        if screens:
-            canvases.append({"name": name, "screens": screens})
-        else:
-            warnings.append(f"{canvas_path}: nenhuma tela válida.")
+        folders_map: Dict[str, List[str]] = {}
+        for hpath in html_files:
+            folder = posixpath.dirname(hpath)
+            c_name = posixpath.basename(folder) if folder else "Principal"
+            if c_name.lower() in {"design", "out", "out4", "screens", "html", "dist", "."}:
+                c_name = "Principal"
+            folders_map.setdefault(c_name, []).append(hpath)
+
+        for c_name, hpaths in folders_map.items():
+            screens = []
+            for hpath in hpaths:
+                stem = posixpath.splitext(posixpath.basename(hpath))[0]
+                clean_name = re.sub(r"^\d+[\-_]", "", stem).replace("_", " ").replace("-", " ").strip().title()
+                if not clean_name:
+                    clean_name = stem
+                is_mob = "mobile" in stem.lower()
+                w, h = (375, 812) if is_mob else (1440, 900)
+                html_raw = _decode(files[hpath])
+                html_inlined = inline_assets(html_raw, hpath, files)
+                screens.append({
+                    "name": clean_name,
+                    "html_content": html_inlined,
+                    "width": w,
+                    "height": h,
+                    "device_type": "mobile" if is_mob else "desktop",
+                    "screen_kind": "page",
+                    "group": None,
+                })
+                screen_count += 1
+            if screens:
+                canvases.append({"name": c_name, "screens": screens})
+    else:
+        for canvas_path in canvas_files:
+            try:
+                raw = json.loads(_decode(files[canvas_path]))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                warnings.append(f"{canvas_path}: JSON inválido, canvas ignorado.")
+                continue
+            if not isinstance(raw, dict):
+                continue
+
+            folder = posixpath.dirname(canvas_path)
+            name = str(raw.get("title") or raw.get("name") or posixpath.basename(folder) or "Canvas")
+            screens: List[Dict[str, Any]] = []
+            for item in raw.get("screens") or []:
+                if not isinstance(item, dict):
+                    continue
+                file_ref = str(item.get("file") or "")
+                if not file_ref:
+                    warnings.append(f"{canvas_path}: tela sem arquivo, ignorada.")
+                    continue
+                html_path = posixpath.normpath(posixpath.join(folder, file_ref))
+                if html_path not in files:
+                    warnings.append(f"{html_path}: arquivo da tela não está no ZIP.")
+                    continue
+                if screen_count >= MAX_SCREENS:
+                    warnings.append("Limite de telas por importação atingido; restante ignorado.")
+                    break
+                try:
+                    width = int(item.get("width") or 1440)
+                    height = int(item.get("height") or 900)
+                except (TypeError, ValueError):
+                    width, height = 1440, 900
+                html = inline_assets(_decode(files[html_path]), html_path, files)
+                screens.append(
+                    {
+                        "name": str(item.get("name") or item.get("id") or posixpath.basename(html_path)),
+                        "html_content": html,
+                        "width": width,
+                        "height": height,
+                        "device_type": _device_type(item.get("device"), width),
+                        "screen_kind": "modal_overlay" if "modal" in str(item.get("id", "")).lower() else "page",
+                        "group": item.get("group"),
+                    }
+                )
+                screen_count += 1
+
+            if screens:
+                canvases.append({"name": name, "screens": screens})
+            else:
+                warnings.append(f"{canvas_path}: nenhuma tela válida.")
 
     if not canvases:
         raise DesignCorpusError("O corpus não tem nenhuma tela importável.")

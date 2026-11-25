@@ -41,6 +41,7 @@ from app.authz import authorize_project
 from app.jsx import html_to_jsx
 from app.storage import save_asset, sniff_image_type
 from app.routes_assets import generate_asset_signature
+from app.ws import broadcaster
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -226,34 +227,53 @@ async def create_project(
 async def import_design_corpus(
     file: UploadFile = File(...),
     name: Optional[str] = Form(None),
+    project_id: Optional[str] = Form(None),
     current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db),
 ):
-    """Importa um ZIP com a pasta `design/` do Mockbird v1 como um novo projeto."""
+    """Importa um ZIP com a pasta `design/` do Mockbird v1 criando um novo projeto ou atualizando um existente."""
     blob = await file.read()
     try:
         parsed = parse_design_corpus(blob)
     except DesignCorpusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    raw_name = (name or "").strip()
-    if not raw_name:
-        raw_name = (
-            Path(file.filename or "").stem.replace("_", " ").replace("-", " ").strip()
-        )
-    if not raw_name or raw_name.lower() in {"design", "zip", "corpus"}:
-        raw_name = "Projeto importado"
-
     tokens = parsed["tokens"]
-    project = await _create_project_shell(
-        db,
-        current_user,
-        raw_name,
-        "Importado do corpus design/ do Mockbird v1.",
-        tokens_light=tokens["light"] or None,
-        tokens_dark=tokens["dark"] or None,
-        tokens_shared=tokens["shared"] or None,
-    )
+
+    if project_id:
+        project = await authorize_project(project_id, current_user, "edit", db)
+        if any(tokens.values()):
+            tok_res = await db.execute(
+                select(DesignTokens).where(DesignTokens.project_id == project.id)
+            )
+            tokens_row = tok_res.scalars().first()
+            if not tokens_row:
+                tokens_row = DesignTokens(project_id=project.id)
+                db.add(tokens_row)
+            if tokens.get("light"):
+                tokens_row.light_tokens = tokens["light"]
+            if tokens.get("dark"):
+                tokens_row.dark_tokens = tokens["dark"]
+            if tokens.get("shared"):
+                tokens_row.shared_tokens = tokens["shared"]
+    else:
+        raw_name = (name or "").strip()
+        if not raw_name:
+            raw_name = (
+                Path(file.filename or "").stem.replace("_", " ").replace("-", " ").strip()
+            )
+        if not raw_name or raw_name.lower() in {"design", "zip", "corpus"}:
+            raw_name = "Projeto importado"
+
+        project = await _create_project_shell(
+            db,
+            current_user,
+            raw_name,
+            "Importado do corpus design/ do Mockbird v1.",
+            tokens_light=tokens["light"] or None,
+            tokens_dark=tokens["dark"] or None,
+            tokens_shared=tokens["shared"] or None,
+        )
 
     imported_assets: Dict[str, str] = {}
     from urllib.parse import quote
@@ -297,16 +317,30 @@ async def import_design_corpus(
         imported_assets[f"../{encoded_base}"] = new_url
         imported_assets[f"./{encoded_base}"] = new_url
 
-    entry_screen_id: Optional[str] = None
+    # Mapeia canvases e telas existentes no projeto para atualização inteligente
+    canv_res = await db.execute(select(Canvas).where(Canvas.project_id == project.id))
+    existing_canvases = {c.name.lower().strip(): c for c in canv_res.scalars().all()}
+    existing_canvas_ids = [c.id for c in existing_canvases.values()]
+
+    screens_by_name = {}
+    if existing_canvas_ids:
+        scr_res = await db.execute(select(Screen).where(Screen.canvas_id.in_(existing_canvas_ids)))
+        screens_by_name = {s.name.lower().strip(): s for s in scr_res.scalars().all()}
+
+    entry_screen_id: Optional[str] = project.entry_screen_id
     screen_total = 0
     for order, canvas_data in enumerate(parsed["canvases"]):
-        canvas = Canvas(
-            project_id=project.id,
-            name=canvas_data["name"][:255],
-            sort_order=order,
-        )
-        db.add(canvas)
-        await db.flush()
+        c_name = canvas_data["name"][:255]
+        canvas = existing_canvases.get(c_name.lower().strip())
+        if not canvas:
+            canvas = Canvas(
+                project_id=project.id,
+                name=c_name,
+                sort_order=len(existing_canvases) + order,
+            )
+            db.add(canvas)
+            await db.flush()
+            existing_canvases[c_name.lower().strip()] = canvas
 
         first_screen: Optional[Screen] = None
         for index, data in enumerate(canvas_data["screens"]):
@@ -317,70 +351,98 @@ async def import_design_corpus(
                         f'"{old_ref}"', f'"{new_url}"'
                     ).replace(f"'{old_ref}'", f"'{new_url}'")
 
-            screen = Screen(
-                canvas_id=canvas.id,
-                name=data["name"][:255],
-                is_entry=(index == 0),
-                screen_kind=data.get("screen_kind") or "page",
-                device_type=data.get("device_type") or "desktop",
-                width=data["width"],
-                height=data["height"],
-                pos_x=index * 40,
-                html_content=screen_html,
-            )
-            db.add(screen)
-            await db.flush()
-            if first_screen is None:
-                first_screen = screen
+            s_name = data["name"][:255]
+            existing_s = screens_by_name.get(s_name.lower().strip())
+            if existing_s:
+                existing_s.html_content = screen_html
+                existing_s.width = data["width"]
+                existing_s.height = data["height"]
+                existing_s.current_revision += 1
+                rev = ScreenRevision(
+                    screen_id=existing_s.id,
+                    revision_number=existing_s.current_revision,
+                    html_content=screen_html,
+                    css_content=existing_s.css_content or "",
+                    js_content=existing_s.js_content or "",
+                    actor=current_user.name,
+                    change_summary="Atualização via ZIP Import",
+                )
+                db.add(rev)
+                if first_screen is None:
+                    first_screen = existing_s
+            else:
+                screen = Screen(
+                    canvas_id=canvas.id,
+                    name=s_name,
+                    is_entry=(index == 0 and not project.entry_screen_id),
+                    screen_kind=data.get("screen_kind") or "page",
+                    device_type=data.get("device_type") or "desktop",
+                    width=data["width"],
+                    height=data["height"],
+                    pos_x=index * 40,
+                    html_content=screen_html,
+                    css_content="",
+                    js_content="",
+                    current_revision=1,
+                )
+                db.add(screen)
+                await db.flush()
+                rev = ScreenRevision(
+                    screen_id=screen.id,
+                    revision_number=1,
+                    html_content=screen_html,
+                    css_content="",
+                    js_content="",
+                    actor=current_user.name,
+                    change_summary="Importado via ZIP",
+                )
+                db.add(rev)
+                screens_by_name[s_name.lower().strip()] = screen
+                if first_screen is None:
+                    first_screen = screen
             screen_total += 1
 
-        if first_screen is not None:
+        if first_screen is not None and not canvas.entry_screen_id:
             canvas.entry_screen_id = first_screen.id
             if entry_screen_id is None:
                 entry_screen_id = first_screen.id
 
-    project.entry_screen_id = entry_screen_id
+    if not project.entry_screen_id and entry_screen_id:
+        project.entry_screen_id = entry_screen_id
+
     await db.commit()
     await db.refresh(project)
 
+    # Dispara WebSocket
+    await broadcaster.broadcast(
+        project.id,
+        {
+            "type": "project_updated",
+            "project_id": project.id,
+            "origin": current_user.id,
+        },
+    )
+
     return DesignImportOut(
         project=project,
-        canvases=len(parsed["canvases"]),
+        canvases=len(existing_canvases),
         screens=screen_total,
         warnings=parsed["warnings"],
     )
 
-    canvas = Canvas(project_id=project.id, name="Principal", sort_order=0)
-    db.add(canvas)
-    await db.flush()
 
-    # Cria Tela Principal inicial
-    initial_html = (
-        '<div class="flex flex-col items-center justify-center min-h-[500px] p-8 text-center" data-mb-id="root-hero">'
-        '  <h1 class="text-4xl font-bold mb-4" data-mb-id="hero-title">Bem-vindo ao Mockbird v2</h1>'
-        '  <p class="text-lg text-slate-500 max-w-md mb-6" data-mb-id="hero-desc">Este é o seu primeiro mock. Clique nos elementos para editar ou arraste para compor sua interface.</p>'
-        '  <button class="px-6 py-3 bg-teal-600 text-white rounded-lg font-medium shadow-md hover:bg-teal-700 transition" data-mb-id="hero-cta">Começar Agora</button>'
-        "</div>"
+@router.post("/{project_id}/import/design", response_model=DesignImportOut)
+async def import_design_corpus_to_project(
+    project_id: str,
+    file: UploadFile = File(...),
+    name: Optional[str] = Form(None),
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Importa um ZIP atualizando telas e tokens de um projeto existente."""
+    return await import_design_corpus(
+        file=file, name=name, project_id=project_id, current_user=current_user, db=db
     )
-    screen = Screen(
-        canvas_id=canvas.id,
-        name="Início",
-        is_entry=True,  # ⭐ Tela Principal
-        html_content=initial_html,
-        css_content="",
-        js_content="",
-        width=1440,
-        height=900,
-    )
-    db.add(screen)
-    await db.flush()
-
-    project.entry_screen_id = screen.id
-    canvas.entry_screen_id = screen.id
-
-    await db.commit()
-    await db.refresh(project)
-    return project
 
 
 @router.get("/{project_id}", response_model=ProjectOut)

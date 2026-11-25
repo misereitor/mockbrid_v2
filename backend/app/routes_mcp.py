@@ -144,6 +144,22 @@ class MCPUpdateScreenHTMLRequest(BaseModel):
     js_content: Optional[str] = None
 
 
+class MCPBatchScreenItem(BaseModel):
+    screen_id: Optional[str] = None
+    screen_name: Optional[str] = None
+    canvas_name: Optional[str] = None
+    html_content: str
+    css_content: Optional[str] = None
+    js_content: Optional[str] = None
+    viewport: Optional[str] = None
+    change_summary: Optional[str] = "Atualização em lote via MCP Agent"
+
+
+class MCPBatchUpdateScreensRequest(BaseModel):
+    project_id: Optional[str] = None
+    screens: List[MCPBatchScreenItem]
+
+
 class MCPUpdateDesignTokensRequest(BaseModel):
     project_id: str
     light_tokens: Optional[Dict[str, Any]] = None
@@ -709,6 +725,37 @@ MCP_TOOLS_SPEC = [
                 "js_content": {"type": "string", "description": "Código JS atualizado (opcional)."},
             },
             "required": ["screen_id", "html_content"],
+        },
+    },
+    {
+        "name": "batch_update_screens",
+        "description": "Atualiza ou cria múltiplas telas em lote para um projeto existente (por screen_id ou screen_name). Evita ter que enviar telas uma por uma em chamadas isoladas, ideal para sincronizar rotas capturadas localmente.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "ID do projeto Mockbird a ser atualizado. Se omitido, utiliza o projeto vinculado à chave MCP.",
+                },
+                "screens": {
+                    "type": "array",
+                    "description": "Lista de telas com HTML a serem atualizadas ou criadas.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "screen_id": {"type": "string", "description": "ID da tela existente (opcional se screen_name for informado)."},
+                            "screen_name": {"type": "string", "description": "Nome da tela para correspondência ou criação (ex: 'Login', 'Dashboard', 'Kanban')."},
+                            "canvas_name": {"type": "string", "description": "Nome do canvas onde alocar (opcional)."},
+                            "html_content": {"type": "string", "description": "Código HTML completo ou fragmento da tela."},
+                            "css_content": {"type": "string", "description": "CSS customizado opcional."},
+                            "js_content": {"type": "string", "description": "JS customizado opcional."},
+                            "viewport": {"type": "string", "enum": ["desktop", "tablet", "mobile"], "description": "Viewport da tela (padrão: desktop)."},
+                        },
+                        "required": ["html_content"],
+                    },
+                },
+            },
+            "required": ["screens"],
         },
     },
     {
@@ -1480,6 +1527,152 @@ async def mcp_update_screen_html(
     }
 
 
+@router.post("/mcp/tools/batch_update_screens")
+async def mcp_batch_update_screens(
+    payload: MCPBatchUpdateScreensRequest,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Atualiza ou cria múltiplas telas em lote para um projeto existente via MCP."""
+    if "screen:write" not in auth["scopes"] and "project:write" not in auth["scopes"]:
+        raise HTTPException(
+            status_code=403, detail="Chave MCP sem escopo de escrita de telas/projetos"
+        )
+
+    project_id = get_effective_mcp_project_id(auth, payload.project_id)
+    if not project_id:
+        raise HTTPException(
+            status_code=400,
+            detail="project_id é obrigatório para atualização de telas em lote.",
+        )
+
+    validate_mcp_project_access(auth, project_id)
+    user = auth["user"]
+    project = await authorize_project(project_id, user, "edit", db)
+
+    # Carrega canvases do projeto
+    c_res = await db.execute(
+        select(Canvas).where(Canvas.project_id == project.id).order_by(Canvas.sort_order.asc())
+    )
+    canvases = c_res.scalars().all()
+    if not canvases:
+        default_canvas = Canvas(project_id=project.id, name="Principal", sort_order=0)
+        db.add(default_canvas)
+        await db.flush()
+        canvases = [default_canvas]
+
+    canvas_map = {c.name.lower().strip(): c for c in canvases}
+    first_canvas = canvases[0]
+
+    # Carrega telas existentes do projeto
+    canvas_ids = [c.id for c in canvases]
+    s_res = await db.execute(
+        select(Screen).where(Screen.canvas_id.in_(canvas_ids))
+    )
+    existing_screens = s_res.scalars().all()
+    screens_by_id = {s.id: s for s in existing_screens}
+    screens_by_name = {s.name.lower().strip(): s for s in existing_screens}
+
+    key_name = auth["key"].name
+    updated = []
+    created = []
+
+    for item in payload.screens:
+        target_screen = None
+        if item.screen_id and item.screen_id in screens_by_id:
+            target_screen = screens_by_id[item.screen_id]
+        elif item.screen_name:
+            target_screen = screens_by_name.get(item.screen_name.lower().strip())
+
+        if target_screen:
+            target_screen.html_content = item.html_content
+            if item.css_content is not None:
+                target_screen.css_content = item.css_content
+            if item.js_content is not None:
+                target_screen.js_content = item.js_content
+            if item.viewport:
+                dtype = "mobile" if item.viewport == "mobile" else ("tablet" if item.viewport == "tablet" else "desktop")
+                target_screen.device_type = dtype
+                if dtype == "mobile":
+                    target_screen.width, target_screen.height = 375, 812
+                elif dtype == "tablet":
+                    target_screen.width, target_screen.height = 768, 1024
+                else:
+                    target_screen.width, target_screen.height = 1440, 900
+
+            target_screen.current_revision += 1
+            rev = ScreenRevision(
+                screen_id=target_screen.id,
+                revision_number=target_screen.current_revision,
+                html_content=target_screen.html_content,
+                css_content=target_screen.css_content or "",
+                js_content=target_screen.js_content or "",
+                actor=f"mcp:{key_name}",
+                change_summary=item.change_summary or "Atualização em lote via MCP Agent",
+            )
+            db.add(rev)
+            updated.append({"id": target_screen.id, "name": target_screen.name, "canvas_id": target_screen.canvas_id})
+        else:
+            target_canvas = first_canvas
+            if item.canvas_name and item.canvas_name.lower().strip() in canvas_map:
+                target_canvas = canvas_map[item.canvas_name.lower().strip()]
+
+            new_name = item.screen_name or f"Tela {len(existing_screens) + len(created) + 1}"
+            dtype = "mobile" if (item.viewport == "mobile") else ("tablet" if item.viewport == "tablet" else "desktop")
+            w = 375 if dtype == "mobile" else (768 if dtype == "tablet" else 1440)
+            h = 812 if dtype == "mobile" else (1024 if dtype == "tablet" else 900)
+            new_screen = Screen(
+                canvas_id=target_canvas.id,
+                name=new_name,
+                html_content=item.html_content,
+                css_content=item.css_content or "",
+                js_content=item.js_content or "",
+                device_type=dtype,
+                width=w,
+                height=h,
+                current_revision=1,
+            )
+            db.add(new_screen)
+            await db.flush()
+
+            rev = ScreenRevision(
+                screen_id=new_screen.id,
+                revision_number=1,
+                html_content=new_screen.html_content,
+                css_content=new_screen.css_content,
+                js_content=new_screen.js_content,
+                actor=f"mcp:{key_name}",
+                change_summary=item.change_summary or "Criação em lote via MCP Agent",
+            )
+            db.add(rev)
+            screens_by_id[new_screen.id] = new_screen
+            screens_by_name[new_screen.name.lower().strip()] = new_screen
+            created.append({"id": new_screen.id, "name": new_screen.name, "canvas_id": new_screen.canvas_id})
+
+    await db.commit()
+
+    # Notifica via WebSocket
+    await broadcaster.broadcast(
+        project.id,
+        {
+            "type": "screens_batch_updated",
+            "project_id": project.id,
+            "origin": f"mcp:{key_name}",
+            "updated_count": len(updated),
+            "created_count": len(created),
+        },
+    )
+
+    return {
+        "status": "success",
+        "project_id": project.id,
+        "total_processed": len(payload.screens),
+        "updated_screens": updated,
+        "created_screens": created,
+        "message": f"{len(updated)} telas atualizadas e {len(created)} telas criadas com sucesso.",
+    }
+
+
 @router.post("/mcp/tools/update_design_tokens")
 async def mcp_update_design_tokens(
     payload: MCPUpdateDesignTokensRequest,
@@ -1986,6 +2179,10 @@ async def mcp_jsonrpc_endpoint(
             elif tool_name == "update_screen_html":
                 req_obj = MCPUpdateScreenHTMLRequest(**arguments)
                 res = await mcp_update_screen_html(req_obj, auth, db)
+
+            elif tool_name == "batch_update_screens":
+                req_obj = MCPBatchUpdateScreensRequest(**arguments)
+                res = await mcp_batch_update_screens(req_obj, auth, db)
 
             elif tool_name == "update_design_tokens":
                 req_obj = MCPUpdateDesignTokensRequest(**arguments)
