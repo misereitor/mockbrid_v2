@@ -22,7 +22,12 @@ import {
   Wrench,
   FolderKanban,
   Edit2,
-  Folder
+  Folder,
+  Play,
+  Search,
+  Compass,
+  Zap,
+  CreditCard
 } from 'lucide-react';
 import { EmailSettingsPanel } from '../components/EmailSettingsPanel';
 import { withBasePath } from '../lib/basePath';
@@ -55,6 +60,14 @@ interface AIProviderData {
   base_url?: string;
   custom_models?: string[];
   is_active?: boolean;
+  has_api_key?: boolean;
+  masked_api_key?: string;
+}
+
+interface ModelProbeResult {
+  status: 'testing' | 'ok' | 'error';
+  latency_ms?: number;
+  message?: string;
 }
 
 interface SettingsPageProps {
@@ -98,10 +111,19 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
     'meta-llama/llama-3.3-70b-instruct'
   ]);
   const [newModelInput, setNewModelInput] = useState('');
+  const [hasSavedApiKey, setHasSavedApiKey] = useState(false);
+  const [maskedApiKey, setMaskedApiKey] = useState('');
   
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [testingAll, setTestingAll] = useState(false);
   const [testResult, setTestResult] = useState<{ status: 'ok' | 'error'; message: string } | null>(null);
+  const [modelTestResults, setModelTestResults] = useState<Record<string, ModelProbeResult>>({});
+  const [discovering, setDiscovering] = useState(false);
+  const [showDiscovery, setShowDiscovery] = useState(false);
+  const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
+  const [discoverQuery, setDiscoverQuery] = useState('');
+  const [discoverMessage, setDiscoverMessage] = useState<{ status: 'ok' | 'error'; text: string } | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [copiedMcp, setCopiedMcp] = useState<string | null>(null);
 
@@ -258,13 +280,8 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
   const [plans, setPlans] = useState<any[]>([]);
   const [userRole, setUserRole] = useState('');
   const [assigningPlan, setAssigningPlan] = useState<string | null>(null);
-  const [appEnv, setAppEnv] = useState<string>('homologation');
 
   useEffect(() => {
-    fetch('/api/health')
-      .then(r => (r.ok ? r.json() : null))
-      .then(h => h?.environment && setAppEnv(h.environment))
-      .catch(() => {});
     fetch('/api/auth/me')
       .then(r => (r.ok ? r.json() : null))
       .then(u => u && setUserRole(u.role))
@@ -310,6 +327,8 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
           if (prov.custom_models && prov.custom_models.length > 0) {
             setCustomModels(prov.custom_models);
           }
+          setHasSavedApiKey(Boolean(prov.has_api_key));
+          setMaskedApiKey(prov.masked_api_key || '');
         }
       })
       .catch(err => console.error('Erro ao ler provedores:', err));
@@ -348,13 +367,23 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
     setDefaultModel(m);
   };
 
-  const handleTestConnection = async () => {
-    if (!apiKey.trim() && providerType !== 'ollama') {
-      setTestResult({ status: 'error', message: 'Preencha a API Key para realizar o teste de conexão.' });
-      return;
+  const canRunAiProbe = () => {
+    if (!apiKey.trim() && !hasSavedApiKey && providerType !== 'ollama') {
+      setTestResult({
+        status: 'error',
+        message: 'Preencha ou salve a API Key para realizar testes e descoberta de modelos.',
+      });
+      return false;
     }
-    setTesting(true);
-    setTestResult(null);
+    return true;
+  };
+
+  const handleTestSingleModel = async (modelToTest: string) => {
+    if (!canRunAiProbe()) return;
+    setModelTestResults(prev => ({
+      ...prev,
+      [modelToTest]: { status: 'testing', message: 'Testando...' },
+    }));
 
     try {
       const res = await fetch('/api/ai/test-connection', {
@@ -364,19 +393,155 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
           provider_type: providerType,
           api_key: apiKey.trim(),
           base_url: baseUrl.trim(),
-          model_name: defaultModel.trim()
-        })
+          model_name: modelToTest.trim(),
+        }),
       });
       const data = await res.json();
-      if (data.status === 'ok') {
-        setTestResult({ status: 'ok', message: data.message });
-      } else {
-        setTestResult({ status: 'error', message: data.message || 'Falha ao testar conexão.' });
+      const isOk = data.status === 'ok';
+      setModelTestResults(prev => ({
+        ...prev,
+        [modelToTest]: {
+          status: isOk ? 'ok' : 'error',
+          latency_ms: data.latency_ms,
+          message: data.message || (isOk ? 'OK' : 'Falha ao testar modelo'),
+        },
+      }));
+      if (modelToTest === defaultModel) {
+        setTestResult({
+          status: isOk ? 'ok' : 'error',
+          message: data.message || (isOk ? 'Conexão bem-sucedida!' : 'Falha ao testar conexão.'),
+        });
       }
     } catch (e: any) {
-      setTestResult({ status: 'error', message: e.message || 'Erro de rede ao testar conexão.' });
+      setModelTestResults(prev => ({
+        ...prev,
+        [modelToTest]: {
+          status: 'error',
+          message: e.message || 'Erro de rede ao testar modelo.',
+        },
+      }));
+    }
+  };
+
+  const handleTestConnection = async () => {
+    if (!canRunAiProbe()) return;
+    setTesting(true);
+    setTestResult(null);
+    await handleTestSingleModel(defaultModel);
+    setTesting(false);
+  };
+
+  const handleTestBatchModels = async (modelsToTest: string[]) => {
+    if (!canRunAiProbe() || modelsToTest.length === 0) return;
+    setTestingAll(true);
+    setTestResult(null);
+    setModelTestResults(prev => {
+      const next = { ...prev };
+      for (const m of modelsToTest) {
+        next[m] = { status: 'testing', message: 'Testando...' };
+      }
+      return next;
+    });
+
+    try {
+      const res = await fetch('/api/ai/test-models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider_type: providerType,
+          api_key: apiKey.trim(),
+          base_url: baseUrl.trim(),
+          models: modelsToTest,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || 'Falha ao testar modelos em lote.');
+      }
+      const resultsList: any[] = data.results || [];
+      setModelTestResults(prev => {
+        const next = { ...prev };
+        for (const r of resultsList) {
+          next[r.model] = {
+            status: r.status === 'ok' ? 'ok' : 'error',
+            latency_ms: r.latency_ms,
+            message: r.message,
+          };
+        }
+        return next;
+      });
+      setTestResult({
+        status: data.ok_count > 0 ? 'ok' : 'error',
+        message: `Teste em lote concluído: ${data.ok_count} de ${data.total} modelo(s) responderam com sucesso${data.error_count > 0 ? ` (${data.error_count} com falha)` : ''}.`,
+      });
+    } catch (e: any) {
+      setTestResult({
+        status: 'error',
+        message: e.message || 'Erro de rede ao testar modelos em lote.',
+      });
     } finally {
-      setTesting(false);
+      setTestingAll(false);
+    }
+  };
+
+  const handleDiscoverModels = async (withTest: boolean) => {
+    if (!canRunAiProbe()) return;
+    setDiscovering(true);
+    setShowDiscovery(true);
+    setDiscoverMessage(null);
+
+    try {
+      const res = await fetch('/api/ai/discover-models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider_type: providerType,
+          api_key: apiKey.trim(),
+          base_url: baseUrl.trim(),
+          test_discovered: withTest,
+          max_test: 10,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.status === 'error') {
+        setDiscoverMessage({
+          status: 'error',
+          text: data.detail || data.message || 'Não foi possível descobrir modelos neste endpoint.',
+        });
+        return;
+      }
+      const found: string[] = data.models || [];
+      setDiscoveredModels(found);
+      if (data.test_results && typeof data.test_results === 'object') {
+        setModelTestResults(prev => {
+          const next = { ...prev };
+          for (const [m, r] of Object.entries<any>(data.test_results)) {
+            next[m] = {
+              status: r.status === 'ok' ? 'ok' : 'error',
+              latency_ms: r.latency_ms,
+              message: r.message,
+            };
+          }
+          return next;
+        });
+      }
+      const testedCount = data.test_results ? Object.keys(data.test_results).length : 0;
+      const okTested = data.test_results
+        ? Object.values<any>(data.test_results).filter(r => r.status === 'ok').length
+        : 0;
+      setDiscoverMessage({
+        status: 'ok',
+        text: withTest && testedCount > 0
+          ? `${found.length} modelo(s) descoberto(s) no provedor (${okTested}/${testedCount} aprovados no teste rápido).`
+          : `${found.length} modelo(s) descoberto(s) no provedor.`,
+      });
+    } catch (e: any) {
+      setDiscoverMessage({
+        status: 'error',
+        text: e.message || 'Erro ao consultar modelos do endpoint.',
+      });
+    } finally {
+      setDiscovering(false);
     }
   };
 
@@ -400,6 +565,12 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
       if (!res.ok) {
         const err = await res.json();
         throw new Error(err.detail || 'Falha ao salvar configuração');
+      }
+      if (apiKey.trim()) {
+        setHasSavedApiKey(true);
+        const k = apiKey.trim();
+        setMaskedApiKey(k.length > 8 ? `${k.slice(0, 4)}...${k.slice(-4)}` : '***');
+        setApiKey('');
       }
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 3000);
@@ -503,8 +674,8 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
                 : 'text-slate-400 hover:text-white'
             }`}
           >
-            <ShieldCheck size={14} />
-            <span>Organização & Segurança</span>
+            <CreditCard size={14} />
+            <span>Planos &amp; Consumo</span>
           </button>
 
           {currentUser?.is_system_admin && (
@@ -601,16 +772,29 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
               </div>
 
               <div>
-                <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
-                  API Key / Chave de Acesso
-                </label>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider">
+                    API Key / Chave de Acesso
+                  </label>
+                  {hasSavedApiKey && (
+                    <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 rounded">
+                      Chave salva ({maskedApiKey || 'ativa'})
+                    </span>
+                  )}
+                </div>
                 <div className="relative">
                   <Key size={15} className="absolute left-3.5 top-3 text-slate-500" />
                   <input
                     type="password"
                     value={apiKey}
                     onChange={(e) => setApiKey(e.target.value)}
-                    placeholder={providerType === 'ollama' ? 'Opcional para Ollama local' : 'sk-...'}
+                    placeholder={
+                      providerType === 'ollama'
+                        ? 'Opcional para Ollama local'
+                        : hasSavedApiKey
+                        ? 'Deixe em branco para usar a chave já salva ou digite uma nova'
+                        : 'sk-...'
+                    }
                     className="w-full pl-9 pr-3.5 py-2.5 bg-mockbird-surface border border-mockbird-border rounded-lg text-xs font-mono text-white focus:outline-none focus:border-mockbird-cyan focus:ring-1 focus:ring-mockbird-cyan transition-all"
                   />
                 </div>
@@ -622,7 +806,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
 
             {/* Gerenciamento de Modelos Customizados */}
             <div className="bg-mockbird-surface border border-mockbird-border rounded-xl p-5 space-y-4">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
                 <div>
                   <h3 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
                     <Sparkles size={14} className="text-mockbird-cyan" />
@@ -633,8 +817,30 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
                   </p>
                 </div>
 
-                <div className="text-xs text-slate-400">
-                  Padrão atual: <span className="font-mono font-bold text-mockbird-cyan">{defaultModel}</span>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs text-slate-400 mr-1">
+                    Padrão atual: <span className="font-mono font-bold text-mockbird-cyan">{defaultModel}</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => handleDiscoverModels(false)}
+                    disabled={discovering}
+                    className="bg-mockbird-card hover:bg-mockbird-cardhover border border-mockbird-border text-slate-200 font-semibold text-[11px] px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-all disabled:opacity-50"
+                    title="Consulta GET /models no endpoint configurado para listar modelos disponíveis"
+                  >
+                    <Compass size={13} className={discovering ? 'animate-spin text-mockbird-cyan' : 'text-mockbird-cyan'} />
+                    <span>{discovering ? 'Buscando...' : 'Descobrir Modelos'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleDiscoverModels(true)}
+                    disabled={discovering}
+                    className="bg-mockbird-blue/20 hover:bg-mockbird-blue/30 border border-mockbird-cyan/40 text-mockbird-cyan font-semibold text-[11px] px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-all disabled:opacity-50"
+                    title="Descobre modelos do provedor e já testa a resposta real dos primeiros modelos"
+                  >
+                    <Zap size={13} className={discovering ? 'animate-pulse' : ''} />
+                    <span>Descobrir &amp; Testar</span>
+                  </button>
                 </div>
               </div>
 
@@ -657,6 +863,154 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
                   <span>Adicionar Modelo</span>
                 </button>
               </div>
+
+              {/* Painel de Descoberta de Modelos com Teste */}
+              {showDiscovery && (
+                <div className="bg-mockbird-bg/80 border border-mockbird-cyan/30 rounded-xl p-4 space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <Compass size={15} className="text-mockbird-cyan" />
+                      <span className="text-xs font-bold text-white uppercase tracking-wider">
+                        Descoberta de Modelos no Endpoint ({discoveredModels.length})
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {discoveredModels.length > 0 && (
+                        <>
+                          <button
+                            type="button"
+                            disabled={testingAll}
+                            onClick={() => {
+                              const filteredList = discoveredModels
+                                .filter(m => !discoverQuery.trim() || m.toLowerCase().includes(discoverQuery.trim().toLowerCase()))
+                                .slice(0, 12);
+                              handleTestBatchModels(filteredList);
+                            }}
+                            className="text-[11px] bg-mockbird-surface hover:bg-mockbird-card border border-mockbird-border text-slate-200 px-2.5 py-1 rounded-md flex items-center gap-1 transition disabled:opacity-50"
+                            title="Testa até 12 modelos listados abaixo"
+                          >
+                            <RefreshCw size={11} className={testingAll ? 'animate-spin text-mockbird-cyan' : ''} />
+                            <span>Testar Listados</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const approved = discoveredModels.filter(
+                                m => modelTestResults[m]?.status === 'ok' && !customModels.includes(m)
+                              );
+                              if (approved.length > 0) {
+                                setCustomModels(prev => Array.from(new Set([...prev, ...approved])));
+                              }
+                            }}
+                            className="text-[11px] bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 px-2.5 py-1 rounded-md flex items-center gap-1 transition"
+                          >
+                            <Plus size={11} />
+                            <span>Adicionar Aprovados</span>
+                          </button>
+                        </>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => setShowDiscovery(false)}
+                        className="text-[11px] text-slate-400 hover:text-white px-2 py-0.5"
+                      >
+                        Fechar
+                      </button>
+                    </div>
+                  </div>
+
+                  {discoverMessage && (
+                    <div
+                      className={`text-xs px-3 py-2 rounded-lg border flex items-center gap-2 ${
+                        discoverMessage.status === 'ok'
+                          ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                          : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+                      }`}
+                    >
+                      {discoverMessage.status === 'ok' ? <CheckCircle2 size={14} /> : <AlertCircle size={14} />}
+                      <span>{discoverMessage.text}</span>
+                    </div>
+                  )}
+
+                  {discoveredModels.length > 0 && (
+                    <>
+                      <div className="relative">
+                        <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+                        <input
+                          type="text"
+                          value={discoverQuery}
+                          onChange={(e) => setDiscoverQuery(e.target.value)}
+                          placeholder="Filtrar modelos descobertos (ex: gpt, claude, glm, gemini, coder)..."
+                          className="w-full pl-8 pr-3 py-1.5 bg-mockbird-card border border-mockbird-border rounded-lg text-xs font-mono text-white focus:outline-none focus:border-mockbird-cyan"
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-60 overflow-y-auto pr-1">
+                        {discoveredModels
+                          .filter(m => !discoverQuery.trim() || m.toLowerCase().includes(discoverQuery.trim().toLowerCase()))
+                          .slice(0, 60)
+                          .map((m) => {
+                            const inWorkspace = customModels.includes(m);
+                            const probe = modelTestResults[m];
+                            return (
+                              <div
+                                key={m}
+                                className="flex items-center justify-between p-2 rounded-lg bg-mockbird-card border border-mockbird-border text-xs font-mono gap-2"
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <div className="truncate text-slate-200" title={m}>{m}</div>
+                                  {probe && (
+                                    <div
+                                      className={`text-[10px] font-sans truncate ${
+                                        probe.status === 'ok'
+                                          ? 'text-emerald-400'
+                                          : probe.status === 'error'
+                                          ? 'text-rose-400'
+                                          : 'text-slate-400'
+                                      }`}
+                                      title={probe.message}
+                                    >
+                                      {probe.status === 'testing'
+                                        ? 'Testando...'
+                                        : probe.status === 'ok'
+                                        ? `✓ OK (${probe.latency_ms ?? 0}ms)`
+                                        : `✗ ${probe.message || 'Erro'}`}
+                                    </div>
+                                  )}
+                                </div>
+                                <div className="flex items-center gap-1 shrink-0 font-sans">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleTestSingleModel(m)}
+                                    disabled={probe?.status === 'testing'}
+                                    className="px-2 py-1 rounded bg-mockbird-surface hover:bg-slate-800 border border-mockbird-border text-[10px] text-slate-300 flex items-center gap-1 transition"
+                                    title="Testar este modelo"
+                                  >
+                                    <Play size={10} className={probe?.status === 'testing' ? 'animate-spin text-mockbird-cyan' : 'text-mockbird-cyan'} />
+                                    <span>Testar</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleAddCustomModel(m)}
+                                    disabled={inWorkspace}
+                                    className={`px-2 py-1 rounded text-[10px] font-semibold flex items-center gap-1 transition ${
+                                      inWorkspace
+                                        ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 cursor-default'
+                                        : 'bg-mockbird-blue hover:bg-mockbird-bluedark text-white'
+                                    }`}
+                                  >
+                                    {inWorkspace ? <Check size={10} /> : <Plus size={10} />}
+                                    <span>{inWorkspace ? 'Ativo' : 'Usar'}</span>
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
 
               {/* Sugestões populares em 1 clique */}
               <div>
@@ -687,12 +1041,27 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
 
               {/* Lista dos modelos cadastrados */}
               <div className="space-y-2 pt-2">
-                <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
-                  Modelos Ativos no seu Workspace ({customModels.length}):
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
+                    Modelos Ativos no seu Workspace ({customModels.length}):
+                  </div>
+                  {customModels.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => handleTestBatchModels(customModels)}
+                      disabled={testingAll}
+                      className="text-[11px] bg-mockbird-card hover:bg-mockbird-cardhover border border-mockbird-border text-mockbird-cyan font-semibold px-3 py-1 rounded-lg flex items-center gap-1.5 transition-all disabled:opacity-50"
+                      title="Testa a conexão e resposta de todos os modelos ativos abaixo"
+                    >
+                      <RefreshCw size={12} className={testingAll ? 'animate-spin' : ''} />
+                      <span>{testingAll ? 'Testando Todos...' : `Testar Todos (${customModels.length})`}</span>
+                    </button>
+                  )}
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   {customModels.map((m) => {
                     const isDefault = defaultModel === m;
+                    const probe = modelTestResults[m];
                     return (
                       <div
                         key={m}
@@ -702,11 +1071,42 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
                             : 'bg-mockbird-card border-mockbird-border text-slate-300'
                         }`}
                       >
-                        <span className="truncate mr-2 font-medium" title={m}>
-                          {m}
-                        </span>
+                        <div className="min-w-0 flex-1 mr-2">
+                          <div className="truncate font-medium" title={m}>
+                            {m}
+                          </div>
+                          {probe && (
+                            <div
+                              className={`text-[10px] font-sans truncate mt-0.5 ${
+                                probe.status === 'ok'
+                                  ? 'text-emerald-400'
+                                  : probe.status === 'error'
+                                  ? 'text-rose-400'
+                                  : 'text-mockbird-cyan'
+                              }`}
+                              title={probe.message}
+                            >
+                              {probe.status === 'testing'
+                                ? 'Testando conexão...'
+                                : probe.status === 'ok'
+                                ? `✓ Online (${probe.latency_ms ?? 0}ms)`
+                                : `✗ ${probe.message || 'Falha na conexão'}`}
+                            </div>
+                          )}
+                        </div>
 
                         <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleTestSingleModel(m)}
+                            disabled={probe?.status === 'testing'}
+                            className="text-[10px] font-sans text-slate-400 hover:text-mockbird-cyan px-2 py-0.5 rounded hover:bg-slate-800 border border-transparent hover:border-slate-700 flex items-center gap-1 transition-all"
+                            title={`Testar conexão com ${m}`}
+                          >
+                            <Play size={10} className={probe?.status === 'testing' ? 'animate-spin text-mockbird-cyan' : ''} />
+                            <span>Testar</span>
+                          </button>
+
                           {isDefault ? (
                             <span className="bg-mockbird-cyanbadge text-slate-100 text-[10px] font-sans font-bold px-2 py-0.5 rounded-full flex items-center gap-1">
                               <Star size={10} className="fill-slate-100" />
@@ -758,16 +1158,28 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
             )}
 
             {/* Action Buttons */}
-            <div className="flex items-center justify-between pt-2">
-              <button
-                type="button"
-                onClick={handleTestConnection}
-                disabled={testing}
-                className="bg-mockbird-surface hover:bg-mockbird-card border border-mockbird-border text-slate-200 font-semibold text-xs px-4 py-2.5 rounded-lg flex items-center gap-2 transition-all disabled:opacity-50"
-              >
-                <RefreshCw size={14} className={testing ? 'animate-spin text-mockbird-cyan' : ''} />
-                <span>{testing ? 'Testando Conexão...' : `Testar Conexão (${defaultModel})`}</span>
-              </button>
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleTestConnection}
+                  disabled={testing || testingAll}
+                  className="bg-mockbird-surface hover:bg-mockbird-card border border-mockbird-border text-slate-200 font-semibold text-xs px-4 py-2.5 rounded-lg flex items-center gap-2 transition-all disabled:opacity-50"
+                >
+                  <RefreshCw size={14} className={testing ? 'animate-spin text-mockbird-cyan' : ''} />
+                  <span>{testing ? 'Testando Padrão...' : `Testar Padrão (${defaultModel})`}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleTestBatchModels(customModels)}
+                  disabled={testingAll || testing || customModels.length === 0}
+                  className="bg-mockbird-surface hover:bg-mockbird-card border border-mockbird-cyan/40 text-mockbird-cyan font-semibold text-xs px-4 py-2.5 rounded-lg flex items-center gap-2 transition-all disabled:opacity-50"
+                >
+                  <Zap size={14} className={testingAll ? 'animate-pulse' : ''} />
+                  <span>{testingAll ? 'Testando Todos os Modelos...' : `Testar Todos (${customModels.length})`}</span>
+                </button>
+              </div>
 
               <button
                 type="submit"
@@ -1521,101 +1933,140 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
         </div>
       )}
 
-      {/* TAB 3: ORGANIZAÇÃO & SEGURANÇA */}
+      {/* TAB 3: PLANOS & CONSUMO */}
       {activeTab === 'org' && (
         <div className="bg-mockbird-card border border-mockbird-border rounded-2xl p-6 shadow-xl space-y-6">
-          <div>
-            <h2 className="text-base font-bold text-white flex items-center gap-2">
-              <ShieldCheck size={18} className="text-emerald-400" />
-              Segurança do SaaS & Isolamento Multi-Tenant
-            </h2>
-            <p className="text-xs text-slate-400 mt-1">
-              Todos os recursos, protótipos, comentários e chaves pertencem estritamente à sua organização.
-            </p>
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-mockbird-border pb-5">
+            <div>
+              <h2 className="text-base font-bold text-white flex items-center gap-2">
+                <Sparkles size={18} className="text-mockbird-cyan" />
+                Planos &amp; Franquia Mensal de IA
+              </h2>
+              <p className="text-xs text-slate-400 mt-1">
+                Acompanhe o consumo mensal de tokens da sua organização e escolha o plano ideal para o seu time.
+              </p>
+            </div>
+            {usage?.plan && (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-mockbird-blue/15 text-mockbird-cyan border border-mockbird-cyan/30">
+                <Star size={12} className="fill-mockbird-cyan" />
+                Plano Ativo: {usage.plan.name}
+              </span>
+            )}
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-            <div className="bg-mockbird-surface border border-mockbird-border p-4 rounded-xl">
-              <div className="text-slate-400 mb-1">Licença do Software</div>
-              <div className="text-white font-bold text-sm">MIT / SaaS Open Core</div>
-              <div className="text-[11px] text-slate-500 mt-1">Uso livre sem cobrança de mensalidade inicial.</div>
-            </div>
-
-            <div className="bg-mockbird-surface border border-mockbird-border p-4 rounded-xl">
-              <div className="text-slate-400 mb-1">Ambiente de Execução</div>
-              <div className="text-emerald-400 font-bold text-sm">
-                {appEnv === 'production'
-                  ? `Produção Ativa (Porta ${window.location.port || '8083'})`
-                  : 'Homologação Ativa (Porta 8082)'}
-              </div>
-              <div className="text-[11px] text-slate-500 mt-1">
-                {appEnv === 'production'
-                  ? 'Instância dedicada de produção com banco e segredos isolados.'
-                  : 'Testes isolados antes da publicação em produção.'}
-              </div>
-            </div>
-          </div>
-
-          {/* Plano de IA da organização */}
-          <div className="border-t border-mockbird-border pt-6 space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3">
-              <div>
-                <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                  <Sparkles size={16} className="text-mockbird-cyan" /> Plano de IA
-                </h3>
-                <p className="text-xs text-slate-400 mt-0.5">
-                  O limite do plano prevalece sobre o limite individual de cada usuário.
-                </p>
-              </div>
-              {usage && (
-                <div className="text-right text-xs text-slate-400">
-                  <div className="font-mono text-white">
-                    {Number(usage.tokens_used_month).toLocaleString('pt-BR')} /{' '}
-                    {Number(usage.monthly_token_limit).toLocaleString('pt-BR')} tokens
+          {/* Resumo de Consumo Mensal */}
+          {usage && (
+            <div className="bg-mockbird-surface border border-mockbird-border rounded-xl p-5 space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3">
+                <div>
+                  <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                    Consumo Consolidado no Mês Atual
                   </div>
-                  <div className="w-48 h-1.5 bg-mockbird-bg rounded-full mt-1 overflow-hidden">
-                    <div
-                      className="h-full bg-mockbird-blue"
-                      style={{
-                        width: `${Math.min(100, (usage.tokens_used_month / Math.max(1, usage.monthly_token_limit)) * 100)}%`,
-                      }}
-                    />
+                  <div className="text-2xl font-bold text-white font-mono mt-1">
+                    {Number(usage.tokens_used_month || 0).toLocaleString('pt-BR')}{' '}
+                    <span className="text-sm font-normal text-slate-400">
+                      / {Number(usage.monthly_token_limit || 0).toLocaleString('pt-BR')} tokens
+                    </span>
                   </div>
+                </div>
+                <div className="text-xs text-slate-400 font-mono">
+                  Restam{' '}
+                  <strong className="text-emerald-400">
+                    {Math.max(0, Number(usage.monthly_token_limit || 0) - Number(usage.tokens_used_month || 0)).toLocaleString('pt-BR')}
+                  </strong>{' '}
+                  tokens disponíveis
+                </div>
+              </div>
+
+              <div className="w-full h-2.5 bg-mockbird-bg rounded-full overflow-hidden border border-mockbird-border">
+                <div
+                  className="h-full bg-gradient-to-r from-mockbird-blue to-mockbird-cyan transition-all duration-300"
+                  style={{
+                    width: `${Math.min(100, (Number(usage.tokens_used_month || 0) / Math.max(1, Number(usage.monthly_token_limit || 1))) * 100)}%`,
+                  }}
+                />
+              </div>
+
+              {usage.providers && usage.providers.length > 0 && (
+                <div className="pt-2 border-t border-mockbird-border/60 flex flex-wrap items-center gap-3 text-xs text-slate-400">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                    Por provedor:
+                  </span>
+                  {usage.providers.map((p: any) => (
+                    <span
+                      key={p.provider_type}
+                      className="px-2.5 py-1 rounded-md bg-mockbird-card border border-mockbird-border font-mono text-[11px] text-slate-300"
+                    >
+                      {p.provider_type}: {Number(p.tokens_used_month || 0).toLocaleString('pt-BR')} tokens
+                    </span>
+                  ))}
                 </div>
               )}
             </div>
+          )}
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          {/* Grade de Planos */}
+          <div className="space-y-4">
+            <div>
+              <h3 className="text-sm font-bold text-white">Escolha o Plano da Organização</h3>
+              <p className="text-xs text-slate-400 mt-0.5">
+                O limite mensal de tokens do plano vale para todos os membros da organização.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               {plans.map(plan => {
-                const isCurrent = usage?.plan?.slug === plan.slug;
+                const isCurrent = usage?.plan?.slug === plan.slug || (!usage?.plan && plan.slug === 'free');
+                const features: string[] = Array.isArray(plan.features) ? plan.features : [];
                 return (
                   <div
                     key={plan.slug}
-                    className={`p-4 rounded-xl border flex flex-col gap-2 ${
+                    className={`p-5 rounded-2xl border flex flex-col gap-3 transition-all ${
                       isCurrent
-                        ? 'bg-mockbird-blue/10 border-mockbird-cyan'
-                        : 'bg-mockbird-surface border-mockbird-border'
+                        ? 'bg-mockbird-blue/10 border-mockbird-cyan shadow-lg shadow-mockbird-blue/10'
+                        : 'bg-mockbird-surface border-mockbird-border hover:border-slate-600'
                     }`}
                   >
                     <div className="flex items-center justify-between">
-                      <span className="font-bold text-white text-sm">{plan.name}</span>
-                      {isCurrent && <Check size={14} className="text-mockbird-cyan" />}
+                      <span className="font-bold text-white text-base">{plan.name}</span>
+                      {isCurrent && (
+                        <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-mockbird-cyan/15 text-mockbird-cyan border border-mockbird-cyan/30 flex items-center gap-1">
+                          <Check size={11} /> Atual
+                        </span>
+                      )}
                     </div>
-                    <div className="text-[11px] text-slate-400">{plan.description}</div>
-                    <div className="text-xs text-slate-300 font-mono">
-                      {Number(plan.monthly_token_limit).toLocaleString('pt-BR')} tokens/mês
+
+                    <div className="text-xs text-slate-400 min-h-[32px]">{plan.description}</div>
+
+                    <div className="py-2 border-y border-mockbird-border/70">
+                      <div className="text-xl font-bold text-white">
+                        {plan.price_cents ? `R$ ${(plan.price_cents / 100).toFixed(2).replace('.', ',')}` : 'Grátis'}
+                        {plan.price_cents ? <span className="text-xs font-normal text-slate-400">/mês</span> : null}
+                      </div>
+                      <div className="text-xs text-mockbird-cyan font-mono mt-0.5">
+                        {Number(plan.monthly_token_limit).toLocaleString('pt-BR')} tokens/mês
+                      </div>
                     </div>
-                    <div className="text-[11px] text-slate-500">
-                      {plan.price_cents ? `R$ ${(plan.price_cents / 100).toFixed(2)}/mês` : 'Grátis'}
-                    </div>
+
+                    {features.length > 0 && (
+                      <ul className="space-y-1.5 text-xs text-slate-300 flex-1">
+                        {features.map((feat, idx) => (
+                          <li key={idx} className="flex items-start gap-2">
+                            <Check size={13} className="text-emerald-400 shrink-0 mt-0.5" />
+                            <span>{feat}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+
                     <button
                       type="button"
                       disabled={isCurrent || assigningPlan !== null || (userRole !== 'owner' && !isCurrent)}
                       onClick={() => handleAssignPlan(plan.slug)}
-                      className={`mt-auto text-xs font-semibold py-1.5 rounded-lg transition-all disabled:opacity-40 ${
+                      className={`mt-auto text-xs font-semibold py-2 rounded-lg transition-all disabled:opacity-40 ${
                         isCurrent
-                          ? 'bg-mockbird-card text-slate-300'
-                          : 'bg-mockbird-blue hover:bg-mockbird-bluedark text-white'
+                          ? 'bg-mockbird-card text-slate-300 border border-mockbird-border'
+                          : 'bg-mockbird-blue hover:bg-mockbird-bluedark text-white shadow-sm'
                       }`}
                     >
                       {isCurrent ? 'Plano atual' : assigningPlan === plan.slug ? 'Aplicando…' : 'Usar este plano'}
@@ -1625,7 +2076,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
               })}
             </div>
             {userRole && userRole !== 'owner' && (
-              <p className="text-[11px] text-slate-500">Apenas o owner da organização pode trocar de plano.</p>
+              <p className="text-[11px] text-slate-500">Apenas o proprietário (owner) da organização pode alterar o plano.</p>
             )}
           </div>
         </div>

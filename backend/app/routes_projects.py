@@ -171,7 +171,68 @@ async def list_projects(
         .limit(min(max(1, limit), 200))
     )
     proj_query = await db.execute(query)
-    return proj_query.scalars().all()
+    projects = list(proj_query.scalars().all())
+    if not projects:
+        return []
+
+    proj_ids = [p.id for p in projects]
+
+    # Busca todas as telas dos projetos listados (ordenadas pela principal primeiro)
+    screens_res = await db.execute(
+        select(Screen, Canvas.project_id)
+        .join(Canvas, Canvas.id == Screen.canvas_id)
+        .where(Canvas.project_id.in_(proj_ids))
+        .order_by(Screen.is_entry.desc(), Screen.created_at.asc())
+    )
+    screens_by_proj: Dict[str, List[Screen]] = {}
+    for scr, pid in screens_res.all():
+        screens_by_proj.setdefault(pid, []).append(scr)
+
+    tokens_res = await db.execute(
+        select(DesignTokens).where(DesignTokens.project_id.in_(proj_ids))
+    )
+    tokens_by_proj: Dict[str, DesignTokens] = {
+        t.project_id: t for t in tokens_res.scalars().all()
+    }
+
+    out_list: List[ProjectOut] = []
+    for p in projects:
+        p_out = ProjectOut.model_validate(p)
+        p_screens = screens_by_proj.get(p.id, [])
+        p_out.screens_count = len(p_screens)
+
+        chosen: Optional[Screen] = None
+        if p.entry_screen_id:
+            chosen = next((s for s in p_screens if s.id == p.entry_screen_id), None)
+        if not chosen and p_screens:
+            chosen = p_screens[0]
+
+        if chosen:
+            from app.schemas import ProjectPreviewScreenOut
+
+            p_out.preview_screen = ProjectPreviewScreenOut(
+                id=chosen.id,
+                name=chosen.name,
+                html_content=chosen.html_content or "",
+                css_content=chosen.css_content or "",
+                width=chosen.width or 1440,
+                height=chosen.height or 900,
+            )
+
+        tok = tokens_by_proj.get(p.id)
+        if tok:
+            merged_tokens: Dict[str, Any] = {}
+            if isinstance(tok.shared_tokens, dict):
+                merged_tokens.update(tok.shared_tokens)
+            if isinstance(tok.dark_tokens, dict) and tok.dark_tokens:
+                merged_tokens.update(tok.dark_tokens)
+            elif isinstance(tok.light_tokens, dict):
+                merged_tokens.update(tok.light_tokens)
+            p_out.preview_tokens = merged_tokens
+
+        out_list.append(p_out)
+
+    return out_list
 
 
 @router.post("", response_model=ProjectOut)

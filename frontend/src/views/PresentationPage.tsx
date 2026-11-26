@@ -18,6 +18,14 @@ import {
 } from 'lucide-react';
 import { resolveScreenIndex } from '../lib/mockNav';
 import { applyThemeToHtml } from '../lib/canvasDoc';
+import {
+  PresentationError,
+  fetchGuestComments,
+  fetchPrivatePresentation,
+  fetchPublicPresentation,
+  postGuestComment,
+  presentationErrorMessage,
+} from '../lib/presentationApi';
 
 interface GuestComment {
   id: string;
@@ -27,12 +35,36 @@ interface GuestComment {
   created_at: string;
 }
 
+/**
+ * Origem da apresentação:
+ * - `public`: link de compartilhamento (token do share link, pode exigir senha ou login);
+ * - `private`: pré-visualização do projeto para quem tem acesso (botão "Apresentar").
+ */
+export type PresentationSource =
+  | { kind: 'public'; slug: string }
+  | { kind: 'private'; projectId: string };
+
 interface PresentationPageProps {
-  slug: string;
+  source: PresentationSource;
   onBackToApp?: () => void;
+  /** Chamado quando o link exige login (`login_required`). */
+  onLoginRequired?: () => void;
 }
 
-export const PresentationPage: React.FC<PresentationPageProps> = ({ slug, onBackToApp }) => {
+export const PresentationPage: React.FC<PresentationPageProps> = ({ source, onBackToApp, onLoginRequired }) => {
+  // Slug usado nos endpoints de comentário (só existe no link público).
+  const slug = source.kind === 'public' ? source.slug : '';
+  const commentsAllowedHere = source.kind === 'public';
+  const sourceKind = source.kind;
+  const sourceSlug = source.kind === 'public' ? source.slug : '';
+  const sourceProjectId = source.kind === 'private' ? source.projectId : '';
+
+  // Callback guardado numa ref: uma função nova a cada render não pode
+  // disparar de novo o carregamento da apresentação.
+  const onLoginRequiredRef = useRef(onLoginRequired);
+  useEffect(() => {
+    onLoginRequiredRef.current = onLoginRequired;
+  }, [onLoginRequired]);
   const [projectData, setProjectData] = useState<any>(null);
   const [currentScreenIndex, setCurrentScreenIndex] = useState(0);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -131,21 +163,14 @@ export const PresentationPage: React.FC<PresentationPageProps> = ({ slug, onBack
 
   const loadPresentation = useCallback((pwd?: string) => {
     setLoading(true);
-    const query = pwd ? `?password=${encodeURIComponent(pwd)}` : '';
-    return fetch(`/api/public/p/${slug}${query}`)
-      .then(async r => {
-        if (r.status === 401 || r.status === 403) {
-          setNeedsPassword(true);
-          setPasswordError(r.status === 403 ? 'Senha incorreta.' : null);
-          setLoading(false);
-          return null;
-        }
-        if (!r.ok) throw new Error('Projeto de apresentação não encontrado');
-        return r.json();
-      })
+    setError(null);
+    const request = sourceKind === 'public'
+      ? fetchPublicPresentation(sourceSlug, pwd)
+      : fetchPrivatePresentation(sourceProjectId);
+    return request
       .then(d => {
-        if (!d) return;
         setNeedsPassword(false);
+        setPasswordError(null);
         setProjectData(d);
         // Encontra tela principal se houver
         if (d.screens && d.screens.length > 0) {
@@ -153,9 +178,24 @@ export const PresentationPage: React.FC<PresentationPageProps> = ({ slug, onBack
           if (mainIdx >= 0) setCurrentScreenIndex(mainIdx);
         }
       })
-      .catch(e => setError(e.message))
+      .catch((e: unknown) => {
+        if (e instanceof PresentationError) {
+          if (e.code === 'password_required' || e.code === 'password_invalid') {
+            setNeedsPassword(true);
+            setPasswordError(e.code === 'password_invalid' ? presentationErrorMessage(e) : null);
+            return;
+          }
+          if (e.code === 'login_required' && onLoginRequiredRef.current) {
+            onLoginRequiredRef.current();
+            return;
+          }
+          setError(presentationErrorMessage(e));
+          return;
+        }
+        setError('Não foi possível abrir a apresentação');
+      })
       .finally(() => setLoading(false));
-  }, [slug]);
+  }, [sourceKind, sourceSlug, sourceProjectId]);
 
   useEffect(() => {
     loadPresentation();
@@ -207,15 +247,14 @@ export const PresentationPage: React.FC<PresentationPageProps> = ({ slug, onBack
   }, [presentationTheme, resolvedTokens]);
 
   const loadComments = useCallback(async () => {
-    if (!commentsEnabled || !screenId) return;
-    const pwdQuery = password ? `&password=${encodeURIComponent(password)}` : '';
+    if (!commentsAllowedHere || !commentsEnabled || !screenId) return;
     try {
-      const res = await fetch(`/api/public/p/${slug}/comments?screen_id=${screenId}${pwdQuery}`);
+      const res = await fetchGuestComments(slug, screenId, password);
       if (res.ok) setComments(await res.json());
     } catch (err) {
       console.error('Erro ao carregar comentários:', err);
     }
-  }, [commentsEnabled, screenId, slug, password]);
+  }, [commentsAllowedHere, commentsEnabled, screenId, slug, password]);
 
   useEffect(() => {
     loadComments();
@@ -223,20 +262,19 @@ export const PresentationPage: React.FC<PresentationPageProps> = ({ slug, onBack
 
   const submitGuestComment = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!screenId || !commentBody.trim() || sendingComment) return;
+    if (!commentsAllowedHere || !screenId || !commentBody.trim() || sendingComment) return;
     setSendingComment(true);
     setCommentError(null);
     try {
-      const pwdQuery = password ? `?password=${encodeURIComponent(password)}` : '';
-      const res = await fetch(`/api/public/p/${slug}/comments${pwdQuery}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const res = await postGuestComment(
+        slug,
+        {
           screen_id: screenId,
           body: commentBody.trim(),
           guest_name: guestName.trim() || undefined,
-        }),
-      });
+        },
+        password,
+      );
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.detail || 'Não foi possível enviar o comentário');
@@ -365,7 +403,22 @@ export const PresentationPage: React.FC<PresentationPageProps> = ({ slug, onBack
         if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.indexOf('//') === 0) {
           return { kind: 'external', target: href };
         }
+        if (href.charAt(0) === '#' && href.charAt(1) !== '/') {
+          return { kind: 'anchor', target: href };
+        }
         return { kind: 'screen', target: href };
+      }
+
+      function scrollToAnchor(hash) {
+        var id = String(hash || '').replace(/^#/, '');
+        try { id = decodeURIComponent(id); } catch (err) {}
+        if (!id) return false;
+        var el = document.getElementById(id) ||
+          document.getElementsByName(id)[0] ||
+          document.querySelector("[data-mb-id='" + id + "']");
+        if (!el) return false;
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        return true;
       }
 
       document.addEventListener('click', (e) => {
@@ -408,7 +461,8 @@ export const PresentationPage: React.FC<PresentationPageProps> = ({ slug, onBack
         const nav = mockTarget(e.target);
         if (nav) {
           e.preventDefault();
-          if (nav.kind === 'screen') {
+          if (nav.kind === 'anchor' && scrollToAnchor(nav.target)) return;
+          if (nav.kind === 'screen' || nav.kind === 'anchor') {
             post({ type: 'MOCKBIRD_NAVIGATE', target: nav.target });
           } else if (nav.target) {
             window.open(nav.target, '_blank');

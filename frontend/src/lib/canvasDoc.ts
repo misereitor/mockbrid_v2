@@ -818,7 +818,23 @@ const CANVAS_RUNTIME = `
           if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.indexOf('//') === 0) {
             return { kind: 'external', target: href };
           }
+          if (href.charAt(0) === '#' && href.charAt(1) !== '/') {
+            return { kind: 'anchor', target: href };
+          }
           return { kind: 'screen', target: href };
+        }
+
+        // Âncora na própria página (#secao): rola até o elemento, como num site real.
+        function scrollToAnchor(hash) {
+          let id = String(hash || '').replace(/^#/, '');
+          try { id = decodeURIComponent(id); } catch (err) {}
+          if (!id) return false;
+          const el = document.getElementById(id) ||
+            document.getElementsByName(id)[0] ||
+            document.querySelector("[data-mb-id='" + id + "']");
+          if (!el) return false;
+          el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          return true;
         }
 
         // Clique: no modo mock age como na página; Shift/Ctrl seleciona e
@@ -893,6 +909,7 @@ const CANVAS_RUNTIME = `
           const nav = mockTarget(e.target);
           if (nav) {
             e.preventDefault();
+            if (nav.kind === 'anchor' && scrollToAnchor(nav.target)) return;
             post({ type: 'MOCKBIRD_NAVIGATE', target: nav.target, external: nav.kind === 'external' });
             return;
           }
@@ -1385,6 +1402,17 @@ const CANVAS_RUNTIME = `
               target.replaceWith(newEl);
               emitHtmlChanged();
               selectElement(newEl);
+            } else if (!target && newSnippet) {
+              // Fallback de segurança: se o alvo cirúrgico não foi localizado no DOM
+              // mas a tela contém o placeholder inicial (root-hero / mockbird-hero), substitui o hero
+              const hero = document.querySelector('[data-mb-id="root-hero"]') || document.querySelector('.mockbird-hero');
+              if (hero) {
+                const temp = document.createElement('div');
+                temp.innerHTML = newSnippet;
+                const newEl = temp.firstElementChild || temp;
+                hero.replaceWith(newEl);
+                emitHtmlChanged();
+              }
             }
             return;
           }

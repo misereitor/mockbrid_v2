@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     # instâncias que já tinham contas antes deste recurso existir.
     SYSTEM_ADMIN_EMAIL: str = ""
     MAX_ASSET_BYTES: int = 5 * 1024 * 1024
+    # Rate limit dos links públicos (GET /api/public/p/*). Desligado por padrão:
+    # só ligue depois de confirmar que a aplicação enxerga o IP real do visitante
+    # (FORWARDED_ALLOW_IPS). Atrás de um proxy mal configurado, todos os visitantes
+    # dividiriam o mesmo contador e seriam bloqueados juntos.
+    PUBLIC_RATE_LIMIT_ENABLED: bool = False
 
     # Timeouts e limites das chamadas de LLM. Valores generosos por padrão:
     # modelos locais (llama.cpp/Ollama) levam minutos apenas no prefill do prompt.

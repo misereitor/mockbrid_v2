@@ -38,12 +38,15 @@ class AgentState(BaseModel):
     prompt: str
     current_html: str
     target_element: Optional[TargetElementInfo] = None
+    image_url: Optional[str] = None
+    messages: List[Dict[str, Any]] = Field(default_factory=list)
+    screen_semantics: Optional[Dict[str, Any]] = None
     model_name: str = "bonsai-27b"
     project_id: Optional[str] = None
     screen_id: Optional[str] = None
     project_context: Optional[str] = None
 
-    # Intenção do agente: "explanation" | "surgical_edit" | "layout_repair" | "full_page"
+    # Intenção do agente: "explanation" | "surgical_edit" | "layout_repair" | "evolve_screen" | "full_page"
     intent: str = "surgical_edit"
 
     # Planejamento (quando aplicável)

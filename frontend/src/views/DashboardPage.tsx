@@ -5,6 +5,7 @@ import {
   Copy,
   Check,
   MonitorPlay,
+  Link2,
   ArrowUpRight,
   FolderPlus,
   X,
@@ -16,7 +17,17 @@ import {
   Upload,
   Edit2,
 } from 'lucide-react';
-import { copyPresentationLink, openPresentation } from '../lib/presentation';
+import { openPresentation } from '../lib/presentation';
+import { SharePanel } from '../components/SharePanel';
+
+export interface ProjectPreviewScreen {
+  id: string;
+  name: string;
+  html_content: string;
+  css_content?: string;
+  width?: number;
+  height?: number;
+}
 
 export interface ProjectSummary {
   id: string;
@@ -25,8 +36,115 @@ export interface ProjectSummary {
   description: string;
   screens_count?: number;
   screens?: { id: string; name: string; slug: string; is_main?: boolean }[];
+  preview_screen?: ProjectPreviewScreen | null;
+  preview_tokens?: Record<string, string> | null;
   updated_at?: string;
 }
+
+function buildThumbnailSrcDoc(
+  screen: ProjectPreviewScreen,
+  tokens?: Record<string, string> | null
+): string {
+  const tokenVars = Object.entries(tokens || {})
+    .map(([k, v]) => `--${k}: ${v};`)
+    .join('\n');
+  const rawHtml = screen.html_content || '';
+  const hasFullDoc = /<!doctype\s+html|<html[\s>]/i.test(rawHtml);
+  const customStyle = `<style>
+    :root { ${tokenVars} }
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden !important;
+      user-select: none;
+      pointer-events: none;
+      background: var(--color-bg, #09090b);
+      color: var(--color-text, #f8fafc);
+      font-family: var(--font-body, Inter, system-ui, sans-serif);
+    }
+    ${screen.css_content || ''}
+  </style>`;
+
+  if (hasFullDoc) {
+    if (/<\/head>/i.test(rawHtml)) {
+      return rawHtml.replace(/<\/head>/i, `${customStyle}</head>`);
+    }
+    return `${customStyle}${rawHtml}`;
+  }
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  ${customStyle}
+</head>
+<body>${rawHtml}</body>
+</html>`;
+}
+
+const ProjectThumbnail: React.FC<{
+  screen?: ProjectPreviewScreen | null;
+  tokens?: Record<string, string> | null;
+}> = ({ screen, tokens }) => {
+  const hasHtml = Boolean(screen?.html_content && screen.html_content.trim());
+  const screenWidth = screen?.width && screen.width > 0 ? screen.width : 1440;
+  const screenHeight = screen?.height && screen.height > 0 ? screen.height : 900;
+  // O card no grid tem ~340px de largura; escala proporcional para caber nos 144px (h-36) de altura
+  const scale = Math.min(340 / screenWidth, 144 / screenHeight, 0.35);
+
+  const srcDoc = useMemo(() => {
+    if (!hasHtml || !screen) return '';
+    return buildThumbnailSrcDoc(screen, tokens);
+  }, [hasHtml, screen, tokens]);
+
+  if (!hasHtml || !screen) {
+    return (
+      <>
+        <div
+          className="absolute inset-0 opacity-50"
+          style={{
+            backgroundImage: 'radial-gradient(circle, #27272a 1px, transparent 1px)',
+            backgroundSize: '16px 16px',
+          }}
+        />
+        <div className="absolute left-5 top-5 right-12 space-y-2">
+          <div className="h-2 w-1/3 rounded bg-slate-700" />
+          <div className="h-10 rounded-md bg-mockbird-card border border-mockbird-border" />
+          <div className="h-2 w-1/2 rounded bg-slate-800" />
+        </div>
+      </>
+    );
+  }
+
+  return (
+    <div className="absolute inset-0 overflow-hidden bg-mockbird-bg flex items-start justify-center">
+      <div
+        className="origin-top pointer-events-none select-none shrink-0"
+        style={{
+          width: `${screenWidth}px`,
+          height: `${screenHeight}px`,
+          transform: `scale(${scale})`,
+          transformOrigin: 'top center',
+        }}
+      >
+        <iframe
+          title={`Preview de ${screen.name}`}
+          srcDoc={srcDoc}
+          sandbox="allow-same-origin allow-scripts"
+          loading="lazy"
+          tabIndex={-1}
+          className="w-full h-full border-0 pointer-events-none"
+        />
+      </div>
+      <div className="absolute inset-x-0 bottom-0 h-8 bg-gradient-to-t from-black/75 via-black/30 to-transparent flex items-end justify-between px-3 pb-1.5">
+        <span className="text-[10px] font-medium text-slate-200 truncate bg-black/50 backdrop-blur-sm px-2 py-0.5 rounded border border-white/10">
+          {screen.name}
+        </span>
+      </div>
+    </div>
+  );
+};
 
 interface DashboardPageProps {
   projects: ProjectSummary[];
@@ -62,11 +180,11 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   const [projectName, setProjectName] = useState('');
   const [projectDesc, setProjectDesc] = useState('');
   const [creating, setCreating] = useState(false);
-  const [copiedSlug, setCopiedSlug] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
+  const [sharePanelProject, setSharePanelProject] = useState<{ id: string; name: string } | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [renaming, setRenaming] = useState(false);
   const importInputRef = useRef<HTMLInputElement>(null);
@@ -96,16 +214,6 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       setShowCreateForm(false);
     } finally {
       setCreating(false);
-    }
-  };
-
-  const handleCopyPresentation = async (projectId: string, slug: string) => {
-    try {
-      await copyPresentationLink(projectId);
-      setCopiedSlug(slug);
-      setTimeout(() => setCopiedSlug(null), 2000);
-    } catch {
-      setCopiedSlug(null);
     }
   };
 
@@ -254,19 +362,16 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                   key={proj.id}
                   className="group mb-panel overflow-hidden hover:border-mockbird-borderlight transition-colors duration-150 flex flex-col"
                 >
-                  {/* Pré-visualização abstrata */}
+                  {/* Pré-visualização real da tela principal do projeto */}
                   <button
                     onClick={() => onSelectProject(proj.id)}
-                    className="relative h-32 bg-mockbird-bg border-b border-mockbird-border text-left overflow-hidden"
+                    className="relative h-36 bg-mockbird-bg border-b border-mockbird-border text-left overflow-hidden"
                     aria-label={`Abrir ${proj.name}`}
                   >
-                    <div className="absolute inset-0 opacity-50" style={{ backgroundImage: 'radial-gradient(circle, #27272a 1px, transparent 1px)', backgroundSize: '16px 16px' }} />
-                    <div className="absolute left-5 top-5 right-12 space-y-2">
-                      <div className="h-2 w-1/3 rounded bg-slate-700" />
-                      <div className="h-10 rounded-md bg-mockbird-card border border-mockbird-border" />
-                      <div className="h-2 w-1/2 rounded bg-slate-800" />
+                    <ProjectThumbnail screen={proj.preview_screen} tokens={proj.preview_tokens} />
+                    <div className="absolute right-2.5 top-2.5 p-1 rounded-md bg-black/50 backdrop-blur-sm border border-white/10 text-slate-300 group-hover:text-mockbird-cyan group-hover:border-mockbird-cyan/40 transition-colors">
+                      <ArrowUpRight size={14} />
                     </div>
-                    <ArrowUpRight size={16} className="absolute right-3 top-3 text-slate-600 group-hover:text-mockbird-cyan transition-colors" />
                   </button>
 
                   <div className="p-4 flex-1 flex flex-col gap-3">
@@ -347,20 +452,20 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                       <span className="text-[11px] text-slate-500">{count} {count === 1 ? 'tela' : 'telas'}</span>
                       <div className="flex items-center gap-0.5">
                         <button
-                          onClick={() => { openPresentation(proj.id).catch(() => {}); }}
+                          onClick={() => openPresentation(proj.id)}
                           className="mb-btn-ghost !p-1.5"
-                          title="Abrir apresentação"
-                          aria-label="Abrir apresentação"
+                          title="Pré-visualizar (só para você)"
+                          aria-label="Pré-visualizar apresentação"
                         >
                           <MonitorPlay size={14} />
                         </button>
                         <button
-                          onClick={() => handleCopyPresentation(proj.id, proj.slug)}
+                          onClick={() => setSharePanelProject({ id: proj.id, name: proj.name })}
                           className="mb-btn-ghost !p-1.5"
-                          title="Copiar link de apresentação"
-                          aria-label="Copiar link de apresentação"
+                          title="Compartilhar"
+                          aria-label="Compartilhar projeto"
                         >
-                          {copiedSlug === proj.slug ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
+                          <Link2 size={14} />
                         </button>
                         {onRenameProject && (
                           <button
@@ -419,6 +524,14 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
           </div>
         )}
       </div>
+
+      {sharePanelProject && (
+        <SharePanel
+          projectId={sharePanelProject.id}
+          projectName={sharePanelProject.name}
+          onClose={() => setSharePanelProject(null)}
+        />
+      )}
     </div>
   );
 };

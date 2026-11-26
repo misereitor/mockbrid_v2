@@ -210,6 +210,8 @@ class AIChatRequest(BaseModel):
     prompt: str
     current_html: Optional[str] = ""
     target_element: Optional[Dict[str, Any]] = None
+    image_url: Optional[str] = None
+    messages: Optional[List[Dict[str, Any]]] = None
     system_role: Optional[str] = "assistant"
     model_name: Optional[str] = None
     provider_id: Optional[str] = None
@@ -263,6 +265,21 @@ class AITestRequest(BaseModel):
     api_key: Optional[str] = ""
     base_url: Optional[str] = ""
     model_name: str
+
+
+class AITestBatchRequest(BaseModel):
+    provider_type: str
+    api_key: Optional[str] = ""
+    base_url: Optional[str] = ""
+    models: List[str] = Field(default_factory=list)
+
+
+class AIDiscoverModelsRequest(BaseModel):
+    provider_type: str
+    api_key: Optional[str] = ""
+    base_url: Optional[str] = ""
+    test_discovered: bool = False
+    max_test: int = Field(default=8, ge=1, le=25)
 
 
 @router.get("/providers", response_model=List[AIProviderOut])
@@ -359,12 +376,34 @@ async def save_provider(
     }
 
 
-@router.post("/test-connection")
-async def test_ai_connection(
-    payload: AITestRequest, current_user: User = Depends(require_admin)
-):
-    url = (payload.base_url or "").strip()
-    p_type = payload.provider_type.lower()
+async def _resolve_ai_test_target(
+    db: AsyncSession,
+    current_user: User,
+    provider_type: str,
+    base_url: Optional[str],
+    api_key: Optional[str],
+) -> tuple[str, str, Dict[str, str]]:
+    """Resolve URL validada contra SSRF, tipo do provedor e headers (incluindo API key salva no banco quando omitida)."""
+    url = (base_url or "").strip()
+    p_type = (provider_type or "openai").lower().strip()
+    raw_key = (api_key or "").strip()
+
+    if not raw_key or not url:
+        res = await db.execute(
+            select(AIProvider)
+            .where(AIProvider.organization_id == current_user.organization_id)
+            .order_by(
+                (AIProvider.provider_type == p_type).desc(),
+                AIProvider.is_active.desc(),
+                AIProvider.created_at.desc(),
+            )
+        )
+        saved_prov = res.scalars().first()
+        if saved_prov:
+            if not raw_key:
+                raw_key = _get_provider_api_key(saved_prov)
+            if not url and saved_prov.base_url:
+                url = saved_prov.base_url.strip()
 
     if not url:
         if p_type == "openai":
@@ -380,72 +419,244 @@ async def test_ai_connection(
         else:
             url = "https://api.openai.com/v1"
 
-    # Valida proteção contra SSRF antes de qualquer conexão de rede
     validate_ai_endpoint_url(url)
-
     resolved_url = resolve_docker_base_url(url)
-    logger.info(
-        "Teste de conexao IA: %s -> %s modelo=%s", url, resolved_url, payload.model_name
-    )
 
     headers = {"Content-Type": "application/json"}
-    api_key = (payload.api_key or "").strip()
-    if api_key:
+    if raw_key:
         if p_type == "anthropic":
-            headers["x-api-key"] = api_key
+            headers["x-api-key"] = raw_key
             headers["anthropic-version"] = "2023-06-01"
         else:
-            headers["Authorization"] = f"Bearer {api_key}"
+            headers["Authorization"] = f"Bearer {raw_key}"
     else:
         headers["Authorization"] = "Bearer local-key"
 
-    try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
-            if p_type == "anthropic":
-                res = await client.post(
-                    f"{resolved_url.rstrip('/')}/messages",
-                    headers=headers,
-                    json={
-                        "model": payload.model_name or "claude-3-5-sonnet-20241022",
-                        "max_tokens": 10,
-                        "messages": [{"role": "user", "content": "ping"}],
-                    },
-                )
-            else:
-                res = await client.post(
-                    f"{resolved_url.rstrip('/')}/chat/completions",
-                    headers=headers,
-                    json={
-                        "model": payload.model_name or "gpt-4o-mini",
-                        "messages": [{"role": "user", "content": "ping"}],
-                        "max_tokens": 5,
-                    },
-                )
+    return resolved_url, p_type, headers
 
-            if res.status_code in [200, 201]:
-                return {
-                    "status": "ok",
-                    "message": f"Conexão bem-sucedida com o endpoint e modelo {payload.model_name}!",
-                }
-            else:
-                return {
-                    "status": "error",
-                    "code": res.status_code,
-                    "message": f"Servidor retornou status {res.status_code}: {res.text[:200]}",
-                }
-    except Exception as e:
+
+async def _probe_single_model(
+    client: httpx.AsyncClient,
+    resolved_url: str,
+    p_type: str,
+    headers: Dict[str, str],
+    model_name: str,
+) -> Dict[str, Any]:
+    """Executa um ping real de inferência em um modelo específico e mede a latência."""
+    import time
+
+    started = time.perf_counter()
+    clean_model = (model_name or "").strip() or "gpt-4o-mini"
+    try:
+        if p_type == "anthropic":
+            res = await client.post(
+                f"{resolved_url.rstrip('/')}/messages",
+                headers=headers,
+                json={
+                    "model": clean_model,
+                    "max_tokens": 5,
+                    "messages": [{"role": "user", "content": "ping"}],
+                },
+            )
+        else:
+            res = await client.post(
+                f"{resolved_url.rstrip('/')}/chat/completions",
+                headers=headers,
+                json={
+                    "model": clean_model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 5,
+                },
+            )
+
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        if res.status_code in [200, 201]:
+            return {
+                "model": clean_model,
+                "status": "ok",
+                "latency_ms": latency_ms,
+                "message": f"OK ({latency_ms}ms) — Conexão bem-sucedida com {clean_model}!",
+            }
         return {
+            "model": clean_model,
             "status": "error",
+            "code": res.status_code,
+            "latency_ms": latency_ms,
+            "message": f"HTTP {res.status_code}: {res.text[:180]}",
+        }
+    except Exception as e:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return {
+            "model": clean_model,
+            "status": "error",
+            "latency_ms": latency_ms,
             "message": f"Falha ao conectar em {resolved_url}: {str(e)}",
         }
 
 
+@router.post("/test-connection")
+async def test_ai_connection(
+    payload: AITestRequest,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    resolved_url, p_type, headers = await _resolve_ai_test_target(
+        db, current_user, payload.provider_type, payload.base_url, payload.api_key
+    )
+    logger.info(
+        "Teste de conexao IA: %s modelo=%s", resolved_url, payload.model_name
+    )
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+        return await _probe_single_model(
+            client, resolved_url, p_type, headers, payload.model_name
+        )
+
+
+@router.post("/test-models")
+async def test_ai_models_batch(
+    payload: AITestBatchRequest,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Testa múltiplos modelos em lote contra o endpoint configurado."""
+    import asyncio
+
+    resolved_url, p_type, headers = await _resolve_ai_test_target(
+        db, current_user, payload.provider_type, payload.base_url, payload.api_key
+    )
+    models = list(
+        dict.fromkeys([m.strip() for m in (payload.models or []) if m and m.strip()])
+    )[:30]
+    if not models:
+        raise HTTPException(
+            status_code=400, detail="Informe ao menos um modelo para testar."
+        )
+
+    sem = asyncio.Semaphore(5)
+
+    async with httpx.AsyncClient(timeout=18.0, follow_redirects=False) as client:
+        async def _bounded_probe(m: str) -> Dict[str, Any]:
+            async with sem:
+                return await _probe_single_model(client, resolved_url, p_type, headers, m)
+
+        results = await asyncio.gather(*[_bounded_probe(m) for m in models])
+
+    ok_count = sum(1 for r in results if r["status"] == "ok")
+    error_count = len(results) - ok_count
+    return {
+        "status": "ok" if ok_count > 0 else "error",
+        "ok_count": ok_count,
+        "error_count": error_count,
+        "total": len(results),
+        "results": list(results),
+    }
+
+
+@router.post("/discover-models")
+async def discover_ai_models(
+    payload: AIDiscoverModelsRequest,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Descobre modelos disponíveis no endpoint do provedor (/models) e opcionalmente testa cada um."""
+    import asyncio
+
+    resolved_url, p_type, headers = await _resolve_ai_test_target(
+        db, current_user, payload.provider_type, payload.base_url, payload.api_key
+    )
+    base_clean = resolved_url.rstrip("/")
+    discovered_ids: List[str] = []
+    fetch_error: Optional[str] = None
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+        try:
+            res = await client.get(f"{base_clean}/models", headers=headers)
+            if res.status_code == 200:
+                body = res.json()
+                items = (
+                    body.get("data")
+                    if isinstance(body, dict) and isinstance(body.get("data"), list)
+                    else body.get("models")
+                    if isinstance(body, dict) and isinstance(body.get("models"), list)
+                    else body
+                    if isinstance(body, list)
+                    else []
+                )
+                for item in items:
+                    if isinstance(item, dict):
+                        mid = item.get("id") or item.get("name") or item.get("model")
+                        if isinstance(mid, str) and mid.strip():
+                            clean_id = mid.strip()
+                            if clean_id.startswith("models/"):
+                                clean_id = clean_id[len("models/") :]
+                            discovered_ids.append(clean_id)
+                    elif isinstance(item, str) and item.strip():
+                        discovered_ids.append(item.strip())
+            else:
+                fetch_error = f"GET /models retornou HTTP {res.status_code}: {res.text[:160]}"
+        except Exception as e:
+            fetch_error = f"Falha ao consultar {base_clean}/models: {str(e)}"
+
+        # Fallback para Ollama nativo (/api/tags) caso /v1/models não esteja disponível
+        if not discovered_ids and p_type == "ollama":
+            ollama_root = re.sub(r"/v1/?$", "", base_clean)
+            try:
+                res_tags = await client.get(f"{ollama_root}/api/tags")
+                if res_tags.status_code == 200:
+                    body = res_tags.json()
+                    for item in body.get("models") or []:
+                        if isinstance(item, dict) and item.get("name"):
+                            discovered_ids.append(str(item["name"]).strip())
+                    fetch_error = None
+            except Exception:
+                pass
+
+        discovered_ids = list(dict.fromkeys(discovered_ids))
+
+        test_results: Dict[str, Dict[str, Any]] = {}
+        if payload.test_discovered and discovered_ids:
+            to_test = discovered_ids[: payload.max_test]
+            sem = asyncio.Semaphore(5)
+
+            async def _bounded_probe(m: str) -> Dict[str, Any]:
+                async with sem:
+                    return await _probe_single_model(
+                        client, resolved_url, p_type, headers, m
+                    )
+
+            probed = await asyncio.gather(*[_bounded_probe(m) for m in to_test])
+            test_results = {r["model"]: r for r in probed}
+
+    if not discovered_ids and fetch_error:
+        return {
+            "status": "error",
+            "message": fetch_error,
+            "models": [],
+            "test_results": {},
+        }
+
+    return {
+        "status": "ok",
+        "message": f"{len(discovered_ids)} modelo(s) encontrado(s) no provedor.",
+        "models": discovered_ids,
+        "test_results": test_results,
+    }
+
+
 async def get_project_mock_context(db: AsyncSession, project_id: Optional[str]) -> str:
-    """Busca o mapa de telas e chaves de cenários mock para enriquecer o prompt da IA."""
+    """Busca o mapa de telas, design tokens, dials e chaves de cenários mock para enriquecer o prompt da IA."""
     if not project_id or project_id == "default":
         return ""
     try:
-        from app.models import Canvas, Screen, DataScenario
+        from app.models import Canvas, Screen, DataScenario, DesignTokens
+
+        proj_res = await db.execute(select(Project).where(Project.id == project_id))
+        proj = proj_res.scalars().first()
+
+        tok_res = await db.execute(
+            select(DesignTokens).where(DesignTokens.project_id == project_id)
+        )
+        tok = tok_res.scalars().first()
 
         res = await db.execute(select(Canvas).where(Canvas.project_id == project_id))
         canvas = res.scalars().first()
@@ -462,7 +673,23 @@ async def get_project_mock_context(db: AsyncSession, project_id: Optional[str]) 
         )
         scenarios = scen_res.scalars().all()
 
-        lines = ["\nCONTEXTO DO PROJETO NO MOCKBIRD (Telas e Dados Mock):"]
+        lines = ["\nCONTEXTO DO PROJETO NO MOCKBIRD (Identidade, Telas e Dados Mock):"]
+        if proj:
+            lines.append(
+                f"- PROJETO: '{proj.name}'"
+                + (f" ({proj.description})" if proj.description else "")
+            )
+            if isinstance(proj.design_dials, dict) and proj.design_dials:
+                v = proj.design_dials.get("variance", 7)
+                m = proj.design_dials.get("motion", 4)
+                d = proj.design_dials.get("density", 4)
+                lines.append(
+                    f"- CALIBRAGEM DE DESIGN DO PROJETO: Criatividade/Variância={v}/10, Movimento={m}/10, Densidade={d}/10."
+                )
+        if tok and (tok.light_tokens or tok.dark_tokens):
+            lines.append(
+                f"- TOKENS DE COR DO PROJETO: Light={tok.light_tokens or {}}, Dark={tok.dark_tokens or {}}."
+            )
         if screens:
             screen_list = [f"'{s.name}'" for s in screens]
             lines.append(
@@ -502,41 +729,28 @@ async def get_project_mock_context(db: AsyncSession, project_id: Optional[str]) 
 
 def build_system_prompt(project_context: str = "") -> str:
     prompt = (
-        "Você é o Diretor de Arte e Engenheiro Frontend Principal do Mockbird v2, premiado internacionalmente (Awwwards, Apple, Stripe e Linear). "
-        "Seu objetivo é criar interfaces web estonteantes, modernas, elegantes e prontas para produção.\n\n"
-        "REGRAS DE OURO DE DESIGN & COMPOSIÇÃO:\n"
-        "1. IMAGENS REAIS DE ALTA RESOLUÇÃO (OBRIGATÓRIO):\n"
-        "   - NUNCA use caixas cinzas vazias, divs cinzas de placeholder ou 'placeholder.com'.\n"
-        "   - Use sempre tags <img> com URLs reais e funcionais do Unsplash com parâmetros de qualidade:\n"
-        "     * Carros Esportivos / Sedans (Honda Civic, Type R, etc.):\n"
-        "       https://images.unsplash.com/photo-1618843479313-40f8afb4b4d8?auto=format&fit=crop&w=1200&q=80\n"
-        "       https://images.unsplash.com/photo-1590362891991-f776e747a588?auto=format&fit=crop&w=1200&q=80\n"
-        "       https://images.unsplash.com/photo-1552519507-da3b142c6e3d?auto=format&fit=crop&w=1200&q=80\n"
-        "     * Carros SUVs / Modernos (HR-V, CR-V):\n"
-        "       https://images.unsplash.com/photo-1533473359331-0135ef1b58bf?auto=format&fit=crop&w=1200&q=80\n"
-        "       https://images.unsplash.com/photo-1503376780353-7e6692767b70?auto=format&fit=crop&w=1200&q=80\n"
-        "     * Detalhes de Interior & Volante:\n"
-        "       https://images.unsplash.com/photo-1542282088-72c9c27ed0cd?auto=format&fit=crop&w=1200&q=80\n"
-        "     * SaaS / Dashboards / Tecnologia:\n"
-        "       https://images.unsplash.com/photo-1551288049-bebda4e38f71?auto=format&fit=crop&w=1200&q=80\n"
-        "       https://images.unsplash.com/photo-1460925895917-afdab827c52f?auto=format&fit=crop&w=1200&q=80\n"
-        "2. ANATOMIA DE UMA PÁGINA COMPLETA:\n"
-        "   - Navbar: Logo limpo com ícone SVG ou tipografia forte, links de navegação com espaçamento generoso, botão de ação (CTA) em destaque.\n"
-        "   - Hero Section: Título monumental (text-4xl md:text-6xl font-extrabold tracking-tight text-white leading-tight), subtítulo claro e persuasivo (text-slate-300 text-lg leading-relaxed max-w-2xl), badge moderno no topo (backdrop-blur-md bg-white/5 border border-white/10 px-3 py-1 rounded-full text-xs text-slate-300), e foto de destaque em alta escala.\n"
-        "   - Grid de Produtos / Modelos: Cards com imagem em aspect-video ou h-60 com object-cover, título do modelo, especificações técnicas em badges (ex: '315 cv', '0-100 em 5.4s', 'Híbrido e:HEV'), preço em destaque e botão de ação.\n"
-        "   - Seção de Destaque / Engenharia: Duas colunas com imagem e lista de diferenciais com ícones SVG modernos.\n"
-        "   - Footer: Links organizados por categorias, newsletter e copyright.\n"
-        "3. CORES, CONTRASTE & TOKENS:\n"
-        "   - Fundo escuro premium (bg-[#09090b] ou bg-[var(--color-bg)]), superfícies em bg-[#121215] ou bg-[var(--color-surface)], bordas sutis border-white/10 ou border-[var(--color-border)].\n"
-        "   - Tipografia limpa com Inter/sans-serif e contrastes nítidos. Cores de texto text-white para títulos e text-slate-300 para corpo.\n"
-        "4. IDENTIFICADORES DATA-MB-ID:\n"
-        "   - Todo container, card, botão, imagem e título DEVE ter data-mb-id='...' único (ex: data-mb-id='hero-title', data-mb-id='card-civic-type-r') para inspeção no canvas.\n"
-        "5. INTERATIVIDADE MOCKBIRD (OBRIGATÓRIO PARA PROTÓTIPOS FUNCIONAIS):\n"
-        "   - Todo link, botão de ação ou item de menu de navegação entre telas DEVE ter data-go='<NomeDaTela>' ou href='#/<nome>'.\n"
+        "Você é o Diretor de Arte e Engenheiro Frontend Principal do Mockbird v2. "
+        "Seu objetivo é criar interfaces web autênticas, criativas e sob medida para cada pedido, "
+        "evitando layouts genéricos ou repetitivos.\n\n"
+        "DIRETRIZES DE CRIATIVIDADE E ARQUITETURA DE UI:\n"
+        "1. IDENTIDADE VISUAL SOB MEDIDA (ANTI-TEMPLATE):\n"
+        "   - NUNCA repita sempre a mesma estrutura (Navbar + Hero centralizado + Grid de 3 cards + Footer) ou a mesma cor (#09090b).\n"
+        "   - Escolha a paleta de cores (tema claro solar, creme editorial, dark slate, indigo tech, esmeralda fintech, brutalista alto contraste, etc.), tipografia, bordas e geometria de acordo com o nicho e a personalidade do pedido do usuário.\n"
+        "   - Adapte a arquitetura ao tipo de produto:\n"
+        "     * Aplicações / SaaS / Dashboards / CRM / Kanban / Chat: use layouts de app (sidebar fixa ou retrátil, topbar de comando, split-pane, tabelas densas, colunas de kanban, cards analíticos).\n"
+        "     * Fluxos de Autenticação / Checkout / Formulários: use split-screen 50/50, card focado ou wizard multi-etapas.\n"
+        "     * Landing Pages / E-commerce / Portfólios: varie a composição (hero assimétrico, bento grid, vitrine editorial, revista digital, layout em camadas).\n"
+        "2. CONTEÚDO E MÍDIA AUTÊNTICOS:\n"
+        "   - NUNCA use Lorem ipsum, caixas cinzas vazias ou 'placeholder.com'.\n"
+        "   - Quando a interface pedir imagens ou avatares, use tags <img> com URLs reais do Unsplash contextualizadas ao domínio solicitado (?auto=format&fit=crop&w=1200&q=80) ou ícones SVG inline bem desenhados.\n"
+        "3. IDENTIFICADORES DATA-MB-ID:\n"
+        "   - Todo container, card, botão, imagem e título DEVE ter data-mb-id='...' único e semântico para inspeção no canvas.\n"
+        "4. INTERATIVIDADE MOCKBIRD (PARA PROTÓTIPOS FUNCIONAIS):\n"
+        "   - Links, botões de ação ou itens de menu de navegação entre telas DEVEM ter data-go='<NomeDaTela>' ou href='#/<nome>'.\n"
         "   - Modais e gavetas laterais devem possuir id único e o botão de gatilho deve conter data-overlay='#<id>'. Botões de fechar devem conter data-close.\n"
-        "   - Dados dinâmicos simulados (nomes, valores numéricos, listas) devem conter data-mock='<chave>' ou data-mock-list='<chave>'.\n"
-        "6. SAÍDA DIRETA:\n"
-        "   - Raciocine de forma ágil e concisa, e emita diretamente o código HTML completo dentro do bloco ```html ... ```."
+        "   - Dados dinâmicos simulados devem conter data-mock='<chave>' ou data-mock-list='<chave>'.\n"
+        "5. SAÍDA DIRETA:\n"
+        "   - Raciocine de forma concisa e emita o código HTML completo estilizado com Tailwind CSS dentro do bloco ```html ... ```."
     )
     if project_context:
         prompt += f"\n{project_context}\n"
@@ -1445,11 +1659,12 @@ async def ai_agent_graph_stream(
     db: AsyncSession = Depends(get_db),
 ):
     """Executa o Grafo de Estados (LangGraph) do Agente Autônomo do Mockbird v2 e streama eventos em tempo real."""
-    # 1. Resolução Segura de Tela (carrega o HTML oficial diretamente do banco se screen_id informado)
-    active_html = payload.current_html or ""
+    # 1. Resolução Segura de Tela (prioriza o HTML ativo que o usuário está vendo no canvas)
+    active_html = (payload.current_html or "").strip()
     if payload.screen_id:
         screen = await authorize_screen(payload.screen_id, current_user, "edit", db)
-        active_html = screen.html_content
+        if not active_html:
+            active_html = screen.html_content or ""
 
     if payload.project_id:
         proj_res = await db.execute(
@@ -1498,6 +1713,8 @@ async def ai_agent_graph_stream(
         prompt=payload.prompt,
         current_html=active_html,
         target_element=target_info,
+        image_url=payload.image_url,
+        messages=payload.messages or [],
         model_name=selected_model,
         project_id=payload.project_id,
         screen_id=payload.screen_id,
@@ -1526,6 +1743,9 @@ async def ai_agent_graph_stream(
                 elif ev.get("type") == "validation_result":
                     validation_meta = {k: v for k, v in ev.items() if k != "type"}
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+
+            if payload.project_id and done_ev and done_ev.get("patch") and done_ev.get("patch_type") != "element":
+                yield f"data: {json.dumps({'type': 'tokens_updated', 'project_id': payload.project_id}, ensure_ascii=False)}\n\n"
         except Exception as e:
             error_msg = str(e)
             logger.exception("AI agent: falha no grafo")
@@ -1572,6 +1792,59 @@ async def ai_agent_graph_stream(
                         )
                         session.add(user_msg)
                         session.add(bot_msg)
+
+                # Sincronização automática de Design Tokens pós-geração
+                if (
+                    payload.project_id
+                    and done_ev
+                    and done_ev.get("patch")
+                    and done_ev.get("patch_type") != "element"
+                ):
+                    try:
+                        from app.models import DesignTokens
+                        patch_html = done_ev.get("patch", "")
+                        hex_colors = re.findall(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b", patch_html)
+                        accent_colors = [
+                            h.lower()
+                            for h in hex_colors
+                            if h.lower() not in [
+                                "#fff", "#ffffff", "#000", "#000000", "#09090b",
+                                "#0f172a", "#1e293b", "#334155", "#18181b", "#27272a"
+                            ]
+                        ]
+                        is_dark = bool(
+                            "dark" in patch_html
+                            or "bg-[#0" in patch_html.lower()
+                            or "bg-[#1" in patch_html.lower()
+                            or "bg-slate-950" in patch_html
+                            or "bg-black" in patch_html
+                        )
+                        primary = accent_colors[0] if accent_colors else ("#e11d48" if "honda" in patch_html.lower() else "#2563eb")
+                        tok_stmt = select(DesignTokens).where(DesignTokens.project_id == payload.project_id)
+                        tok_row = (await session.execute(tok_stmt)).scalars().first()
+                        if not tok_row:
+                            tok_row = DesignTokens(project_id=payload.project_id)
+                            session.add(tok_row)
+                        if is_dark:
+                            tok_row.dark_tokens = {
+                                **(tok_row.dark_tokens or {}),
+                                "color-primary": primary,
+                                "color-bg": "#09090b",
+                                "color-surface": "#18181b",
+                                "color-text": "#f4f4f5",
+                                "color-border": "#27272a",
+                            }
+                        else:
+                            tok_row.light_tokens = {
+                                **(tok_row.light_tokens or {}),
+                                "color-primary": primary,
+                                "color-bg": "#ffffff",
+                                "color-surface": "#f8fafc",
+                                "color-text": "#09090b",
+                                "color-border": "#e4e4e7",
+                            }
+                    except Exception as e:
+                        logger.warning("Falha ao sincronizar tokens de design: %s", e)
 
                 # Registro de Telemetria e Diagnóstico da IA
                 duration_ms = int((utcnow() - start_time).total_seconds() * 1000)

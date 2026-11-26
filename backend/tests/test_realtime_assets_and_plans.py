@@ -79,7 +79,12 @@ async def test_assets_upload_validation_and_public_serving():
         async with httpx.AsyncClient(base_url=BASE_URL, timeout=20.0) as anon:
             assert (await anon.get(unsigned_url)).status_code == 404
 
-        await owner.post(f"/api/projects/{project['id']}/publish", headers=headers)
+        # Um share link aberto (anyone, sem senha) libera o asset; a publicação
+        # permanente (`/publish`) foi descontinuada e responde 410.
+        gone = await owner.post(f"/api/projects/{project['id']}/publish", headers=headers)
+        assert gone.status_code == 410
+        link = await owner.post(f"/api/projects/{project['id']}/share-links", json={}, headers=headers)
+        assert link.status_code == 200, link.text
         async with httpx.AsyncClient(base_url=BASE_URL, timeout=20.0) as anon:
             res = await anon.get(asset["url"])
             assert res.status_code == 200

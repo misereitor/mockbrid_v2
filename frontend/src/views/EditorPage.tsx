@@ -9,8 +9,9 @@ import {
   Smartphone, 
   Plus, 
   Save, 
-  MonitorPlay, 
-  Database, 
+  MonitorPlay,
+  Link2,
+  Database,
   Check, 
   ChevronRight,
   Layers,
@@ -42,8 +43,8 @@ import { DevToolsDock } from '../components/DevToolsDock';
 import { InspectorPanel } from '../components/InspectorPanel';
 import { HistoryPanel } from '../components/HistoryPanel';
 import { MediaLibraryPanel } from '../components/MediaLibraryPanel';
-import { ensurePublished } from '../lib/presentation';
 import { useProjectSocket } from '../lib/realtime';
+import { SharePanel } from '../components/SharePanel';
 import { imageHtml, uploadProjectAsset } from '../lib/assets';
 import { resolveScreenIndex } from '../lib/mockNav';
 import { useUndoHistory } from '../lib/useUndoHistory';
@@ -75,7 +76,7 @@ interface ProjectData {
 
 interface EditorPageProps {
   project: ProjectData;
-  onOpenPresentation: (slug: string) => void;
+  onOpenPresentation: (projectId: string) => void;
   onNotify?: (msg: string) => void;
   onNewProject?: () => void;
   onRenameProject?: (projectId: string, newName: string) => Promise<void> | void;
@@ -111,6 +112,7 @@ export const EditorPage: React.FC<EditorPageProps> = ({
 }) => {
   const [screens, setScreens] = useState<ScreenData[]>(project.screens || []);
   const [projectName, setProjectName] = useState(project.name);
+  const [sharePanelOpen, setSharePanelOpen] = useState(false);
   const [isEditingName, setIsEditingName] = useState(false);
   const [nameInput, setNameInput] = useState(project.name);
   const [savingName, setSavingName] = useState(false);
@@ -722,17 +724,18 @@ export const EditorPage: React.FC<EditorPageProps> = ({
             <Download size={14} /> {exportingBundle ? `Exportando ${exportingBundle}` : 'Figma/Penpot'}
           </button>
           <button
-            onClick={async () => {
-              try {
-                onOpenPresentation(await ensurePublished(project.id));
-              } catch {
-                /* falha de publicação: mantém o usuário no editor */
-              }
-            }}
+            onClick={() => onOpenPresentation(project.id)}
             className="mb-btn-outline"
-            title="Apresentar em tela cheia"
+            title="Pré-visualizar em tela cheia (só para você; não compartilha nada)"
           >
             <MonitorPlay size={14} /> Apresentar
+          </button>
+          <button
+            onClick={() => setSharePanelOpen(true)}
+            className="mb-btn-outline"
+            title="Criar links de apresentação com senha, validade e nível de acesso"
+          >
+            <Link2 size={14} /> Compartilhar
           </button>
           <button
             onClick={handleSaveScreen}
@@ -852,6 +855,28 @@ export const EditorPage: React.FC<EditorPageProps> = ({
                   canvasEditorRef.current?.patchElement?.(patch, target);
                 }}
                 initialPrompt={aiPromptInstruction}
+                onCreateScreen={async (name, html) => {
+                  const slug = name.toLowerCase().replace(/\s+/g, '-').replace(/[^\w-]/g, '');
+                  try {
+                    const res = await fetch(`/api/projects/${project.id}/screens`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        name,
+                        slug: slug || `screen-${Date.now()}`,
+                        html_content: html,
+                      }),
+                    });
+                    if (res.ok) {
+                      const created = await res.json();
+                      setScreens((prev) => [...prev, { ...created, is_main: created.is_entry }]);
+                      setCurrentScreenIndex(screens.length);
+                      onNotify?.(`Tela conectada "${name}" criada com sucesso!`);
+                    }
+                  } catch (e) {
+                    console.error('Erro ao criar tela conectada:', e);
+                  }
+                }}
                 onClose={() => setActiveTab(null)}
               />
             </div>
@@ -1042,6 +1067,14 @@ export const EditorPage: React.FC<EditorPageProps> = ({
           </div>
         </div>
       </div>
+
+      {sharePanelOpen && (
+        <SharePanel
+          projectId={project.id}
+          projectName={projectName}
+          onClose={() => setSharePanelOpen(false)}
+        />
+      )}
     </div>
   );
 };

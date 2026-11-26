@@ -5,7 +5,7 @@ import { DashboardPage, ProjectSummary } from './views/DashboardPage';
 import { EditorPage } from './views/EditorPage';
 import { TeamPage } from './views/TeamPage';
 import { SettingsPage } from './views/SettingsPage';
-import { PresentationPage } from './views/PresentationPage';
+import { PresentationPage, type PresentationSource } from './views/PresentationPage';
 import { ResetPasswordPage } from './views/ResetPasswordPage';
 import { VerifyEmailPage } from './views/VerifyEmailPage';
 import { AcceptInvitePage } from './views/AcceptInvitePage';
@@ -14,16 +14,52 @@ import { stripBasePath, withBasePath } from './lib/basePath';
 
 type ViewMode = 'dashboard' | 'editor' | 'team' | 'settings' | 'presentation';
 
+function getInitialRouteState(): {
+  view: ViewMode;
+  source: PresentationSource | null;
+  projectId: string | null;
+} {
+  if (typeof window === 'undefined') {
+    return { view: 'dashboard', source: null, projectId: null };
+  }
+  const path = stripBasePath(window.location.pathname);
+  if (path.startsWith('/p/')) {
+    const slug = path.replace('/p/', '').split('/')[0];
+    if (slug) {
+      return { view: 'presentation', source: { kind: 'public', slug }, projectId: null };
+    }
+  }
+  if (path.startsWith('/preview/')) {
+    const projectId = path.replace('/preview/', '').split('/')[0];
+    if (projectId) {
+      return { view: 'presentation', source: { kind: 'private', projectId }, projectId };
+    }
+  }
+  if (path.startsWith('/editor/') || path.startsWith('/project/')) {
+    const parts = path.split('/').filter(Boolean);
+    const projId = parts[1] || null;
+    return { view: 'editor', source: null, projectId: projId };
+  }
+  if (path === '/team' || path === '/equipe') {
+    return { view: 'team', source: null, projectId: null };
+  }
+  if (path === '/settings' || path === '/configuracoes' || path === '/mcp') {
+    return { view: 'settings', source: null, projectId: null };
+  }
+  return { view: 'dashboard', source: null, projectId: null };
+}
+
 export function App() {
   const [currentUser, setCurrentUser] = useState<any>(null);
   const [loadingAuth, setLoadingAuth] = useState(true);
-  const [currentView, setCurrentView] = useState<ViewMode>('dashboard');
+  const [initialRoute] = useState(getInitialRouteState);
+  const [currentView, setCurrentView] = useState<ViewMode>(initialRoute.view);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
-  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(initialRoute.projectId);
   const [directProject, setDirectProject] = useState<any>(null);
-  const [presentationSlug, setPresentationSlug] = useState<string | null>(null);
+  const [presentationSource, setPresentationSource] = useState<PresentationSource | null>(initialRoute.source);
   const [memberCount, setMemberCount] = useState(1);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(initialRoute.view === 'editor');
   const [emailStatus, setEmailStatus] = useState<any>(null);
   const [resending, setResending] = useState(false);
   const [resendMsg, setResendMsg] = useState<string | null>(null);
@@ -33,11 +69,21 @@ export function App() {
   const parseRouteFromUrl = useCallback(() => {
     const path = stripBasePath(window.location.pathname);
 
-    // Rota pública de apresentação: /p/:slug
+    // Link de compartilhamento: /p/:slug (token do share link)
     if (path.startsWith('/p/')) {
       const slug = path.replace('/p/', '').split('/')[0];
       if (slug) {
-        setPresentationSlug(slug);
+        setPresentationSource({ kind: 'public', slug });
+        setCurrentView('presentation');
+        return;
+      }
+    }
+
+    // Pré-visualização privada: /preview/:projectId (botão "Apresentar")
+    if (path.startsWith('/preview/')) {
+      const projectId = path.replace('/preview/', '').split('/')[0];
+      if (projectId) {
+        setPresentationSource({ kind: 'private', projectId });
         setCurrentView('presentation');
         return;
       }
@@ -298,11 +344,11 @@ export function App() {
     projects.find(p => p.id === activeProjectId) || 
     (directProject?.id === activeProjectId ? directProject : null);
 
-  // Rota pública de apresentação (/p/:slug)
-  if (currentView === 'presentation' && presentationSlug) {
+  // Apresentação: link de compartilhamento (/p/:slug) ou pré-visualização (/preview/:id)
+  if (currentView === 'presentation' && presentationSource) {
     return (
       <PresentationPage
-        slug={presentationSlug}
+        source={presentationSource}
         onBackToApp={currentUser ? () => {
           if (activeProjectId) {
             navigateTo('/editor');
@@ -310,6 +356,20 @@ export function App() {
             navigateTo('/dashboard');
           }
         } : undefined}
+        onLoginRequired={() => {
+          // Guarda o destino para voltar depois do login. Lê a URL atual, que ainda é
+          // o link de apresentação neste ponto; não usa o estado do closure, que pode
+          // estar desatualizado.
+          const current = stripBasePath(window.location.pathname);
+          try {
+            if (/^\/(p|preview)\//.test(current)) {
+              sessionStorage.setItem('mockbird_return_to', current);
+            }
+          } catch {
+            /* modo privado: segue sem retorno */
+          }
+          navigateTo('/login', true);
+        }}
       />
     );
   }
@@ -340,6 +400,18 @@ export function App() {
           setCurrentUser(user);
           loadProjects();
           loadMembersCount();
+          // Volta ao link de apresentação que exigiu login, se houver.
+          let returnTo: string | null = null;
+          try {
+            returnTo = sessionStorage.getItem('mockbird_return_to');
+            sessionStorage.removeItem('mockbird_return_to');
+          } catch {
+            returnTo = null;
+          }
+          if (returnTo && /^\/(p|preview)\//.test(stripBasePath(returnTo))) {
+            navigateTo(stripBasePath(returnTo), true);
+            return;
+          }
           parseRouteFromUrl();
         }}
       />
@@ -407,10 +479,11 @@ export function App() {
             <EditorPage
               key={activeProject.id}
               project={activeProject as any}
-              onOpenPresentation={(slug) => {
-                setPresentationSlug(slug);
-                navigateTo(`/p/${slug}`);
+              onOpenPresentation={(projectId) => {
+                // Pré-visualização privada: não publica nada.
+                navigateTo(`/preview/${projectId}`);
               }}
+
               onNewProject={() => setShowNewProjectModal(true)}
               onRenameProject={handleRenameProject}
             />

@@ -66,6 +66,15 @@ class ProjectUpdate(BaseModel):
     design_dials: Optional[Dict[str, Any]] = None
 
 
+class ProjectPreviewScreenOut(BaseModel):
+    id: str
+    name: str
+    html_content: str = ""
+    css_content: str = ""
+    width: int = 1440
+    height: int = 900
+
+
 class ProjectOut(BaseModel):
     id: str
     workspace_id: str
@@ -78,6 +87,9 @@ class ProjectOut(BaseModel):
     entry_screen_id: Optional[str]
     is_archived: bool
     is_published: bool = False
+    screens_count: int = 0
+    preview_screen: Optional[ProjectPreviewScreenOut] = None
+    preview_tokens: Optional[Dict[str, Any]] = None
     created_at: datetime
     updated_at: datetime
 
@@ -118,6 +130,22 @@ class ShareLinkCreate(BaseModel):
     expires_in_days: Optional[int] = Field(default=90, ge=0, le=3650)
     password: Optional[str] = Field(default="", max_length=128)
     allow_comments: bool = False
+    access_mode: Literal["anyone", "org"] = "anyone"
+    label: Optional[str] = Field(default=None, max_length=120)
+
+
+class ShareLinkUpdate(BaseModel):
+    """Atualização parcial: só os campos enviados mudam.
+
+    - `password`: string vazia remove a senha; ausente mantém a atual.
+    - `expires_in_days`: 0 torna o link sem validade; ausente mantém a atual.
+    """
+
+    access_mode: Optional[Literal["anyone", "org"]] = None
+    allow_comments: Optional[bool] = None
+    label: Optional[str] = Field(default=None, max_length=120)
+    password: Optional[str] = Field(default=None, max_length=128)
+    expires_in_days: Optional[int] = Field(default=None, ge=0, le=3650)
 
 
 class ShareLinkOut(BaseModel):
@@ -125,6 +153,8 @@ class ShareLinkOut(BaseModel):
     project_id: str
     slug: str
     allow_comments: bool
+    access_mode: str = "anyone"
+    label: Optional[str] = None
     expires_at: Optional[datetime]
     view_count: int
     has_password: bool = False

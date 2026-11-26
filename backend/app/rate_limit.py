@@ -11,6 +11,8 @@ from typing import Deque, Dict, Tuple
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from app.config import settings
+
 # (método, caminho) -> (limite, janela em segundos)
 # Limites por IP (janela de 60s). Registro é mais permissivo porque uma
 # organização atrás de NAT compartilha o mesmo IP.
@@ -30,6 +32,9 @@ AI_LIMIT = 30
 MCP_PREFIX = "/mcp"
 MCP_LIMIT = 120
 PUBLIC_COMMENT_LIMIT = 20
+PUBLIC_PREFIX = "/api/public/p/"
+PUBLIC_GET_LIMIT = 60       # abrir/enumerar links públicos, por IP
+PUBLIC_PASSWORD_LIMIT = 10  # tentativas de senha de share link, por IP
 
 MAX_TRACKED_KEYS = 20_000
 
@@ -43,20 +48,32 @@ class RateLimitMiddleware:
         client = scope.get("client")
         return client[0] if client else "unknown"
 
-    def _rule_for(self, method: str, path: str) -> Tuple[int, int]:
+    def _rule_for(
+        self, method: str, path: str, has_share_password: bool = False
+    ) -> Tuple[int, int, str]:
+        """Devolve (limite, janela, balde). O contador é por IP + balde.
+
+        Para os endpoints de link público o balde é único (`/api/public/p/*`), e não
+        o caminho: senão cada slug teria o seu contador e varrer slugs diferentes
+        não seria limitado.
+        """
         if method == "POST" and (method, path) in RULES:
-            return RULES[(method, path)]
+            limit, window = RULES[(method, path)]
+            return (limit, window, path)
         if path.startswith(AI_PREFIX) and method == "POST":
-            return (AI_LIMIT, 60)
+            return (AI_LIMIT, 60, path)
         if path.startswith(MCP_PREFIX):
-            return (MCP_LIMIT, 60)
-        if (
-            method == "POST"
-            and path.startswith("/api/public/p/")
-            and path.endswith("/comments")
-        ):
-            return (PUBLIC_COMMENT_LIMIT, 60)
-        return (0, 0)
+            return (MCP_LIMIT, 60, path)
+        if path.startswith(PUBLIC_PREFIX):
+            if method == "POST" and path.endswith("/comments"):
+                return (PUBLIC_COMMENT_LIMIT, 60, path)
+            # Atrás de flag: só vale se a aplicação enxerga o IP real do visitante
+            # (ver FORWARDED_ALLOW_IPS). Senão todos dividiriam o mesmo balde.
+            if method == "GET" and settings.PUBLIC_RATE_LIMIT_ENABLED:
+                if has_share_password:
+                    return (PUBLIC_PASSWORD_LIMIT, 60, PUBLIC_PREFIX + "*#password")
+                return (PUBLIC_GET_LIMIT, 60, PUBLIC_PREFIX + "*")
+        return (0, 0, path)
 
     def _prune(self, now: float) -> None:
         if len(self._hits) <= MAX_TRACKED_KEYS:
@@ -72,7 +89,10 @@ class RateLimitMiddleware:
 
         method = scope.get("method", "GET")
         path = scope.get("path", "")
-        limit, window = self._rule_for(method, path)
+        has_share_password = any(
+            name == b"x-share-password" for name, _ in scope.get("headers", [])
+        )
+        limit, window, bucket = self._rule_for(method, path, has_share_password)
 
         if not limit:
             await self.app(scope, receive, send)
@@ -80,7 +100,7 @@ class RateLimitMiddleware:
 
         now = time.monotonic()
         self._prune(now)
-        key = f"{self._client_key(scope)}:{method}:{path}"
+        key = f"{self._client_key(scope)}:{method}:{bucket}"
         hits = self._hits[key]
         while hits and now - hits[0] > window:
             hits.popleft()

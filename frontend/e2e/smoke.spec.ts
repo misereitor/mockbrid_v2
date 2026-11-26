@@ -96,3 +96,87 @@ test('link de apresentação abre e aceita comentário de visitante', async ({ p
   await expect(guest.getByText('Ajustar o espaçamento do header.')).toBeVisible();
   await expect(guest.getByText('Visitante CEO')).toBeVisible();
 });
+
+test('Apresentar é só pré-visualização: não cria nenhum link público', async ({ page, context }) => {
+  await register(context.request, 'preview');
+  await page.goto('/');
+  const project = await createProject(page, 'Projeto Preview');
+
+  const before = await context.request.get(`/api/projects/${project.id}/share-links`);
+  expect((await before.json()).length).toBe(0);
+
+  await page.goto(`/editor/${project.id}`);
+  // Mesma aba, como antes: a pré-visualização troca a rota, não publica nada.
+  await page.getByRole('button', { name: /Apresentar/ }).click();
+  await expect(page).toHaveURL(new RegExp(`/preview/${project.id}$`));
+  await expect(page.getByText('Modo Apresentação')).toBeVisible();
+
+  // Nenhum link foi criado e o slug do projeto não abre a apresentação pública.
+  const after = await context.request.get(`/api/projects/${project.id}/share-links`);
+  expect((await after.json()).length).toBe(0);
+  const slugAttempt = await context.request.get(`/api/public/p/${project.slug}`);
+  expect(slugAttempt.status()).toBe(404);
+});
+
+test('painel Compartilhar cria link, altera permissão e revoga', async ({ page, context }) => {
+  await register(context.request, 'sharepanel');
+  await page.goto('/');
+  const project = await createProject(page, 'Projeto Painel');
+
+  await page.goto(`/editor/${project.id}`);
+  await page.getByRole('button', { name: /Compartilhar/ }).click();
+  await expect(page.getByText('Este projeto não está compartilhado')).toBeVisible();
+
+  await page.getByRole('button', { name: /Criar e copiar link/ }).click();
+  await expect(page.getByText('Qualquer pessoa com o link').first()).toBeVisible();
+
+  const listed = await (await context.request.get(`/api/projects/${project.id}/share-links`)).json();
+  expect(listed.length).toBe(1);
+  const link = listed[0];
+
+  // Muda de "qualquer pessoa" para "só organização" sem trocar a URL.
+  await page.getByRole('combobox', { name: 'Quem pode abrir' }).selectOption('org');
+  await expect(page.getByText('Só membros da organização').first()).toBeVisible();
+
+  // Visitante sem login é levado ao login e o link fica guardado para voltar depois.
+  const guest = await context.browser()!.newContext();
+  const guestPage = await guest.newPage();
+  await guestPage.goto(`/p/${link.slug}`);
+  await expect(guestPage).toHaveURL(/\/login$/);
+  await expect(guestPage.getByText('Bem-vindo de volta')).toBeVisible();
+  expect(await guestPage.evaluate(() => sessionStorage.getItem('mockbird_return_to'))).toBe(`/p/${link.slug}`);
+  await guest.close();
+
+  // Revoga: o link deixa de existir.
+  page.once('dialog', (d) => d.accept());
+  await page.getByRole('button', { name: 'Revogar link' }).click();
+  await expect(page.getByText('Este projeto não está compartilhado')).toBeVisible();
+  const gone = await context.request.get(`/api/public/p/${link.slug}`);
+  expect(gone.status()).toBe(404);
+});
+
+test('link com senha pede senha no navegador e aceita a correta', async ({ page, context }) => {
+  await register(context.request, 'pwdlink');
+  await page.goto('/');
+  const project = await createProject(page, 'Projeto Senha');
+
+  const linkRes = await context.request.post(`/api/projects/${project.id}/share-links`, {
+    data: { password: 'segredo123', allow_comments: false },
+    headers: await csrf(page),
+  });
+  const link = await linkRes.json();
+
+  const guest = await context.browser()!.newContext();
+  const guestPage = await guest.newPage();
+  await guestPage.goto(`/p/${link.slug}`);
+  await expect(guestPage.getByText('Apresentação protegida')).toBeVisible();
+
+  await guestPage.getByPlaceholder('Senha de acesso').fill('errada');
+  await guestPage.getByRole('button', { name: 'Abrir apresentação' }).click();
+  await expect(guestPage.getByText('Senha incorreta.')).toBeVisible();
+
+  await guestPage.getByPlaceholder('Senha de acesso').fill('segredo123');
+  await guestPage.getByRole('button', { name: 'Abrir apresentação' }).click();
+  await expect(guestPage.getByText('Modo Apresentação')).toBeVisible();
+  await guest.close();
+});

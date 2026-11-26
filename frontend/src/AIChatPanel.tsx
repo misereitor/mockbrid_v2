@@ -11,14 +11,16 @@ import {
   History, 
   MessageSquare, 
   CheckCircle2, 
-  Workflow, 
   ShieldCheck, 
   Wrench, 
-  Zap, 
   ListTodo,
   RotateCcw,
   Undo2,
-  Redo2
+  Redo2,
+  LayoutGrid,
+  Wand2,
+  Layers,
+  ArrowUpRight
 } from 'lucide-react';
 import { SelectedElementInfo } from './CanvasEditor';
 import {
@@ -68,6 +70,8 @@ interface AIChatPanelProps {
   projectId?: string;
   screenId?: string;
   onCaptureScreenshot?: () => Promise<string>;
+  onCreateScreen?: (name: string, html: string) => Promise<void>;
+  onTokensUpdated?: () => void;
 }
 
 export function AIChatPanel({ 
@@ -78,7 +82,9 @@ export function AIChatPanel({
   onClearSelectedElement,
   initialPrompt, 
   projectId = 'default',
-  screenId
+  screenId,
+  onCreateScreen,
+  onTokensUpdated,
 }: AIChatPanelProps) {
   const storageKey = `mockbird_chat_sessions_${projectId}`;
   // Hidrata direto do localStorage no primeiro render: se um efeito fizesse
@@ -87,6 +93,7 @@ export function AIChatPanel({
   const [sessions, setSessions] = useState<ChatSession[]>(() => readStoredSessions(storageKey) || [createDefaultSession()]);
   const [currentSessionId, setCurrentSessionId] = useState<string>(() => sessions[0]?.id || 'sess_default');
   const [prompt, setPrompt] = useState(initialPrompt || '');
+  const [attachedImage, setAttachedImage] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   // A conversa é sempre automática: o agente decide internamente se deve
   // explicar, inspecionar, editar ou gerar código.
@@ -283,6 +290,8 @@ export function AIChatPanel({
     }));
 
     setPrompt('');
+    const imageToSend = attachedImage;
+    setAttachedImage(null);
     setLoading(true);
     setStreamingContent('');
     setStreamingThought('');
@@ -291,6 +300,12 @@ export function AIChatPanel({
     setActiveTool(null);
     setAgentAudit(null);
     setErrorMessage(null);
+
+    // Compacta o histórico conversacional da sessão atual (últimos 10 turnos)
+    const historyToSend = currentMessages.slice(-10).map(m => ({
+      role: m.role,
+      content: m.content || (m.patch ? 'Interface construída e aplicada no Canvas.' : '')
+    }));
 
     // FLUXO 1: AGENTE AUTÔNOMO
     if (executionMode === 'agent') {
@@ -301,8 +316,10 @@ export function AIChatPanel({
           body: JSON.stringify({
             prompt: cleanPrompt,
             current_html: currentHtml,
+            messages: historyToSend,
             project_id: projectId,
             screen_id: screenId,
+            image_url: imageToSend || undefined,
             target_element: selectedElement ? {
               mbId: selectedElement.mbId,
               tag: selectedElement.tag,
@@ -392,6 +409,12 @@ export function AIChatPanel({
                 finalReasoning = ev.reasoning || '';
                 if (ev.audit) collectedAudit = ev.audit;
                 if (ev.plan) collectedPlan = ev.plan;
+              } else if (ev.type === 'create_screen') {
+                if (ev.name && ev.html && onCreateScreen) {
+                  onCreateScreen(ev.name, ev.html);
+                }
+              } else if (ev.type === 'tokens_updated') {
+                if (onTokensUpdated) onTokensUpdated();
               } else if (ev.type === 'error') {
                 setErrorMessage(ev.detail || 'Ocorreu um erro no grafo do agente.');
               }
@@ -408,10 +431,17 @@ export function AIChatPanel({
         }
         const nowTime = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
 
+        const isPlaceholder = !currentHtml || currentHtml.includes('Bem-vindo ao Mockbird v2') || currentHtml.includes('data-mb-id="root-hero"');
+        const hasValidTarget = Boolean(finalTargetMbId || finalTargetSelector || selectedElement);
+
+        if (finalPatchType === 'element' && (!hasValidTarget || isPlaceholder)) {
+          finalPatchType = 'full';
+        }
+
         // Auto-aplicação imediata no Canvas quando o Agente produz um patch de código válido
         if (hasValidPatch) {
           try {
-            if (finalPatchType === 'element' && onApplyElementPatch) {
+            if (finalPatchType === 'element' && hasValidTarget && !isPlaceholder && onApplyElementPatch) {
               onApplyElementPatch(effectivePatch, {
                 mbId: finalTargetMbId,
                 selector: finalTargetSelector
@@ -481,6 +511,7 @@ export function AIChatPanel({
         body: JSON.stringify({
           prompt: cleanPrompt,
           current_html: currentHtml,
+          messages: historyToSend,
           project_id: projectId,
           screen_id: screenId,
           target_element: selectedElement ? {
@@ -616,8 +647,10 @@ export function AIChatPanel({
     if (!patchHtml) return;
     const clean = cleanAndExtractHtml(patchHtml);
     const snapshotBefore = currentHtml;
+    const isPlaceholder = !currentHtml || currentHtml.includes('Bem-vindo ao Mockbird v2') || currentHtml.includes('data-mb-id="root-hero"');
+    const hasTarget = Boolean(target?.mbId || target?.selector || selectedElement);
 
-    if (onApplyElementPatch) {
+    if (hasTarget && !isPlaceholder && onApplyElementPatch) {
       onApplyElementPatch(clean, target);
     } else {
       onApplyHtml(clean);
@@ -678,7 +711,10 @@ export function AIChatPanel({
     const msg = currentMessages.find(m => m.id === msgId);
     if (!msg || !msg.patch) return;
 
-    if (msg.patchType === 'element' && onApplyElementPatch) {
+    const isPlaceholder = !currentHtml || currentHtml.includes('Bem-vindo ao Mockbird v2') || currentHtml.includes('data-mb-id="root-hero"');
+    const hasTarget = Boolean(msg.targetSelector || msg.targetMbId || selectedElement);
+
+    if (msg.patchType === 'element' && hasTarget && !isPlaceholder && onApplyElementPatch) {
       onApplyElementPatch(msg.patch, { selector: msg.targetSelector, mbId: msg.targetMbId });
     } else {
       onApplyHtml(msg.patch);
@@ -746,7 +782,6 @@ export function AIChatPanel({
   };
 
   const estimatedContextTokens = Math.ceil((currentHtml.length + prompt.length) / 4);
-  const responseLimit = 8192;
   const usagePercent = usageInfo?.monthly_token_limit
     ? Math.min(100, Math.round((usageInfo.tokens_used_month / usageInfo.monthly_token_limit) * 100))
     : 0;
@@ -754,42 +789,52 @@ export function AIChatPanel({
   const compactNumber = (value?: number) => value == null ? '—' : new Intl.NumberFormat('pt-BR', { notation: 'compact', maximumFractionDigits: 1 }).format(value);
 
   return (
-    <div className="w-full flex flex-col h-full bg-[#0b0c10] text-slate-100 select-none overflow-hidden relative">
-      {/* Header com Seletor de Modelo e Histórico */}
-      <div className="px-4 py-3 border-b border-white/[0.08] flex items-center justify-between gap-3 shrink-0 bg-[#11131b]">
-        <div className="flex items-center gap-2 min-w-0">
-          <div className="relative p-2 rounded-xl bg-[#1a2030] text-cyan-300 shrink-0 border border-cyan-300/15">
-            <Workflow size={17} />
-            <span className="absolute -right-0.5 -bottom-0.5 h-2 w-2 rounded-full bg-emerald-400 ring-2 ring-[#11131d]" />
+    <div className="w-full flex flex-col h-full bg-[#0b0d13] text-slate-100 select-none overflow-hidden relative">
+      {/* Header Compacto e Elegante */}
+      <div className="px-3.5 py-2.5 border-b border-white/[0.06] flex items-center justify-between gap-2.5 shrink-0 bg-[#0f121a]/95 backdrop-blur-md">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className="relative h-8 w-8 rounded-xl bg-gradient-to-br from-cyan-500/20 via-indigo-500/15 to-transparent flex items-center justify-center text-cyan-300 shrink-0 border border-cyan-400/25 shadow-[0_0_16px_-4px_rgba(34,211,238,0.3)]">
+            <Sparkles size={15} />
+            <span
+              className={`absolute -right-0.5 -bottom-0.5 h-2 w-2 rounded-full ring-2 ring-[#0f121a] ${
+                loading ? 'bg-cyan-400 animate-ping' : 'bg-emerald-400'
+              }`}
+            />
           </div>
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">
-              <span className="text-[13px] font-semibold tracking-tight text-white truncate">Agente Autônomo</span>
-              <span className="text-[9px] px-1.5 py-0.5 rounded-md font-medium bg-emerald-400/10 text-emerald-300">online</span>
+              <span className="text-xs font-semibold tracking-tight text-white truncate">
+                Agente Mockbird
+              </span>
+              <span className="text-[9px] px-1.5 py-0.5 rounded-full font-medium bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
+                {loading ? 'ativo' : 'pronto'}
+              </span>
             </div>
-            <p className="text-[10px] text-slate-400 truncate">Analisa, executa e valida alterações no canvas</p>
+            <p className="text-[10px] text-slate-400 truncate" title={currentSession.title}>
+              {currentMessages.length > 0 ? currentSession.title : 'Edição autônoma e cirúrgica no canvas'}
+            </p>
           </div>
         </div>
 
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1 shrink-0">
           <button
             type="button"
             onClick={() => setShowSessionsDrawer(!showSessionsDrawer)}
-              className={`p-2 rounded-lg border transition-all text-xs flex items-center gap-1.5 ${
+            className={`h-7 px-2.5 rounded-lg border transition-all text-[11px] font-medium flex items-center gap-1.5 ${
               showSessionsDrawer
-                ? 'bg-mockbird-blue/20 border-mockbird-blue text-white'
-                : 'bg-mockbird-surface border-mockbird-border text-slate-300 hover:text-white'
+                ? 'bg-cyan-500/15 border-cyan-400/40 text-cyan-200'
+                : 'bg-white/[0.03] border-white/[0.07] text-slate-300 hover:text-white hover:bg-white/[0.06]'
             }`}
             title="Histórico de Conversas"
           >
-            <History size={14} />
-            <span className="text-[11px] hidden sm:inline">{sessions.length}</span>
+            <History size={13} />
+            <span>{sessions.length}</span>
           </button>
 
           <button
             type="button"
             onClick={handleCreateSession}
-              className="p-2 rounded-lg bg-white/[0.03] border border-white/[0.08] hover:bg-white/[0.08] text-slate-300 hover:text-white transition"
+            className="h-7 w-7 rounded-lg bg-white/[0.03] border border-white/[0.07] hover:bg-white/[0.08] text-slate-300 hover:text-white flex items-center justify-center transition"
             title="Nova Conversa"
           >
             <Plus size={14} />
@@ -797,31 +842,16 @@ export function AIChatPanel({
         </div>
       </div>
 
-      {/* O agente escolhe o fluxo automaticamente; não há modo manual. */}
-      <div className="px-4 py-1.5 bg-[#0d0f15] border-b border-white/[0.06] flex items-center justify-end text-xs">
-
-        {/* Modelo Selecionado */}
-        <select
-          value={selectedModel}
-          onChange={(e) => setSelectedModel(e.target.value)}
-          className="bg-transparent border-0 rounded-md px-1.5 py-0.5 text-[10px] text-slate-500 focus:outline-none focus:text-slate-200 cursor-pointer"
-        >
-          {availableModels.map(m => (
-            <option key={m} value={m}>{m}</option>
-          ))}
-        </select>
-      </div>
-
       {/* Gaveta de Histórico de Sessões */}
       {showSessionsDrawer && (
-        <div className="p-2.5 bg-mockbird-bg border-b border-mockbird-border space-y-1.5 max-h-48 overflow-y-auto shrink-0 animate-in slide-in-from-top duration-150">
-          <div className="flex items-center justify-between px-1 text-[11px] text-slate-400 font-semibold">
-            <span>Conversas Salvas</span>
+        <div className="p-2.5 bg-[#0e1118] border-b border-white/[0.07] space-y-1.5 max-h-52 overflow-y-auto shrink-0 animate-in slide-in-from-top duration-150">
+          <div className="flex items-center justify-between px-1.5 pb-1 text-[10px] uppercase tracking-wider text-slate-400 font-semibold">
+            <span>Conversas do Projeto</span>
             <button
               onClick={handleCreateSession}
-              className="text-mockbird-cyan hover:underline flex items-center gap-1 text-[10px]"
+              className="text-cyan-400 hover:text-cyan-300 flex items-center gap-1 text-[10px] normal-case"
             >
-              <Plus size={11} /> Nova
+              <Plus size={11} /> Nova conversa
             </button>
           </div>
           {sessions.map(s => {
@@ -833,21 +863,21 @@ export function AIChatPanel({
                   setCurrentSessionId(s.id);
                   setShowSessionsDrawer(false);
                 }}
-                className={`group flex items-center justify-between p-2 rounded-lg cursor-pointer transition text-xs border ${
+                className={`group flex items-center justify-between px-2.5 py-2 rounded-xl cursor-pointer transition text-xs border ${
                   isCurr
-                    ? 'bg-mockbird-card border-mockbird-blue/50 text-white'
-                    : 'hover:bg-mockbird-card/60 text-slate-300'
+                    ? 'bg-cyan-500/10 border-cyan-400/30 text-white'
+                    : 'border-transparent hover:bg-white/[0.04] text-slate-300'
                 }`}
               >
                 <div className="min-w-0 flex items-center gap-2 truncate">
-                  <MessageSquare size={13} className={isCurr ? 'text-mockbird-cyan' : 'text-slate-500'} />
+                  <MessageSquare size={13} className={isCurr ? 'text-cyan-400' : 'text-slate-500'} />
                   <span className="truncate text-[11px] font-medium">{s.title}</span>
                 </div>
-                <div className="flex items-center gap-1 shrink-0">
-                  <span className="text-[10px] text-slate-500">{s.messages.length} msg</span>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <span className="text-[10px] text-slate-500 font-mono">{s.messages.length}</span>
                   <button
                     onClick={(e) => handleDeleteSession(s.id, e)}
-                    className="p-1 rounded opacity-0 group-hover:opacity-100 hover:text-rose-400 text-slate-500 transition"
+                    className="p-1 rounded-md opacity-0 group-hover:opacity-100 hover:bg-rose-500/10 hover:text-rose-400 text-slate-500 transition"
                     title="Excluir conversa"
                   >
                     <Trash2 size={12} />
@@ -860,36 +890,88 @@ export function AIChatPanel({
       )}
 
       {/* Lista de Mensagens do Chat */}
-      <div className="flex-1 overflow-y-auto p-3.5 space-y-3 text-xs scrollbar-thin scrollbar-thumb-white/10">
+      <div className="flex-1 overflow-y-auto px-3.5 py-4 space-y-3.5 text-xs [scrollbar-width:thin] [scrollbar-color:rgba(255,255,255,0.1)_transparent]">
         {currentMessages.length === 0 && !loading && (
-          <div className="h-full flex flex-col items-center justify-center text-center p-6 text-slate-400 space-y-4">
-          <div className="relative p-3.5 rounded-2xl bg-[#151b2a] text-cyan-300 border border-cyan-300/15">
-              <Workflow size={30} />
-              <Sparkles size={13} className="absolute -right-1 -top-1 text-indigo-300" />
-            </div>
-            <div className="space-y-1">
-              <h4 className="text-sm font-semibold text-white tracking-tight">Como posso melhorar sua tela?</h4>
-              <p className="text-[11px] text-slate-400 max-w-[260px] leading-relaxed">
-                Descreva a mudança em linguagem natural. Eu inspeciono o canvas, faço a alteração e valido o resultado.
+          <div className="min-h-full flex flex-col justify-center py-4 px-1">
+            {/* Hero Card */}
+            <div className="relative rounded-2xl border border-white/[0.07] bg-gradient-to-b from-[#141824] to-[#0e111a] p-5 text-center overflow-hidden shadow-xl">
+              <div
+                className="pointer-events-none absolute -top-16 left-1/2 -translate-x-1/2 h-32 w-56 rounded-full opacity-35 blur-2xl"
+                style={{ background: 'radial-gradient(circle, rgba(34,211,238,0.45), rgba(99,102,241,0.15), transparent)' }}
+              />
+              <div className="relative mx-auto mb-3.5 flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-cyan-400/20 to-indigo-500/20 border border-cyan-300/25 text-cyan-300 shadow-inner">
+                <Sparkles size={20} />
+              </div>
+              <h4 className="text-sm font-semibold text-white tracking-tight">
+                O que vamos construir hoje?
+              </h4>
+              <p className="text-[11px] text-slate-400 mt-1 leading-relaxed max-w-[260px] mx-auto">
+                Peça uma tela completa, clique em um elemento do canvas para edição cirúrgica ou escolha um ponto de partida:
               </p>
-            </div>
 
-            {/* Sugestões rápidas de prompt */}
-            <div className="pt-2 w-full max-w-[260px] space-y-1.5 text-left">
-              <button
-                type="button"
-                onClick={() => setPrompt('Cria uma landing page para concessionária Honda com hero do Civic Type R, grid bento de modelos e simulador de financiamento')}
-                 className="w-full p-2.5 rounded-lg bg-[#11131b] hover:bg-[#181b26] border border-white/[0.08] text-[11px] text-slate-300 transition text-left"
-              >
-                🏎️ Concessionária Honda com Bento Grid
-              </button>
-              <button
-                type="button"
-                onClick={() => setPrompt('O layout tá com alinhamento quebrado no cabeçalho e nos cards. Poderia consertar a estrutura mantendo os elementos?')}
-                 className="w-full p-2.5 rounded-lg bg-[#11131b] hover:bg-[#181b26] border border-white/[0.08] text-[11px] text-slate-300 transition text-left"
-              >
-                🛠️ Consertar alinhamento e layout quebrado
-              </button>
+              {/* Cards de Ações Rápidas */}
+              <div className="mt-4 grid grid-cols-1 gap-2 text-left">
+                {[
+                  {
+                    icon: LayoutGrid,
+                    accent: 'text-cyan-400 bg-cyan-500/10 border-cyan-500/20',
+                    title: 'Landing Page com Bento Grid',
+                    desc: 'Hero de alto impacto, grade de produtos e CTA',
+                    prompt:
+                      'Cria uma landing page moderna com hero impactante, bento grid de recursos, seção de destaques com fotos reais e chamadas de ação claras.',
+                  },
+                  {
+                    icon: Layers,
+                    accent: 'text-indigo-400 bg-indigo-500/10 border-indigo-500/20',
+                    title: 'Dashboard SaaS & Analytics',
+                    desc: 'Sidebar, cards de KPIs, gráficos e tabela limpa',
+                    prompt:
+                      'Cria um dashboard SaaS dark premium com barra lateral, 4 cards de métricas com indicadores de tendência, gráfico principal e tabela de atividades recentes.',
+                  },
+                  {
+                    icon: Wrench,
+                    accent: 'text-amber-400 bg-amber-500/10 border-amber-500/20',
+                    title: 'Consertar Alinhamento & Layout',
+                    desc: 'Corrige espaçamentos, grid e responsividade',
+                    prompt:
+                      'Inspecione a tela atual e corrija problemas de alinhamento, espaçamento entre cards, contraste e hierarquia visual mantendo o conteúdo.',
+                  },
+                  {
+                    icon: Wand2,
+                    accent: 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20',
+                    title: 'Refinar Estética & Interatividade',
+                    desc: 'Melhora tipografia, estados hover e modais',
+                    prompt:
+                      'Eleve o acabamento visual desta tela: melhore tipografia, bordas sutis, estados de hover, contraste e adicione micro-interações elegantes.',
+                  },
+                ].map((item) => {
+                  const Icon = item.icon;
+                  return (
+                    <button
+                      key={item.title}
+                      type="button"
+                      onClick={() => setPrompt(item.prompt)}
+                      className="group/card w-full p-2.5 rounded-xl bg-white/[0.025] hover:bg-white/[0.06] border border-white/[0.06] hover:border-cyan-400/30 transition-all flex items-center gap-3 text-left"
+                    >
+                      <div className={`h-8 w-8 rounded-lg border flex items-center justify-center shrink-0 ${item.accent}`}>
+                        <Icon size={15} />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="text-[11px] font-semibold text-slate-200 group-hover/card:text-white truncate">
+                          {item.title}
+                        </div>
+                        <div className="text-[10px] text-slate-500 truncate">
+                          {item.desc}
+                        </div>
+                      </div>
+                      <ArrowUpRight
+                        size={13}
+                        className="text-slate-600 group-hover/card:text-cyan-400 shrink-0 transition-colors"
+                      />
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           </div>
         )}
@@ -915,19 +997,18 @@ export function AIChatPanel({
           if (isUser) {
             return (
               <div key={msg.id} className="group relative flex justify-end">
-                <div className="bg-mockbird-blue text-white rounded-2xl rounded-tr-sm px-3.5 py-2.5 max-w-[88%] text-xs shadow-md leading-relaxed select-text space-y-1 relative">
-                  <div className="flex items-center justify-between gap-2 text-[10px] text-blue-200">
+                <div className="bg-gradient-to-br from-[#232b4d] to-[#191f38] border border-indigo-400/25 text-slate-100 rounded-2xl rounded-tr-sm px-3.5 py-2.5 max-w-[88%] text-xs shadow-lg leading-relaxed select-text space-y-1.5 relative">
+                  <div className="flex items-center justify-between gap-2 text-[10px] text-indigo-200/80">
                     <div className="flex items-center gap-1.5">
-                      {msg.mode === 'agent' ? <Workflow size={11} /> : <Zap size={11} />}
-                      <span>{msg.mode === 'agent' ? 'Agente' : 'Chat Direto'}</span>
+                      <span className="font-mono text-[9px] text-indigo-300/70">{msg.timestamp}</span>
                       {msg.targetTag && (
-                        <span className="ml-1 px-1.5 py-0.2 bg-black/20 rounded font-mono text-emerald-300">
-                          alvo: &lt;{msg.targetTag}&gt;
+                        <span className="px-1.5 py-0.5 bg-cyan-500/15 border border-cyan-400/25 rounded font-mono text-[9px] text-cyan-300">
+                          &lt;{msg.targetTag}&gt;
                         </span>
                       )}
                     </div>
 
-                    {/* Botão de Rollback / Voltar Mensagem (estilo Antigravity) */}
+                    {/* Botão de Rollback / Voltar Mensagem */}
                     <button
                       type="button"
                       onClick={() => setRewindTarget({
@@ -937,24 +1018,37 @@ export function AIChatPanel({
                         content: msg.content,
                         snapshotHtml: msg.htmlSnapshotBefore || currentHtml
                       })}
-                      className="opacity-0 group-hover:opacity-100 hover:text-white p-0.5 rounded text-blue-200 hover:bg-black/20 transition flex items-center gap-1 text-[9px]"
+                      className="opacity-0 group-hover:opacity-100 hover:text-white px-1.5 py-0.5 rounded-md text-indigo-200 hover:bg-white/10 transition flex items-center gap-1 text-[9px]"
                       title="Voltar conversa até aqui (Rollback)"
                     >
                       <RotateCcw size={10} />
                       <span>Voltar</span>
                     </button>
                   </div>
-                  <div>{msg.content}</div>
+                  <div className="text-slate-100">{msg.content}</div>
                 </div>
               </div>
             );
           }
 
           return (
-            <div key={msg.id} className="group relative flex flex-col space-y-2.5 max-w-[96%] animate-in fade-in duration-200">
-              {/* Botão de Rollback da mensagem do assistente */}
+            <div key={msg.id} className="group relative flex flex-col space-y-2 max-w-[97%] animate-in fade-in duration-200">
+              {/* Cabeçalho da resposta do assistente */}
               <div className="flex items-center justify-between text-[10px] text-slate-500 px-1">
-                <span className="font-mono">{msg.timestamp}</span>
+                <div className="flex items-center gap-1.5">
+                  <span className="h-1.5 w-1.5 rounded-full bg-cyan-400" />
+                  <span className="font-medium text-slate-400">Agente</span>
+                  <span className="font-mono text-slate-600">{msg.timestamp}</span>
+                  {msg.audit && (
+                    <span
+                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/25 text-[9px] font-mono font-semibold text-emerald-300"
+                      title="Auditoria de Qualidade Visual"
+                    >
+                      <ShieldCheck size={10} className="text-emerald-400" />
+                      {msg.audit.score}/100
+                    </span>
+                  )}
+                </div>
                 <button
                   type="button"
                   onClick={() => setRewindTarget({
@@ -964,7 +1058,7 @@ export function AIChatPanel({
                     content: msg.content,
                     snapshotHtml: msg.htmlSnapshotBefore || currentHtml
                   })}
-                  className="opacity-0 group-hover:opacity-100 hover:text-mockbird-cyan p-0.5 rounded text-slate-400 hover:bg-mockbird-card transition flex items-center gap-1 text-[10px]"
+                  className="opacity-0 group-hover:opacity-100 hover:text-cyan-300 px-1.5 py-0.5 rounded-md text-slate-400 hover:bg-white/[0.05] transition flex items-center gap-1 text-[10px]"
                   title="Voltar conversa até esta resposta"
                 >
                   <RotateCcw size={11} />
@@ -974,17 +1068,17 @@ export function AIChatPanel({
 
               {/* Plano Arquitetural Executado */}
               {msg.plan && msg.plan.length > 0 && (
-                <div className="rounded-xl border border-mockbird-border bg-[#0a0a0c] p-2.5 space-y-1.5">
-                  <div className="flex items-center gap-1.5 text-[11px] font-semibold text-mockbird-cyan">
+                <div className="rounded-xl border border-white/[0.07] bg-[#0e111a] p-2.5 space-y-1.5">
+                  <div className="flex items-center gap-1.5 text-[11px] font-semibold text-cyan-300">
                     <ListTodo size={13} />
-                    <span>Plano Arquitetural Executado ({msg.plan.length} blocos)</span>
+                    <span>Plano Executado ({msg.plan.length} etapas)</span>
                   </div>
                   <div className="space-y-1">
                     {msg.plan.map((p) => (
-                      <div key={p.id} className="flex items-start gap-2 text-[10px] text-slate-300 bg-mockbird-surface/80 p-1.5 rounded-lg border border-mockbird-border/40">
+                      <div key={p.id} className="flex items-start gap-2 text-[10px] text-slate-300 bg-white/[0.02] p-1.5 rounded-lg border border-white/[0.05]">
                         <span className="font-mono font-bold text-emerald-400 shrink-0">✓ {p.id}.</span>
                         <div>
-                          <strong className="text-white">{p.title}:</strong> <span className="text-slate-400">{p.description}</span>
+                          <strong className="text-slate-100">{p.title}:</strong> <span className="text-slate-400">{p.description}</span>
                         </div>
                       </div>
                     ))}
@@ -992,64 +1086,51 @@ export function AIChatPanel({
                 </div>
               )}
 
-              {/* Selo de Auditoria de Qualidade */}
-              {msg.audit && (
-                <div className="flex items-center justify-between px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-[11px] text-emerald-300">
-                  <div className="flex items-center gap-1.5">
-                    <ShieldCheck size={14} className="text-emerald-400" />
-                    <span>Auditoria de Qualidade Antirresumo</span>
-                  </div>
-                  <span className="font-mono font-bold">{msg.audit.score}/100</span>
-                </div>
-              )}
-
               {/* Raciocínio Expansível */}
               {msg.reasoning && (
-                <div className="rounded-xl border border-mockbird-border bg-[#0a0a0c] overflow-hidden">
+                <div className="rounded-xl border border-white/[0.07] bg-[#0e111a] overflow-hidden">
                   <button
                     type="button"
                     onClick={() => setShowThought(!showThought)}
                     className="w-full px-3 py-1.5 flex items-center justify-between text-[11px] text-slate-400 hover:text-white transition-colors"
                   >
-                    <div className="flex items-center gap-1.5 text-mockbird-cyan">
-                      <Brain size={13} />
-                      <span className="font-medium">Raciocínio da IA</span>
+                    <div className="flex items-center gap-1.5 text-cyan-300">
+                      <Brain size={12} />
+                      <span className="font-medium">Raciocínio</span>
                     </div>
                     {showThought ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
                   </button>
                   {showThought && (
-                    <div className="p-3 text-[10px] font-mono text-slate-400 max-h-36 overflow-y-auto whitespace-pre-wrap leading-relaxed select-text border-t border-mockbird-border/40">
+                    <div className="p-3 text-[10px] font-mono text-slate-400 max-h-36 overflow-y-auto whitespace-pre-wrap leading-relaxed select-text border-t border-white/[0.06]">
                       {msg.reasoning}
                     </div>
                   )}
                 </div>
               )}
 
-              {/* Mensagem / Explicação do Assistente em Português */}
+              {/* Mensagem / Explicação do Assistente */}
               {msg.content && (
-                <div className="bg-mockbird-card border border-mockbird-border rounded-2xl rounded-tl-sm p-3 text-xs text-slate-200 shadow-sm leading-relaxed select-text whitespace-pre-wrap">
+                <div className="bg-[#12151f] border border-white/[0.07] rounded-2xl rounded-tl-sm p-3 text-xs text-slate-200 shadow-sm leading-relaxed select-text whitespace-pre-wrap">
                   {msg.content}
                 </div>
               )}
 
               {/* Card de Código Gerado com Visualizador de Alterações (Diff) e Reversão */}
               {msg.patch && msg.patch.trim().length > 0 && (
-                <div className="p-3.5 rounded-xl bg-mockbird-card border border-mockbird-border shadow-panel space-y-2.5">
-                  <div className="flex items-start justify-between gap-2">
-                    <span className="text-xs font-bold text-white flex items-center gap-1.5">
-                      <Sparkles size={14} className="text-mockbird-cyan shrink-0" />
+                <div className="p-3 rounded-2xl bg-[#12151f] border border-white/[0.09] shadow-lg space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-white flex items-center gap-1.5">
+                      <Sparkles size={13} className="text-cyan-400 shrink-0" />
                       {msg.patchType === 'element'
-                        ? `Alteração Cirúrgica <${msg.targetTag || 'alvo'}>`
-                        : `Versão da Tela (${msg.timestamp})`}
+                        ? `Edição Cirúrgica <${msg.targetTag || 'alvo'}>`
+                        : 'Atualização da Tela'}
                     </span>
+                    {msg.patchType === 'element' && (msg.targetSelector || msg.targetMbId) && (
+                      <span className="text-[10px] text-cyan-300 font-mono bg-cyan-500/10 border border-cyan-400/20 px-1.5 py-0.5 rounded truncate max-w-[140px]">
+                        {msg.targetSelector || `#${msg.targetMbId}`}
+                      </span>
+                    )}
                   </div>
-
-                  {msg.patchType === 'element' && (msg.targetSelector || msg.targetMbId) && (
-                    <div className="text-[10px] text-slate-400 font-mono flex items-center gap-1">
-                      <span>Alvo:</span>
-                      <span className="text-emerald-300 font-semibold">{msg.targetSelector || `#${msg.targetMbId}`}</span>
-                    </div>
-                  )}
 
                   <DiffViewer
                     message={msg}
@@ -1067,33 +1148,33 @@ export function AIChatPanel({
                   {/* Botões de Ação com Suporte a Reversão (Undo) e Reaplicação (Redo) */}
                   {msg.isApplied ? (
                     <div className="flex items-center gap-2">
-                      <div className="flex-1 py-2 px-3 rounded-xl text-xs font-semibold bg-emerald-600/20 border border-emerald-500/40 text-emerald-300 flex items-center justify-center gap-1.5">
-                        <CheckCircle2 size={14} className="text-emerald-400" />
-                        <span>Aplicado {msg.appliedAt ? `(${msg.appliedAt})` : ''}</span>
+                      <div className="flex-1 py-1.5 px-3 rounded-xl text-[11px] font-semibold bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 flex items-center justify-center gap-1.5">
+                        <CheckCircle2 size={13} className="text-emerald-400" />
+                        <span>Aplicado no Canvas {msg.appliedAt ? `(${msg.appliedAt})` : ''}</span>
                       </div>
                       <button
                         type="button"
                         onClick={() => handleRevertVersion(msg.id)}
-                        className="px-3.5 py-2 rounded-xl text-xs font-bold bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/40 text-amber-300 flex items-center justify-center gap-1.5 transition-all shadow-sm"
+                        className="px-3 py-1.5 rounded-xl text-[11px] font-semibold bg-white/[0.04] hover:bg-amber-500/15 border border-white/[0.08] hover:border-amber-500/30 text-slate-300 hover:text-amber-300 flex items-center justify-center gap-1.5 transition-all"
                         title="Reverter alteração (desfazer do Canvas)"
                       >
-                        <Undo2 size={13} />
-                        <span>Reverter</span>
+                        <Undo2 size={12} />
+                        <span>Desfazer</span>
                       </button>
                     </div>
                   ) : msg.htmlSnapshotBefore && msg.appliedAt ? (
                     <div className="flex items-center gap-2">
-                      <div className="flex-1 py-2 px-3 rounded-xl text-xs font-semibold bg-slate-800/60 border border-mockbird-border text-slate-400 flex items-center justify-center gap-1.5">
-                        <RotateCcw size={13} className="text-slate-500" />
-                        <span>Alteração Revertida</span>
+                      <div className="flex-1 py-1.5 px-3 rounded-xl text-[11px] font-medium bg-white/[0.03] border border-white/[0.07] text-slate-400 flex items-center justify-center gap-1.5">
+                        <RotateCcw size={12} className="text-slate-500" />
+                        <span>Versão desfeita</span>
                       </div>
                       <button
                         type="button"
                         onClick={() => handleReapplyVersion(msg.id)}
-                        className="px-3.5 py-2 rounded-xl text-xs font-bold bg-mockbird-blue hover:bg-mockbird-bluedark text-white flex items-center justify-center gap-1.5 transition-all shadow-md"
+                        className="px-3 py-1.5 rounded-xl text-[11px] font-semibold bg-gradient-to-r from-cyan-500 to-indigo-500 hover:from-cyan-400 hover:to-indigo-400 text-white flex items-center justify-center gap-1.5 transition-all shadow-sm"
                         title="Reaplicar esta alteração no Canvas"
                       >
-                        <Redo2 size={13} />
+                        <Redo2 size={12} />
                         <span>Reaplicar</span>
                       </button>
                     </div>
@@ -1107,22 +1188,22 @@ export function AIChatPanel({
                           handleApplyVersion(msg.id, msg.patch || '');
                         }
                       }}
-                      className={`w-full py-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition-all shadow-md ${
+                      className={`w-full py-2 rounded-xl text-xs font-semibold flex items-center justify-center gap-2 transition-all shadow-md ${
                         appliedId === msg.id
                           ? 'bg-emerald-600 text-white'
-                          : 'bg-mockbird-blue hover:bg-mockbird-bluedark text-white'
+                          : 'bg-gradient-to-r from-cyan-500 to-indigo-500 hover:from-cyan-400 hover:to-indigo-400 text-white'
                       }`}
                     >
                       {appliedId === msg.id ? (
                         <>
-                          <CheckCircle2 size={15} />
-                          <span>✓ Aplicado com Sucesso!</span>
+                          <CheckCircle2 size={14} />
+                          <span>Aplicado com Sucesso!</span>
                         </>
                       ) : (
                         <>
-                          <Sparkles size={15} />
+                          <Sparkles size={14} />
                           <span>
-                            {msg.patchType === 'element' ? 'Aplicar no Elemento Selecionado' : 'Aplicar na Tela'}
+                            {msg.patchType === 'element' ? 'Aplicar no Elemento' : 'Aplicar na Tela'}
                           </span>
                         </>
                       )}
@@ -1136,56 +1217,76 @@ export function AIChatPanel({
 
         {/* Execução Ativa do Agente Autônomo */}
         {loading && executionMode === 'agent' && (
-          <div className="space-y-2.5 max-w-[96%] animate-in fade-in">
-            {/* Card do Nó Ativo */}
-            <div className="p-3 rounded-xl bg-[#151827] border border-indigo-400/20 text-xs space-y-2.5">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2 text-indigo-300 font-bold">
-                  <Loader2 size={14} className="animate-spin text-mockbird-cyan" />
-                  <span className="text-white">{agentStep?.title || 'Inicializando agente...'}</span>
+          <div className="space-y-2 max-w-[97%] animate-in fade-in">
+            <div className="p-3.5 rounded-2xl bg-gradient-to-b from-[#151928] to-[#10131e] border border-cyan-400/25 text-xs space-y-2.5 shadow-lg">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 font-semibold text-white">
+                  <Loader2 size={14} className="animate-spin text-cyan-400 shrink-0" />
+                  <span>{agentStep?.title || 'Analisando solicitação...'}</span>
                 </div>
                 {activeTool && (
-                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-mono flex items-center gap-1">
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/15 border border-cyan-400/25 text-cyan-300 font-mono flex items-center gap-1">
                     <Wrench size={10} /> {activeTool}
                   </span>
                 )}
               </div>
               <p className="text-[11px] text-slate-400 leading-relaxed">
-                {agentStep?.detail || 'Inspecionando contexto e selecionando ferramentas ideais...'}
+                {agentStep?.detail || 'Inspecionando estrutura da tela e preparando alterações...'}
               </p>
+
+              {agentTimeline.length > 0 && (
+                <div className="pt-2 border-t border-white/[0.07] space-y-1.5">
+                  {agentTimeline.map((item, index) => (
+                    <div key={`${item.node}-${index}`} className="flex items-center gap-2 text-[10px] text-slate-300">
+                      <span
+                        className={`h-1.5 w-1.5 rounded-full shrink-0 ${
+                          item.status === 'running'
+                            ? 'bg-cyan-400 animate-pulse'
+                            : item.status === 'failed'
+                            ? 'bg-rose-400'
+                            : 'bg-emerald-400'
+                        }`}
+                      />
+                      <span className="truncate">{item.title}</span>
+                      <span className="ml-auto text-[9px] font-mono text-slate-500">
+                        {item.status === 'running' ? 'em curso' : item.status === 'failed' ? 'falhou' : 'ok'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {agentAudit && (
-                <div className="flex items-center gap-1.5 pt-1 text-[10px] text-emerald-400 font-semibold border-t border-indigo-500/20">
-                  <ShieldCheck size={12} />
-                  <span>Auditoria Antirresumo: {agentAudit.score}/100</span>
+                <div className="flex items-center gap-1.5 pt-1.5 text-[10px] text-emerald-300 font-semibold border-t border-white/[0.07]">
+                  <ShieldCheck size={12} className="text-emerald-400" />
+                  <span>Auditoria Visual: {agentAudit.score}/100</span>
                 </div>
               )}
             </div>
 
-            {agentTimeline.length > 0 && (
-              <div className="p-3 rounded-xl border border-white/[0.08] bg-[#11131b] space-y-2">
-                <div className="flex items-center gap-1.5 text-[11px] font-semibold text-mockbird-cyan"><Workflow size={13} /><span>Linha do tempo</span></div>
-                {agentTimeline.map((item, index) => (
-                  <div key={`${item.node}-${index}`} className="flex items-center gap-2 text-[10px] text-slate-300">
-                    <span className={`h-2 w-2 rounded-full ${item.status === 'running' ? 'bg-cyan-400 animate-pulse' : item.status === 'failed' ? 'bg-red-400' : 'bg-emerald-400'}`} />
-                    <span>{item.title}</span>
-                    <span className="ml-auto text-slate-500">{item.status === 'running' ? 'executando' : item.status === 'failed' ? 'falhou' : 'concluído'}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-            {/* Plano de Ação em Andamento */}
             {agentPlan.length > 0 && (
-              <div className="p-3 rounded-xl border border-white/[0.08] bg-[#11131b] space-y-2">
-                <div className="flex items-center gap-1.5 text-[11px] font-semibold text-mockbird-cyan">
-                  <Workflow size={13} />
+              <div className="p-3 rounded-2xl border border-white/[0.07] bg-[#10131d] space-y-2">
+                <div className="flex items-center gap-1.5 text-[11px] font-semibold text-cyan-300">
+                  <ListTodo size={13} />
                   <span>Plano Arquitetural ({agentPlan.length} etapas)</span>
                 </div>
                 <div className="space-y-1">
                   {agentPlan.map((p) => (
-                    <div key={p.id} className="flex items-start gap-2 text-[10px] text-slate-300 bg-mockbird-surface p-1.5 rounded-lg border border-mockbird-border/40">
-                       <span className={`font-mono font-bold shrink-0 ${p.status === 'completed' ? 'text-emerald-400' : p.status === 'failed' ? 'text-red-400' : 'text-mockbird-cyan'}`}>{p.status === 'completed' ? '✓' : p.status === 'failed' ? '!' : `${p.id}.`}</span>
+                    <div key={p.id} className="flex items-start gap-2 text-[10px] text-slate-300 bg-white/[0.02] p-1.5 rounded-lg border border-white/[0.05]">
+                      <span
+                        className={`font-mono font-bold shrink-0 ${
+                          p.status === 'completed'
+                            ? 'text-emerald-400'
+                            : p.status === 'failed'
+                            ? 'text-rose-400'
+                            : 'text-cyan-400'
+                        }`}
+                      >
+                        {p.status === 'completed' ? '✓' : p.status === 'failed' ? '!' : `${p.id}.`}
+                      </span>
                       <div>
-                        <strong className="text-white">{p.title}:</strong> <span className="text-slate-400">{p.description}</span>
+                        <strong className="text-white">{p.title}:</strong>{' '}
+                        <span className="text-slate-400">{p.description}</span>
                       </div>
                     </div>
                   ))}
@@ -1264,17 +1365,44 @@ export function AIChatPanel({
         executionMode={executionMode}
         selectedElement={selectedElement}
         onClearSelectedElement={onClearSelectedElement}
+        availableModels={availableModels}
+        selectedModel={selectedModel}
+        onSelectModel={setSelectedModel}
+        attachedImage={attachedImage}
+        onAttachedImageChange={setAttachedImage}
       />
 
-      <div className="shrink-0 border-t border-white/[0.06] bg-[#090b10] px-3 py-1.5 font-mono text-[9px] text-slate-500">
-        <div className="flex items-center gap-x-3 gap-y-1 flex-wrap">
-          <span className="flex items-center gap-1 text-slate-400"><span className={`h-1.5 w-1.5 rounded-full ${providerLoading ? 'bg-amber-400' : providerInfo ? 'bg-emerald-400' : 'bg-rose-400'}`} />{providerLabel}</span>
-          <span className="text-slate-300">{selectedModel}</span>
-          <span title="Estimativa: caracteres divididos por 4">ctx ~{compactNumber(estimatedContextTokens)} / {compactNumber(responseLimit)}</span>
-          <span className="ml-auto flex items-center gap-1.5" title="Consumo mensal da organização">
-            uso {compactNumber(usageInfo?.tokens_used_month)} / {compactNumber(usageInfo?.monthly_token_limit)}
-            {usageInfo?.monthly_token_limit ? <span className="h-1 w-12 overflow-hidden rounded-full bg-white/10"><span className="block h-full bg-cyan-400" style={{ width: `${usagePercent}%` }} /></span> : null}
-          </span>
+      {/* Barra de Status Compacta em Linha Única */}
+      <div className="shrink-0 border-t border-white/[0.05] bg-[#080a0f] px-3.5 py-1.5 font-mono text-[10px] text-slate-400">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="inline-flex items-center gap-1.5 text-slate-300 truncate">
+              <span
+                className={`h-1.5 w-1.5 rounded-full shrink-0 ${
+                  providerLoading ? 'bg-amber-400' : providerInfo ? 'bg-emerald-400' : 'bg-rose-400'
+                }`}
+              />
+              <span className="truncate">{providerLabel}</span>
+            </span>
+            <span className="text-slate-600">•</span>
+            <span className="text-slate-500 truncate" title="Contexto estimado da tela atual">
+              ctx ~{compactNumber(estimatedContextTokens)}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0" title="Consumo mensal de tokens da organização">
+            <span className="text-slate-400">
+              {compactNumber(usageInfo?.tokens_used_month)} / {compactNumber(usageInfo?.monthly_token_limit)}
+            </span>
+            {usageInfo?.monthly_token_limit ? (
+              <span className="h-1.5 w-12 overflow-hidden rounded-full bg-white/[0.08]">
+                <span
+                  className="block h-full bg-gradient-to-r from-cyan-400 to-indigo-400"
+                  style={{ width: `${usagePercent}%` }}
+                />
+              </span>
+            ) : null}
+          </div>
         </div>
       </div>
 

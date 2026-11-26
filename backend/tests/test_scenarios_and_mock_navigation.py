@@ -29,7 +29,6 @@ async def test_scenarios_lifecycle_and_public_presentation():
         assert proj.status_code == 200, proj.text
         data = proj.json()
         project_id = data["id"]
-        slug = data["slug"]
 
         # 3. GET /scenarios inicializa os cenários padrão
         scen_res = await client.get(f"/api/projects/{project_id}/scenarios", headers=headers)
@@ -61,12 +60,13 @@ async def test_scenarios_lifecycle_and_public_presentation():
         assert created_scen["mock_data"]["user"]["name"] == "Carlos VIP"
         custom_id = created_scen["id"]
 
-        # 5. Publicar projeto e checar se o endpoint público de apresentação traz os cenários
-        pub_res = await client.post(f"/api/projects/{project_id}/publish", headers=headers)
-        assert pub_res.status_code == 200, pub_res.text
+        # 5. Compartilhar por share link e checar se o endpoint público traz os cenários
+        link_res = await client.post(f"/api/projects/{project_id}/share-links", json={}, headers=headers)
+        assert link_res.status_code == 200, link_res.text
+        share_slug = link_res.json()["slug"]
 
         async with httpx.AsyncClient(base_url=BASE_URL, timeout=20.0) as anon:
-            public_res = await anon.get(f"/api/public/p/{slug}")
+            public_res = await anon.get(f"/api/public/p/{share_slug}")
             assert public_res.status_code == 200, public_res.text
             public_data = public_res.json()
             assert "scenarios" in public_data

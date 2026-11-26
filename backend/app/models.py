@@ -128,6 +128,9 @@ class ShareLink(Base):
     slug = Column(String(100), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=True)
     allow_comments = Column(Boolean, default=False, nullable=False)
+    # 'anyone' = qualquer pessoa com o link; 'org' = exige login e acesso ao projeto.
+    access_mode = Column(String(20), default="anyone", server_default="anyone", nullable=False)
+    label = Column(String(120), nullable=True)
     expires_at = Column(DateTime, nullable=True)
     view_count = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, default=utcnow, nullable=False)

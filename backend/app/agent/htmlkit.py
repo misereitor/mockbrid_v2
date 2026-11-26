@@ -414,6 +414,102 @@ def _score(html: str, errors: List[str], warnings: List[str]) -> int:
     return max(0, min(100, score))
 
 
+def auto_heal_interactivity_and_assets(html: str) -> tuple[str, list[str]]:
+    """Cura âncoras órfãs, botões sem ação e imagens sem fallback elegante."""
+    warnings: list[str] = []
+    repaired = html or ""
+
+    # 1. Âncoras e links (#secao e vazios)
+    anchor_pattern = re.compile(r"""href\s*=\s*(["'])#([^"'\s#]+)\1""", re.IGNORECASE)
+    anchors_needed: set[str] = set()
+    for m in anchor_pattern.finditer(repaired):
+        anchors_needed.add(m.group(2))
+
+    existing_ids = {
+        m[1] for m in re.findall(r"""(?<![-_a-zA-Z0-9])id\s*=\s*(["'])(.*?)\1""", repaired, re.IGNORECASE)
+    }
+
+    for anchor in anchors_needed:
+        if anchor not in existing_ids:
+            escaped = re.escape(anchor)
+            match_section = re.search(
+                rf"""(<(?:section|div|article|main)[^>]*data-mb-id\s*=\s*["'][^"']*{escaped}[^"']*["'][^>]*)>""",
+                repaired,
+                re.IGNORECASE,
+            )
+            if match_section and not re.search(r'(?<![-_a-zA-Z0-9])id\s*=', match_section.group(1)):
+                orig_tag = match_section.group(1)
+                new_tag = f'{orig_tag} id="{anchor}"'
+                repaired = repaired.replace(orig_tag + ">", new_tag + ">", 1)
+                existing_ids.add(anchor)
+                warnings.append(f'id="{anchor}" injetado na seção correspondente para o link funcionar.')
+            else:
+                match_any_section = re.search(r"""(<section\b[^>]*)>""", repaired, re.IGNORECASE)
+                if match_any_section and not re.search(r'(?<![-_a-zA-Z0-9])id\s*=', match_any_section.group(1)):
+                    orig_tag = match_any_section.group(1)
+                    new_tag = f'{orig_tag} id="{anchor}"'
+                    repaired = repaired.replace(orig_tag + ">", new_tag + ">", 1)
+                    existing_ids.add(anchor)
+                    warnings.append(f'id="{anchor}" injetado em uma <section> para ancoragem de link.')
+
+    def fix_empty_anchor(m: re.Match) -> str:
+        tag_content = m.group(1)
+        if "data-toast" not in tag_content and "data-go" not in tag_content and "data-overlay" not in tag_content:
+            return f'<a{tag_content} href="javascript:void(0)" data-toast="Ação em demonstração">'
+        return m.group(0)
+
+    repaired = re.sub(
+        r"""<a\b((?:(?![^>]*data-toast)(?![^>]*(?:data-go|data-overlay))[^>]*)href\s*=\s*(["'])#?\2[^>]*)>""",
+        fix_empty_anchor,
+        repaired,
+        flags=re.IGNORECASE,
+    )
+
+    # 2. Botões mortos (<button> sem ação)
+    def fix_button(m: re.Match) -> str:
+        attrs = m.group(1)
+        inner = m.group(2)
+        has_action = any(
+            attr in attrs
+            for attr in [
+                "data-toast",
+                "data-go",
+                "data-overlay",
+                "data-close",
+                "onclick",
+                "type=\"submit\"",
+                "type='submit'",
+            ]
+        )
+        if not has_action:
+            clean_text = re.sub(r"<[^>]+>", "", inner).strip()
+            toast_msg = f"{clean_text[:40]} confirmado!" if clean_text else "Ação executada com sucesso!"
+            toast_msg = toast_msg.replace('"', '&quot;')
+            return f'<button{attrs} data-toast="{toast_msg}">{inner}</button>'
+        return m.group(0)
+
+    repaired = re.sub(
+        r"""<button\b([^>]*)>(.*?)</button>""",
+        fix_button,
+        repaired,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # 3. Imagens (<img> com fallback de erro e lazy loading)
+    def fix_img(m: re.Match) -> str:
+        attrs = m.group(1)
+        modified = attrs
+        if "onerror" not in attrs:
+            modified += ' onerror="this.onerror=null;this.style.opacity=\'0.7\';"'
+        if "loading" not in attrs:
+            modified += ' loading="lazy"'
+        return f"<img{modified}>"
+
+    repaired = re.sub(r"""<img\b([^>]*)>""", fix_img, repaired, flags=re.IGNORECASE)
+
+    return repaired, warnings
+
+
 def validate_and_repair(
     raw_html: str,
     mode: str = "full",
@@ -466,6 +562,8 @@ def validate_and_repair(
             )
             warnings.append("data-mb-id do alvo reinserido.")
         snippet, _, _ = _ensure_unique_mb_ids(snippet)
+        snippet, heal_warns = auto_heal_interactivity_and_assets(snippet)
+        warnings.extend(heal_warns)
         if len(snippet) < 10 or not _has_markup(snippet):
             errors.append("Fragmento de elemento vazio ou sem marcação.")
         if "<body" in snippet.lower() or "<html" in snippet.lower():
@@ -512,6 +610,9 @@ def validate_and_repair(
         warnings.append(f"{injected} data-mb-id inserido(s) automaticamente.")
     if renamed:
         warnings.append(f"{renamed} data-mb-id duplicado(s) renomeado(s).")
+
+    rebuilt, heal_warns = auto_heal_interactivity_and_assets(rebuilt)
+    warnings.extend(heal_warns)
 
     text = _visible_text(rebuilt)
     if len(rebuilt) < min_chars:

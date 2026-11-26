@@ -1,8 +1,9 @@
 """Upload e entrega de imagens usadas nas telas.
 
 Sem dependência externa: os arquivos ficam em `ASSETS_DIR/<project_id>/`.
-A entrega é liberada para membros do projeto e, para visitantes, apenas quando
-o projeto está publicado ou possui share link ativo (URLs são UUIDs).
+A entrega é liberada para membros do projeto, para URLs assinadas (`?sig=`) e,
+para visitantes sem assinatura, apenas quando o projeto tem um share link ativo,
+aberto (`anyone`) e sem senha.
 """
 
 import hashlib
@@ -10,7 +11,7 @@ import hmac
 import logging
 import re
 from datetime import datetime
-from typing import List, Optional
+from typing import List
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
@@ -18,11 +19,11 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
-from app.auth import decode_access_token, hash_session_token
 from app.authz import authorize_project
 from app.config import settings
 from app.database import get_db
-from app.models import Asset, Canvas, Project, Screen, Session, ShareLink, User
+from app.models import Asset, Canvas, Project, Screen, ShareLink, User
+from app.optional_auth import get_optional_user
 from app.routes_auth import get_current_user, require_editor
 from app.storage import ALLOWED_TYPES, asset_path, delete_asset, save_asset, sniff_image_type
 from app.timeutils import utcnow
@@ -152,44 +153,27 @@ async def remove_asset(
     return {"message": "Asset removido", "asset_id": asset_id}
 
 
-async def _optional_user(request: Request, db: AsyncSession) -> Optional[User]:
-    token = request.cookies.get("mockbird_token")
-    if not token:
-        header = request.headers.get("Authorization") or ""
-        if header.startswith("Bearer "):
-            token = header[len("Bearer "):]
-    if not token:
-        return None
-    payload = decode_access_token(token)
-    if not payload or "sub" not in payload:
-        return None
-    session_res = await db.execute(
-        select(Session).where(Session.token == hash_session_token(token))
-    )
-    session = session_res.scalars().first()
-    if not session or session.expires_at < utcnow():
-        return None
-    user_res = await db.execute(select(User).where(User.id == payload["sub"]))
-    user = user_res.scalars().first()
-    if not user or not user.is_active:
-        return None
-    return user
-
-
 async def _project_is_public(project_id: str, db: AsyncSession) -> bool:
-    res = await db.execute(
-        select(Project).where(
+    """Asset sem assinatura só é público se o projeto tem um link realmente aberto.
+
+    Vale apenas para share link ativo, `anyone` e **sem senha**. Links com senha ou
+    restritos à organização não abrem assets avulsos: as imagens das telas carregam
+    pelas URLs assinadas (`?sig=`) que o sistema grava no HTML.
+    """
+    project_res = await db.execute(
+        select(Project.id).where(
             Project.id == project_id,
             Project.is_archived == False,  # noqa: E712
-            Project.is_published == True,  # noqa: E712
         )
     )
-    if res.scalars().first():
-        return True
+    if not project_res.first():
+        return False
     links = await db.execute(select(ShareLink).where(ShareLink.project_id == project_id))
     now = utcnow()
     return any(
-        link.expires_at is None or link.expires_at > now
+        (link.expires_at is None or link.expires_at > now)
+        and (link.access_mode or "anyone") == "anyone"
+        and not link.password_hash
         for link in links.scalars().all()
     )
 
@@ -208,7 +192,7 @@ async def get_asset(
     sig = request.query_params.get("sig", "")
     allowed = verify_asset_signature(asset_id, sig)
     if not allowed:
-        user = await _optional_user(request, db)
+        user = await get_optional_user(request, db)
         if user:
             try:
                 await authorize_project(asset.project_id, user, "read", db)
