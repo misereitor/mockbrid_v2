@@ -1,0 +1,1 @@
+Adicionar agentes e skills no frontend, configurado de forma manual com arquivos MD
