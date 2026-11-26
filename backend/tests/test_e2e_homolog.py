@@ -13,7 +13,8 @@ async def test_api_health():
         data = res.json()
         assert data["status"] == "healthy"
         assert data["service"] == "Mockbird v2"
-        assert data["environment"] == "homologation"
+        # /api/health é anônimo: não pode revelar o ambiente de execução.
+        assert "environment" not in data
 
 
 @pytest.mark.asyncio

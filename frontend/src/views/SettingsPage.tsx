@@ -261,17 +261,16 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
   const [appEnv, setAppEnv] = useState<string>('homologation');
 
   useEffect(() => {
-    fetch('/api/health')
-      .then(r => (r.ok ? r.json() : null))
-      .then(h => h?.environment && setAppEnv(h.environment))
-      .catch(() => {});
     fetch('/api/auth/me')
       .then(r => (r.ok ? r.json() : null))
       .then(u => u && setUserRole(u.role))
       .catch(() => {});
     fetch('/api/org/ai-usage')
       .then(r => (r.ok ? r.json() : null))
-      .then(setUsage)
+      .then(u => {
+        setUsage(u);
+        if (u?.environment) setAppEnv(u.environment);
+      })
       .catch(() => {});
     fetch('/api/ai/plans')
       .then(r => (r.ok ? r.json() : []))

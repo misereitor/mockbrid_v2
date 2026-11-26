@@ -26,9 +26,22 @@ services:
         condition: service_healthy
     env_file:
       - .env.prod
+    environment:
+      # IPs de quem pode enviar X-Forwarded-For/Proto (o proxy). Sem isso o uvicorn
+      # só confia em 127.0.0.1 e o IP/esquema reais do cliente não chegam à
+      # aplicação (rate limit e flag Secure dos cookies ficam errados).
+      # Ajuste ao IP/rede do proxy que alcança este container ANTES de aplicar e
+      # confirme na homologação qual IP a aplicação enxerga. Não use "*".
+      # O valor abaixo cobre a rede bridge padrão do Docker (de onde o proxy no
+      # host chega por 127.0.0.1:8083) e o loopback.
+      FORWARDED_ALLOW_IPS: "127.0.0.1,172.16.0.0/12"
+    # --workers 1: o estado do WebSocket (presença, cursor, screen_updated) e o
+    # rate limit são em memória por processo. Com mais de um worker cada um só vê
+    # parte das conexões e o limite efetivo multiplica. Voltar a subir o número
+    # de workers só depois de mover esse estado para o Redis (roadmap).
     command: >
       sh -c "alembic upgrade head &&
-      uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2 --proxy-headers"
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --proxy-headers"
     ports:
       # Acesso local e pela VPN WireGuard na porta dedicada de produção (8083)
       - "127.0.0.1:8083:8000"

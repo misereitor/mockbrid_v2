@@ -27,7 +27,7 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 # Documentação interativa só é exposta fora de produção.
-docs_enabled = settings.ENVIRONMENT != "production"
+docs_enabled = not settings.is_production
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -87,7 +87,6 @@ async def health_check():
     return {
         "status": "healthy" if db_status == "connected" else "degraded",
         "service": settings.PROJECT_NAME,
-        "environment": settings.ENVIRONMENT,
         "database": db_status,
     }
 

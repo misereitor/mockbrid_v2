@@ -4,9 +4,19 @@ import httpx
 import secrets
 import json
 
-BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000")
+BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8082")
+
+# Este teste chama um LLM real (`bonsai-27b`). A stack do CI não tem provedor de
+# IA e, mesmo com um, o modelo às vezes não converge ("limite de iterações"), então
+# o resultado não é determinístico. Só roda quando alguém pede explicitamente, com
+# um provedor configurado: `AI_E2E=1 pytest tests/test_agent_surgical_and_separation.py`.
+requires_real_llm = pytest.mark.skipif(
+    not os.getenv("AI_E2E"),
+    reason="depende de um LLM real e não determinístico; defina AI_E2E=1 para rodar",
+)
 
 
+@requires_real_llm
 @pytest.mark.asyncio
 async def test_agent_intent_and_separation():
     async with httpx.AsyncClient(base_url=BASE_URL, timeout=120.0) as client:

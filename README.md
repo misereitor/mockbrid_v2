@@ -26,6 +26,23 @@ consegue publicar a porta `10.8.0.7:8082`; suba a VPN e rode `docker compose up 
 O container da API executa `alembic upgrade head` antes de subir o uvicorn — um volume
 novo (ou um deploy limpo) já nasce com o esquema aplicado.
 
+#### `ENVIRONMENT` e segredos em produção
+
+`ENVIRONMENT` assume **`production`** quando não é declarado: homologação, desenvolvimento e
+testes precisam definir `homologation`, `development` ou `test` (o `docker-compose.yml`, o
+`.env.example`, o `conftest.py` e o CI já definem). Em produção a API **não sobe** se:
+
+- `SECRET_KEY` tiver menos de 32 caracteres ou for um valor de exemplo;
+- `DATABASE_URL`/`DATABASE_URL_SYNC` usarem a senha padrão de homologação;
+- `ENCRYPTION_KEY` estiver vazia ou não for uma chave Fernet válida
+  (`python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`);
+- `COOKIE_SECURE` não for definido (`true` ou `false`). Ele **não é forçado**: a produção é
+  acessada por HTTP (VPN) e por HTTPS (proxy), então a escolha é do operador.
+
+Em produção o CORS e a checagem de `Origin` do WebSocket usam **somente** `ALLOW_ORIGINS`
+(sem os `localhost` automáticos). `/api/health` é anônimo e não informa o ambiente; a tela de
+Configurações lê `environment` de `/api/org/ai-usage`, que exige login.
+
 ### 2. Migrações de banco (Alembic)
 
 ```bash
