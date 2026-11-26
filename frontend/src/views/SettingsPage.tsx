@@ -288,7 +288,10 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
       .catch(() => {});
     fetch('/api/org/ai-usage')
       .then(r => (r.ok ? r.json() : null))
-      .then(setUsage)
+      .then(u => {
+        setUsage(u);
+        if (u?.environment) setAppEnv(u.environment);
+      })
       .catch(() => {});
     fetch('/api/ai/plans')
       .then(r => (r.ok ? r.json() : []))

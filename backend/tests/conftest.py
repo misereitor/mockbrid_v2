@@ -8,8 +8,14 @@ e marcamos como `skip` apenas os módulos que dependem dela; testes unitários
 
 import os
 
-import httpx
-import pytest
+# `app.config` valida o ambiente ao ser importado e o padrão é "production"
+# (estrito). A suíte roda como `test`; precisa ser definido antes de qualquer
+# import de `app.*`. Atribuição direta (e não setdefault) para que um
+# ENVIRONMENT=production vazado do shell não derrube a coleta dos testes.
+os.environ["ENVIRONMENT"] = "test"
+
+import httpx  # noqa: E402
+import pytest  # noqa: E402
 
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8082")
 

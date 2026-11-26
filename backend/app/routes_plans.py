@@ -8,6 +8,7 @@ from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
+from app.config import settings
 from app.database import get_db
 from app.models import AIPlan, AIProvider, Organization, User
 from app.quotas import get_org_plan, user_token_limit
@@ -42,6 +43,9 @@ class ProviderUsageOut(BaseModel):
 
 class AIUsageOut(BaseModel):
     organization_id: str
+    # Ambiente de execução (exibido em Configurações). Fica aqui, atrás de
+    # autenticação, e não em /api/health, que é anônimo.
+    environment: str
     plan: Optional[AIPlanOut]
     tokens_used_month: int
     monthly_token_limit: int
@@ -88,6 +92,7 @@ async def get_ai_usage(
 
     return AIUsageOut(
         organization_id=current_user.organization_id,
+        environment=settings.ENVIRONMENT,
         plan=AIPlanOut.model_validate(plan) if plan else None,
         tokens_used_month=used,
         monthly_token_limit=user_token_limit(current_user, plan),
