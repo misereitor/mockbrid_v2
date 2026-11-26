@@ -35,6 +35,7 @@ services:
       # O valor abaixo cobre a rede bridge padrão do Docker (de onde o proxy no
       # host chega por 127.0.0.1:8083) e o loopback.
       FORWARDED_ALLOW_IPS: "127.0.0.1,172.16.0.0/12"
+      COOKIE_SECURE: "false"
     # --workers 1: o estado do WebSocket (presença, cursor, screen_updated) e o
     # rate limit são em memória por processo. Com mais de um worker cada um só vê
     # parte das conexões e o limite efetivo multiplica. Voltar a subir o número
