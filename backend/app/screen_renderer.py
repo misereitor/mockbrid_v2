@@ -743,3 +743,295 @@ def audit_screen_rules(
         "issues": issues,
         "checks": checks,
     }
+
+
+def _extract_mb_element_map(html_content: str) -> Dict[str, str]:
+    """Extrai mapa de elementos com data-mb-id ou id e seu tag/atributos de abertura + trecho interno."""
+    elements: Dict[str, str] = {}
+    if not html_content:
+        return elements
+    pattern = re.compile(
+        r'<([a-zA-Z0-9\-]+)([^>]*\b(?:data-mb-id|id)=["\']([^"\']+)["\'][^>]*)>',
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(html_content):
+        tag = match.group(1).lower()
+        attrs = re.sub(r"\s+", " ", match.group(2)).strip()
+        el_id = match.group(3).strip()
+        start = match.start()
+        snippet = re.sub(r"\s+", " ", html_content[start : start + 240]).strip()
+        elements[el_id] = f"<{tag} {attrs}> :: {snippet}"
+    return elements
+
+
+def compute_structural_diff(
+    html_a: str,
+    html_b: str,
+    css_a: str = "",
+    css_b: str = "",
+    js_a: str = "",
+    js_b: str = "",
+) -> Dict[str, Any]:
+    """Calcula o diff estrutural (HTML, CSS, JS e inventário de elementos data-mb-id/id) entre duas telas ou revisões."""
+    import difflib
+
+    norm_html_a = (html_a or "").strip()
+    norm_html_b = (html_b or "").strip()
+    norm_css_a = (css_a or "").strip()
+    norm_css_b = (css_b or "").strip()
+    norm_js_a = (js_a or "").strip()
+    norm_js_b = (js_b or "").strip()
+
+    lines_a = norm_html_a.splitlines()
+    lines_b = norm_html_b.splitlines()
+
+    matcher = difflib.SequenceMatcher(None, norm_html_a, norm_html_b)
+    similarity = round(matcher.ratio(), 4)
+
+    diff_lines = list(
+        difflib.unified_diff(
+            lines_a,
+            lines_b,
+            fromfile="screen_a.html",
+            tofile="screen_b.html",
+            lineterm="",
+            n=2,
+        )
+    )
+
+    lines_added = sum(1 for ln in diff_lines if ln.startswith("+") and not ln.startswith("+++"))
+    lines_removed = sum(1 for ln in diff_lines if ln.startswith("-") and not ln.startswith("---"))
+
+    map_a = _extract_mb_element_map(norm_html_a)
+    map_b = _extract_mb_element_map(norm_html_b)
+
+    ids_a = set(map_a.keys())
+    ids_b = set(map_b.keys())
+
+    mb_ids_added = sorted(ids_b - ids_a)
+    mb_ids_removed = sorted(ids_a - ids_b)
+    mb_ids_modified = sorted(el_id for el_id in (ids_a & ids_b) if map_a[el_id] != map_b[el_id])
+
+    return {
+        "identical_code": (norm_html_a == norm_html_b and norm_css_a == norm_css_b and norm_js_a == norm_js_b),
+        "html_changed": norm_html_a != norm_html_b,
+        "css_changed": norm_css_a != norm_css_b,
+        "js_changed": norm_js_a != norm_js_b,
+        "similarity_ratio": similarity,
+        "lines_added": lines_added,
+        "lines_removed": lines_removed,
+        "elements_diff": {
+            "total_elements_a": len(ids_a),
+            "total_elements_b": len(ids_b),
+            "added": mb_ids_added,
+            "removed": mb_ids_removed,
+            "modified": mb_ids_modified,
+        },
+        "unified_diff_preview": "\n".join(diff_lines[:120]),
+    }
+
+
+async def compare_rendered_screens(
+    html_a: str,
+    html_b: str,
+    css_a: str = "",
+    css_b: str = "",
+    js_a: str = "",
+    js_b: str = "",
+    tokens_a: Optional[Dict[str, Any]] = None,
+    tokens_b: Optional[Dict[str, Any]] = None,
+    viewport_name: str = "desktop",
+    theme: str = "light",
+    full_page: bool = False,
+    include_visual_diff: bool = True,
+) -> Dict[str, Any]:
+    """Compara duas telas ou duas revisões estruturalmente (HTML/DOM) e visualmente (pixel diff via Chromium headless)."""
+    structural = compute_structural_diff(
+        html_a=html_a,
+        html_b=html_b,
+        css_a=css_a,
+        css_b=css_b,
+        js_a=js_a,
+        js_b=js_b,
+    )
+
+    if not include_visual_diff:
+        return {
+            "status": "success",
+            "viewport": viewport_name,
+            "theme": theme,
+            "structural_diff": structural,
+            "visual_diff": None,
+        }
+
+    vp = VIEWPORT_CONFIGS.get(viewport_name.lower(), VIEWPORT_CONFIGS["desktop"])
+    width = vp["width"]
+    height = vp["height"]
+
+    full_html_a = build_full_page_html(
+        html_content=html_a,
+        css_content=css_a,
+        js_content=js_a,
+        tokens=tokens_a,
+        theme=theme,
+    )
+    full_html_b = build_full_page_html(
+        html_content=html_b,
+        css_content=css_b,
+        js_content=js_b,
+        tokens=tokens_b if tokens_b is not None else tokens_a,
+        theme=theme,
+    )
+
+    console_logs: List[Dict[str, Any]] = []
+    page_errors: List[str] = []
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = await browser.new_context(
+            viewport={"width": width, "height": height},
+            device_scale_factor=1,
+        )
+        page = await context.new_page()
+        await _setup_page_network_and_diagnostics(page, console_logs, page_errors)
+
+        try:
+            await page.set_content(full_html_a, wait_until="domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(220)
+        shot_a_bytes = await page.screenshot(type="png", full_page=full_page)
+
+        try:
+            await page.set_content(full_html_b, wait_until="domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(220)
+        shot_b_bytes = await page.screenshot(type="png", full_page=full_page)
+
+        b64_a = base64.b64encode(shot_a_bytes).decode("ascii")
+        b64_b = base64.b64encode(shot_b_bytes).decode("ascii")
+
+        # Executa pixel diff em Canvas HTML5 dentro do Chromium e gera imagem PNG com highlight magenta
+        diff_eval = await page.evaluate(
+            """
+            async ([srcA, srcB]) => {
+                const loadImg = (src) => new Promise((resolve, reject) => {
+                    const img = new Image();
+                    img.onload = () => resolve(img);
+                    img.onerror = (e) => reject(e);
+                    img.src = 'data:image/png;base64,' + src;
+                });
+                const [imgA, imgB] = await Promise.all([loadImg(srcA), loadImg(srcB)]);
+                const w = Math.max(imgA.width, imgB.width);
+                const h = Math.max(imgA.height, imgB.height);
+
+                const canvasA = document.createElement('canvas');
+                const canvasB = document.createElement('canvas');
+                const canvasDiff = document.createElement('canvas');
+                canvasA.width = canvasB.width = canvasDiff.width = w;
+                canvasA.height = canvasB.height = canvasDiff.height = h;
+
+                const ctxA = canvasA.getContext('2d');
+                const ctxB = canvasB.getContext('2d');
+                const ctxD = canvasDiff.getContext('2d');
+
+                ctxA.drawImage(imgA, 0, 0);
+                ctxB.drawImage(imgB, 0, 0);
+
+                const dataA = ctxA.getImageData(0, 0, w, h).data;
+                const dataB = ctxB.getImageData(0, 0, w, h).data;
+                const diffImg = ctxD.createImageData(w, h);
+                const out = diffImg.data;
+
+                let diffPixels = 0;
+                const totalPixels = w * h;
+                const threshold = 16; // tolerância anti-aliasing por canal
+                let minX = w, minY = h, maxX = -1, maxY = -1;
+
+                for (let i = 0; i < dataA.length; i += 4) {
+                    const dr = Math.abs(dataA[i] - dataB[i]);
+                    const dg = Math.abs(dataA[i + 1] - dataB[i + 1]);
+                    const db = Math.abs(dataA[i + 2] - dataB[i + 2]);
+                    const da = Math.abs(dataA[i + 3] - dataB[i + 3]);
+
+                    if (dr > threshold || dg > threshold || db > threshold || da > threshold) {
+                        diffPixels++;
+                        const pxIndex = i / 4;
+                        const x = pxIndex % w;
+                        const y = Math.floor(pxIndex / w);
+                        if (x < minX) minX = x;
+                        if (x > maxX) maxX = x;
+                        if (y < minY) minY = y;
+                        if (y > maxY) maxY = y;
+
+                        // Destaca pixel alterado em magenta vibrante (#ff0055)
+                        out[i] = 255;
+                        out[i + 1] = 0;
+                        out[i + 2] = 85;
+                        out[i + 3] = 255;
+                    } else {
+                        // Mantém imagem B esmaecida ao fundo para contexto visual
+                        out[i] = Math.round(dataB[i] * 0.35 + 15);
+                        out[i + 1] = Math.round(dataB[i + 1] * 0.35 + 20);
+                        out[i + 2] = Math.round(dataB[i + 2] * 0.35 + 30);
+                        out[i + 3] = 255;
+                    }
+                }
+
+                ctxD.putImageData(diffImg, 0, 0);
+                if (maxX >= minX && maxY >= minY) {
+                    ctxD.strokeStyle = '#00e5ff';
+                    ctxD.lineWidth = 2;
+                    ctxD.strokeRect(
+                        Math.max(0, minX - 2),
+                        Math.max(0, minY - 2),
+                        Math.min(w, maxX - minX + 4),
+                        Math.min(h, maxY - minY + 4)
+                    );
+                }
+
+                const dataUrl = canvasDiff.toDataURL('image/png');
+                const diffBase64 = dataUrl.replace(/^data:image\\/png;base64,/, '');
+                const diffPct = totalPixels > 0 ? Number(((diffPixels / totalPixels) * 100).toFixed(4)) : 0;
+
+                return {
+                    width: w,
+                    height: h,
+                    total_pixels: totalPixels,
+                    diff_pixels: diffPixels,
+                    diff_percentage: diffPct,
+                    identical_visual: diffPixels === 0,
+                    changed_bounding_box: maxX >= minX ? {
+                        x: minX,
+                        y: minY,
+                        width: maxX - minX + 1,
+                        height: maxY - minY + 1,
+                    } : null,
+                    diff_image_base64: diffBase64,
+                };
+            }
+            """,
+            [b64_a, b64_b],
+        )
+
+        await browser.close()
+
+    diff_b64 = diff_eval.pop("diff_image_base64", "")
+    diff_bytes = base64.b64decode(diff_b64) if diff_b64 else b""
+
+    return {
+        "status": "success",
+        "viewport": viewport_name,
+        "theme": theme,
+        "structural_diff": structural,
+        "visual_diff": {
+            **diff_eval,
+            "diff_image_base64": diff_b64,
+        },
+        "diff_screenshot_bytes": diff_bytes,
+    }
+

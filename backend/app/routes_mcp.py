@@ -25,6 +25,7 @@ from app.models import (
     Workspace,
     Asset,
     DataScenario,
+    Comment,
 )
 from app.routes_auth import get_current_user, require_editor
 from app.timeutils import utcnow
@@ -38,8 +39,9 @@ from app.screen_renderer import (
     simulate_sequence_interactions,
     diagnose_screen_structure,
     audit_screen_rules,
+    compare_rendered_screens,
 )
-from app.design_corpus import parse_design_corpus, DesignCorpusError
+from app.design_corpus import parse_design_corpus, DesignCorpusError, nest_tokens
 from app.routes_projects import apply_design_corpus_to_project
 
 router = APIRouter(tags=["mcp"])
@@ -242,6 +244,83 @@ class MCPInteractElementRequest(BaseModel):
     viewport: Optional[str] = "desktop"
     theme: Optional[str] = "light"
     capture_screenshot: Optional[bool] = True
+
+
+class MCPSearchScreensRequest(BaseModel):
+    project_id: Optional[str] = None
+    query: Optional[str] = None
+    name_query: Optional[str] = None
+    canvas_id: Optional[str] = None
+    canvas_name: Optional[str] = None
+    mb_id: Optional[str] = None
+    html_query: Optional[str] = None
+    device_type: Optional[str] = None
+    is_entry: Optional[bool] = None
+    limit: Optional[int] = 20
+    offset: Optional[int] = 0
+    include_snippet: Optional[bool] = True
+
+
+class MCPGetDesignTokensRequest(BaseModel):
+    project_id: Optional[str] = None
+    theme: Optional[str] = "all"  # all, light, dark, shared
+    format: Optional[str] = "json"  # json, css, dtcg, all
+
+
+class MCPGetComponentLibraryRequest(BaseModel):
+    project_id: Optional[str] = None
+    category: Optional[str] = None
+    query: Optional[str] = None
+    include_html: Optional[bool] = True
+    include_presets: Optional[bool] = True
+
+
+class MCPCompareScreensRequest(BaseModel):
+    screen_id: Optional[str] = None
+    screen_id_a: Optional[str] = None
+    screen_id_b: Optional[str] = None
+    revision_a: Optional[int] = None
+    revision_b: Optional[int] = None
+    viewport: Optional[str] = "desktop"
+    theme: Optional[str] = "light"
+    full_page: Optional[bool] = False
+    include_visual_diff: Optional[bool] = True
+
+
+class MCPListScreenRevisionsRequest(BaseModel):
+    screen_id: str
+    limit: Optional[int] = 30
+
+
+class MCPGetCanvasRequest(BaseModel):
+    project_id: Optional[str] = None
+    canvas_id: Optional[str] = None
+    canvas_name: Optional[str] = None
+    include_screens: Optional[bool] = True
+
+
+class MCPUploadAssetRequest(BaseModel):
+    project_id: Optional[str] = None
+    filename: str
+    data_base64: str
+    content_type: Optional[str] = "image/png"
+
+
+class MCPGetScreenCommentsRequest(BaseModel):
+    screen_id: str
+    status: Optional[str] = "all"  # all, open, resolved
+
+
+class MCPAddCommentRequest(BaseModel):
+    screen_id: str
+    body: str = Field(..., min_length=1)
+    element_mb_id: Optional[str] = ""
+    element_snippet: Optional[str] = ""
+    pin_x: Optional[float] = 50.0
+    pin_y: Optional[float] = 50.0
+    author_name: Optional[str] = None
+    resolve_comment_id: Optional[str] = None
+
 
 
 # ============================================================================
@@ -1023,6 +1102,185 @@ MCP_TOOLS_SPEC = [
                 "change_summary": {"type": "string", "description": "Descrição da alteração para o histórico de revisões."}
             },
             "required": ["project_id", "zip_base64"],
+        },
+    },
+    {
+        "name": "search_screens",
+        "description": "Busca leve e paginada de telas por nome, canvas, identificador data-mb-id ou trecho de HTML/CSS/JS sem carregar o mapa completo do projeto.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "ID do projeto (opcional se a chave MCP estiver vinculada a um projeto)."},
+                "query": {"type": "string", "description": "Termo de busca livre (procura em nome da tela, canvas, data-mb-id e HTML/CSS/JS)."},
+                "name_query": {"type": "string", "description": "Filtro específico por nome da tela (case-insensitive)."},
+                "canvas_id": {"type": "string", "description": "Filtra telas de um canvas específico pelo ID."},
+                "canvas_name": {"type": "string", "description": "Filtra telas pelo nome do canvas (case-insensitive)."},
+                "mb_id": {"type": "string", "description": "Filtra telas que contenham um elemento com este data-mb-id ou id."},
+                "html_query": {"type": "string", "description": "Filtra telas que contenham este trecho ou classe no HTML/CSS/JS."},
+                "device_type": {"type": "string", "enum": ["desktop", "tablet", "mobile"], "description": "Filtra por tipo de dispositivo/viewport."},
+                "is_entry": {"type": "boolean", "description": "Filtra apenas a tela principal de entrada (true/false)."},
+                "limit": {"type": "integer", "description": "Máximo de resultados por página (default: 20, máx: 100)."},
+                "offset": {"type": "integer", "description": "Deslocamento para paginação (default: 0)."},
+                "include_snippet": {"type": "boolean", "description": "Se verdadeiro, inclui trecho de contexto do match e amostra de data-mb-ids. Default: true."}
+            },
+        },
+    },
+    {
+        "name": "get_design_tokens",
+        "description": "Lê isoladamente os Design Tokens atuais do projeto (light, dark, shared) e variáveis CSS equivalentes sem carregar telas ou canvases. (Também acessível via alias 'export_tokens').",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "ID do projeto (opcional se a chave MCP for vinculada a um projeto)."},
+                "theme": {
+                    "type": "string",
+                    "enum": ["all", "light", "dark", "shared"],
+                    "description": "Filtra um tema específico ou retorna todos ('all'). Default: 'all'.",
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["json", "css", "dtcg", "all"],
+                    "description": "Formato de saída: 'json' (flat dict), 'css' (declarações :root / [data-theme]), 'dtcg' (W3C Design Tokens aninhado) ou 'all'. Default: 'json'.",
+                },
+            },
+        },
+    },
+    {
+        "name": "export_tokens",
+        "description": "Alias de get_design_tokens: exporta isoladamente os Design Tokens do projeto nos formatos JSON, CSS custom properties (--*) ou W3C DTCG.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "ID do projeto (opcional se a chave MCP for vinculada a um projeto)."},
+                "theme": {
+                    "type": "string",
+                    "enum": ["all", "light", "dark", "shared"],
+                    "description": "Filtra um tema específico ou retorna todos ('all'). Default: 'all'.",
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["json", "css", "dtcg", "all"],
+                    "description": "Formato de saída: 'json', 'css', 'dtcg' ou 'all'. Default: 'all'.",
+                },
+            },
+        },
+    },
+    {
+        "name": "get_component_library",
+        "description": "Lista o catálogo de componentes e parciais reutilizáveis do projeto (parciais sincronizadas, blocos extraídos com data-mb-id/data-mb-component e presets token-driven do sistema com slots, variantes e markup base). (Também acessível via alias 'list_components').",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "ID do projeto (opcional se a chave MCP for vinculada a um projeto)."},
+                "category": {
+                    "type": "string",
+                    "description": "Filtra por categoria (ex: 'partial', 'navigation', 'button', 'card', 'input', 'modal', 'table', 'badge').",
+                },
+                "query": {"type": "string", "description": "Termo de busca por nome, id, slot ou classe do componente."},
+                "include_html": {"type": "boolean", "description": "Se verdadeiro, inclui o markup HTML base pronto para uso. Default: true."},
+                "include_presets": {"type": "boolean", "description": "Se verdadeiro, inclui também os componentes base token-driven do Design System Mockbird. Default: true."},
+            },
+        },
+    },
+    {
+        "name": "list_components",
+        "description": "Alias de get_component_library: lista componentes reutilizáveis, parciais sincronizadas, slots, variantes e markup base do projeto.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "ID do projeto (opcional se a chave MCP for vinculada a um projeto)."},
+                "category": {"type": "string", "description": "Filtra por categoria de componente."},
+                "query": {"type": "string", "description": "Busca por nome ou identificador."},
+                "include_html": {"type": "boolean", "description": "Inclui o HTML base do componente. Default: true."},
+                "include_presets": {"type": "boolean", "description": "Inclui presets token-driven do Design System. Default: true."},
+            },
+        },
+    },
+    {
+        "name": "compare_screens",
+        "description": "Executa diff estrutural (HTML/DOM/CSS/JS e elementos data-mb-id) e diff visual pixel a pixel via Chromium headless entre duas telas diferentes ou entre duas revisões da mesma tela, gerando imagem PNG com highlight das regiões alteradas.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "screen_id": {"type": "string", "description": "ID da tela (quando comparando duas revisões da mesma tela)."},
+                "screen_id_a": {"type": "string", "description": "ID da primeira tela (base / antes)."},
+                "screen_id_b": {"type": "string", "description": "ID da segunda tela (comparada / depois). Se omitido, usa a mesma tela de screen_id_a/screen_id."},
+                "revision_a": {"type": "integer", "description": "Número da revisão inicial (opcional; se omitido ao comparar revisões da mesma tela, usa current_revision - 1)."},
+                "revision_b": {"type": "integer", "description": "Número da revisão final (opcional; default: revisão atual da tela B)."},
+                "viewport": {"type": "string", "enum": ["desktop", "tablet", "mobile"], "description": "Viewport para renderização do diff visual. Default: desktop."},
+                "theme": {"type": "string", "enum": ["light", "dark"], "description": "Tema visual para renderização do diff. Default: light."},
+                "full_page": {"type": "boolean", "description": "Se verdadeiro, compara a página inteira com scroll. Default: false."},
+                "include_visual_diff": {"type": "boolean", "description": "Se verdadeiro, renderiza ambas no Chromium e gera imagem PNG de pixel diff. Default: true."},
+            },
+        },
+    },
+    {
+        "name": "list_screen_revisions",
+        "description": "Lista o histórico de revisões disponíveis de uma tela (número da revisão, autor, resumo da alteração, data e tamanho) para consulta antes de restore_screen_revision ou compare_screens.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "screen_id": {"type": "string", "description": "ID da tela."},
+                "limit": {"type": "integer", "description": "Máximo de revisões a listar (default: 30)."},
+            },
+            "required": ["screen_id"],
+        },
+    },
+    {
+        "name": "get_canvas",
+        "description": "Retorna isoladamente um canvas específico (por canvas_id ou canvas_name) ou lista os canvases do projeto com suas telas, dimensões e ordem, sem carregar tokens ou o mapa completo.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "ID do projeto (opcional se a chave for vinculada ao projeto ou se canvas_id for informado)."},
+                "canvas_id": {"type": "string", "description": "ID do canvas específico a consultar (opcional)."},
+                "canvas_name": {"type": "string", "description": "Nome do canvas a consultar (opcional, case-insensitive)."},
+                "include_screens": {"type": "boolean", "description": "Se verdadeiro, inclui a lista de telas de cada canvas retornado. Default: true."},
+            },
+        },
+    },
+    {
+        "name": "upload_asset",
+        "description": "Envia um novo arquivo de mídia (logo, imagem PNG, JPG, SVG, WEBP, GIF) em base64 para a biblioteca de assets do projeto e retorna sua URL assinada pronta para uso em tags <img>.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "ID do projeto (opcional se a chave for vinculada a um projeto)."},
+                "filename": {"type": "string", "description": "Nome original do arquivo (ex: 'logo-brand.svg', 'hero-banner.png')."},
+                "data_base64": {"type": "string", "description": "Conteúdo binário do arquivo codificado em base64 (aceita data URI ou base64 puro)."},
+                "content_type": {"type": "string", "description": "MIME type do arquivo (ex: 'image/png', 'image/svg+xml', 'image/jpeg', 'image/webp'). Default: 'image/png'."},
+            },
+            "required": ["filename", "data_base64"],
+        },
+    },
+    {
+        "name": "get_screen_comments",
+        "description": "Lista os comentários e anotações de revisão ancorados em uma tela e seus elementos (data-mb-id).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "screen_id": {"type": "string", "description": "ID da tela."},
+                "status": {"type": "string", "enum": ["all", "open", "resolved"], "description": "Filtra comentários por status. Default: 'all'."},
+            },
+            "required": ["screen_id"],
+        },
+    },
+    {
+        "name": "add_comment",
+        "description": "Adiciona um novo comentário/anotação de review em um elemento ou coordenada da tela (ou marca um comentário existente como resolvido).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "screen_id": {"type": "string", "description": "ID da tela."},
+                "body": {"type": "string", "description": "Texto do comentário ou parecer de revisão."},
+                "element_mb_id": {"type": "string", "description": "data-mb-id do elemento ao qual o comentário está vinculado (opcional)."},
+                "element_snippet": {"type": "string", "description": "Trecho HTML opcional de referência do elemento."},
+                "pin_x": {"type": "number", "description": "Posição horizontal relativa do pin em % (0 a 100, default 50)."},
+                "pin_y": {"type": "number", "description": "Posição vertical relativa do pin em % (0 a 100, default 50)."},
+                "author_name": {"type": "string", "description": "Nome do autor/agente (default: nome da chave MCP)."},
+                "resolve_comment_id": {"type": "string", "description": "ID de um comentário existente para anexar resposta e marcar como 'resolved' (opcional)."},
+            },
+            "required": ["screen_id", "body"],
         },
     },
 ]
@@ -2493,6 +2751,1232 @@ async def mcp_import_project_zip(
 
 
 # ============================================================================
+# Ferramentas Avançadas de Produtividade MCP (Search, Tokens, Components, Diff, Revisions, Canvases, Assets, Comments)
+# ============================================================================
+
+DEFAULT_DESIGN_SYSTEM_COMPONENTS: List[Dict[str, Any]] = [
+    {
+        "id": "mb-btn-primary",
+        "name": "Button (Token-Driven)",
+        "category": "button",
+        "source": "design_system_preset",
+        "description": "Botão interativo padronizado com suporte a temas light/dark, tokens de cor primária e estados de foco/hover.",
+        "slots": ["icon-left", "label", "icon-right"],
+        "variants": {
+            "size": ["sm", "md", "lg"],
+            "tone": ["primary", "secondary", "outline", "ghost", "danger"],
+            "state": ["default", "hover", "active", "disabled", "loading"],
+        },
+        "tokens_used": ["--color-primary", "--color-surface", "--color-text", "--color-border"],
+        "marker_syntax": 'data-mb-component="button" data-mb-id="btn-action"',
+        "base_html": (
+            '<button data-mb-component="button" data-mb-id="btn-primary-action" type="button" '
+            'class="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg font-medium text-sm '
+            'bg-indigo-600 hover:bg-indigo-500 text-white shadow-sm transition-all focus:outline-none focus:ring-2 focus:ring-indigo-500/40">\n'
+            '  <span>Confirmar Ação</span>\n'
+            '</button>'
+        ),
+    },
+    {
+        "id": "mb-card-surface",
+        "name": "Surface Card",
+        "category": "card",
+        "source": "design_system_preset",
+        "description": "Contêiner de superfície elevado com header, body e footer estruturados e suporte nativo a dark mode.",
+        "slots": ["card-header", "card-title", "card-actions", "card-body", "card-footer"],
+        "variants": {
+            "size": ["compact", "default", "spacious"],
+            "tone": ["default", "elevated", "bordered", "highlighted"],
+            "state": ["default", "interactive", "selected"],
+        },
+        "tokens_used": ["--color-surface", "--color-bg", "--color-text", "--color-border"],
+        "marker_syntax": '<!-- PARTIAL:card-surface --> ... <!-- /PARTIAL:card-surface -->',
+        "base_html": (
+            '<div data-mb-component="card" data-mb-id="card-container" '
+            'class="rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 shadow-sm">\n'
+            '  <div class="flex items-center justify-between mb-3">\n'
+            '    <h3 data-mb-id="card-title" class="text-base font-semibold text-slate-900 dark:text-white">Título do Card</h3>\n'
+            '    <span class="text-xs px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 font-medium">Ativo</span>\n'
+            '  </div>\n'
+            '  <p data-mb-id="card-body" class="text-sm text-slate-600 dark:text-slate-400">Conteúdo descritivo do componente reutilizável.</p>\n'
+            '</div>'
+        ),
+    },
+    {
+        "id": "mb-input-field",
+        "name": "Form Input Field",
+        "category": "input",
+        "source": "design_system_preset",
+        "description": "Campo de entrada com label, estado de validação, helper text e ícone opcional.",
+        "slots": ["label", "input", "prefix-icon", "helper-text", "error-message"],
+        "variants": {
+            "size": ["sm", "md", "lg"],
+            "tone": ["default", "error", "success"],
+            "state": ["default", "focused", "disabled", "readonly"],
+        },
+        "tokens_used": ["--color-surface", "--color-text", "--color-border", "--color-primary"],
+        "marker_syntax": 'data-mb-component="input-field" data-mb-id="field-wrapper"',
+        "base_html": (
+            '<div data-mb-component="input-field" data-mb-id="field-group" class="flex flex-col gap-1.5">\n'
+            '  <label class="text-xs font-semibold text-slate-700 dark:text-slate-300">Nome do Campo</label>\n'
+            '  <input data-mb-id="input-control" type="text" placeholder="Digite aqui..." '
+            'class="w-full px-3.5 py-2 rounded-lg text-sm bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-800 '
+            'text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40" />\n'
+            '</div>'
+        ),
+    },
+    {
+        "id": "mb-modal-dialog",
+        "name": "Modal Dialog Overlay",
+        "category": "modal",
+        "source": "design_system_preset",
+        "description": "Janela modal com backdrop, cabeçalho com botão fechar, corpo rolável e barra de ações.",
+        "slots": ["modal-header", "modal-title", "modal-close", "modal-body", "modal-footer"],
+        "variants": {
+            "size": ["sm", "md", "lg", "xl"],
+            "tone": ["default", "danger", "info"],
+            "state": ["open", "hidden"],
+        },
+        "tokens_used": ["--color-surface", "--color-text", "--color-border"],
+        "marker_syntax": '<!-- PARTIAL:modal-dialog --> ... <!-- /PARTIAL:modal-dialog -->',
+        "base_html": (
+            '<div data-mb-component="modal" data-mb-id="modal-overlay" '
+            'class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 backdrop-blur-xs p-4">\n'
+            '  <div data-mb-id="modal-content" class="w-full max-w-lg rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-2xl overflow-hidden">\n'
+            '    <div class="flex items-center justify-between px-5 py-4 border-b border-slate-200 dark:border-slate-800">\n'
+            '      <h3 class="text-base font-bold text-slate-900 dark:text-white">Título do Modal</h3>\n'
+            '      <button data-mb-id="modal-close-btn" type="button" class="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">✕</button>\n'
+            '    </div>\n'
+            '    <div class="p-5 text-sm text-slate-600 dark:text-slate-300">Corpo do modal.</div>\n'
+            '    <div class="flex items-center justify-end gap-2 px-5 py-3.5 bg-slate-50 dark:bg-slate-950/50 border-t border-slate-200 dark:border-slate-800">\n'
+            '      <button data-mb-id="modal-cancel-btn" type="button" class="px-3.5 py-1.5 rounded-lg text-xs font-medium text-slate-600 dark:text-slate-400">Cancelar</button>\n'
+            '      <button data-mb-id="modal-confirm-btn" type="button" class="px-4 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white">Salvar</button>\n'
+            '    </div>\n'
+            '  </div>\n'
+            '</div>'
+        ),
+    },
+    {
+        "id": "mb-nav-sidebar",
+        "name": "Sidebar Navigation Partial",
+        "category": "navigation",
+        "source": "design_system_preset",
+        "description": "Barra lateral de navegação sincronizável entre telas via marcador de parcial e links data-mb-nav.",
+        "slots": ["brand-logo", "nav-items", "user-profile-footer"],
+        "variants": {
+            "size": ["collapsed", "expanded"],
+            "tone": ["surface", "inverted"],
+            "state": ["active-item", "default-item"],
+        },
+        "tokens_used": ["--color-surface", "--color-bg", "--color-text", "--color-primary", "--color-border"],
+        "marker_syntax": '<!-- PARTIAL:sidebar --> ... <!-- /PARTIAL:sidebar -->',
+        "base_html": (
+            '<!-- PARTIAL:sidebar -->\n'
+            '<aside data-mb-component="sidebar" data-mb-id="app-sidebar" '
+            'class="w-64 shrink-0 bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 flex flex-col justify-between p-4">\n'
+            '  <div class="space-y-4">\n'
+            '    <div data-mb-id="sidebar-brand" class="px-2 py-1 text-lg font-bold text-slate-900 dark:text-white">BrandApp</div>\n'
+            '    <nav data-mb-id="sidebar-nav" class="flex flex-col gap-1">\n'
+            '      <a data-mb-id="nav-dashboard" data-mb-nav="dashboard" href="#" class="px-3 py-2 rounded-lg text-sm font-medium bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400">Dashboard</a>\n'
+            '      <a data-mb-id="nav-settings" data-mb-nav="settings" href="#" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800">Configurações</a>\n'
+            '    </nav>\n'
+            '  </div>\n'
+            '</aside>\n'
+            '<!-- /PARTIAL:sidebar -->'
+        ),
+    },
+    {
+        "id": "mb-status-badge",
+        "name": "Status Badge / Pill",
+        "category": "badge",
+        "source": "design_system_preset",
+        "description": "Indicador compacto de status, tag ou categoria semântica.",
+        "slots": ["dot-indicator", "label"],
+        "variants": {
+            "size": ["xs", "sm", "md"],
+            "tone": ["neutral", "success", "warning", "danger", "info"],
+            "state": ["solid", "subtle", "outline"],
+        },
+        "tokens_used": ["--color-primary", "--color-surface", "--color-text"],
+        "marker_syntax": 'data-mb-component="badge"',
+        "base_html": (
+            '<span data-mb-component="badge" data-mb-id="status-badge" '
+            'class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">\n'
+            '  <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>\n'
+            '  <span>Concluído</span>\n'
+            '</span>'
+        ),
+    },
+]
+
+
+@router.post("/mcp/tools/search_screens")
+async def mcp_search_screens(
+    payload: MCPSearchScreensRequest,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Busca leve e paginada de telas por nome, canvas, data-mb-id ou trecho de HTML/CSS/JS."""
+    if "project:read" not in auth["scopes"] and "screen:read" not in auth["scopes"]:
+        raise HTTPException(
+            status_code=403, detail="Chave MCP sem escopo de leitura de projeto/telas"
+        )
+
+    proj_id = get_effective_mcp_project_id(auth, payload.project_id)
+    user = auth["user"]
+
+    if proj_id:
+        validate_mcp_project_access(auth, proj_id)
+        project = await authorize_project(proj_id, user, "read", db)
+        target_project_ids = [project.id]
+    else:
+        allowed = auth.get("project_ids") or ([] if not auth.get("project_id") else [auth["project_id"]])
+        if allowed:
+            target_project_ids = []
+            for pid in allowed:
+                try:
+                    p = await authorize_project(pid, user, "read", db)
+                    target_project_ids.append(p.id)
+                except HTTPException:
+                    continue
+        else:
+            p_res = await db.execute(
+                select(Project)
+                .join(Workspace, Workspace.id == Project.workspace_id)
+                .where(Workspace.organization_id == user.organization_id)
+            )
+            target_project_ids = [p.id for p in p_res.scalars().all()]
+
+    if not target_project_ids:
+        return {
+            "total_matches": 0,
+            "limit": payload.limit or 20,
+            "offset": payload.offset or 0,
+            "has_more": False,
+            "screens": [],
+        }
+
+    stmt = (
+        select(Screen, Canvas)
+        .join(Canvas, Canvas.id == Screen.canvas_id)
+        .where(Canvas.project_id.in_(target_project_ids))
+        .order_by(Canvas.sort_order.asc(), Screen.created_at.asc())
+    )
+    if payload.canvas_id:
+        stmt = stmt.where(Canvas.id == payload.canvas_id)
+    if payload.device_type:
+        stmt = stmt.where(Screen.device_type == payload.device_type.lower().strip())
+    if payload.is_entry is not None:
+        stmt = stmt.where(Screen.is_entry == bool(payload.is_entry))
+
+    rows = (await db.execute(stmt)).all()
+
+    q_general = (payload.query or "").strip().lower()
+    q_name = (payload.name_query or "").strip().lower()
+    q_canvas = (payload.canvas_name or "").strip().lower()
+    q_mb_id = (payload.mb_id or "").strip().lower().lstrip("#")
+    q_html = (payload.html_query or "").strip().lower()
+
+    matched_items: List[Dict[str, Any]] = []
+    mb_id_re = re.compile(r'\b(?:data-mb-id|id)=["\']([^"\']+)["\']', re.IGNORECASE)
+
+    for screen, canvas in rows:
+        s_name_l = (screen.name or "").lower()
+        c_name_l = (canvas.name or "").lower()
+        html_raw = screen.html_content or ""
+        css_raw = screen.css_content or ""
+        js_raw = screen.js_content or ""
+        html_l = html_raw.lower()
+        css_l = css_raw.lower()
+        js_l = js_raw.lower()
+
+        screen_mb_ids = mb_id_re.findall(html_raw)
+        screen_mb_ids_l = [m.lower() for m in screen_mb_ids]
+
+        if q_name and q_name not in s_name_l:
+            continue
+        if q_canvas and q_canvas not in c_name_l:
+            continue
+        if q_mb_id and not any(q_mb_id in mid for mid in screen_mb_ids_l):
+            continue
+        if q_html and (q_html not in html_l and q_html not in css_l and q_html not in js_l):
+            continue
+
+        matched_in: List[str] = []
+        snippet_preview: Optional[str] = None
+
+        if q_general:
+            if q_general in s_name_l:
+                matched_in.append("screen_name")
+            if q_general in c_name_l:
+                matched_in.append("canvas_name")
+            if any(q_general in mid for mid in screen_mb_ids_l):
+                matched_in.append("data-mb-id")
+            idx_html = html_l.find(q_general)
+            if idx_html != -1:
+                matched_in.append("html")
+                start_snip = max(0, idx_html - 60)
+                end_snip = min(len(html_raw), idx_html + len(q_general) + 100)
+                snippet_preview = re.sub(r"\s+", " ", html_raw[start_snip:end_snip]).strip()
+            if q_general in css_l:
+                matched_in.append("css")
+            if q_general in js_l:
+                matched_in.append("js")
+            if not matched_in:
+                continue
+        else:
+            if q_name:
+                matched_in.append("screen_name")
+            if q_canvas:
+                matched_in.append("canvas_name")
+            if q_mb_id:
+                matched_in.append("data-mb-id")
+            if q_html:
+                matched_in.append("html")
+                idx_h = html_l.find(q_html)
+                if idx_h != -1:
+                    start_snip = max(0, idx_h - 60)
+                    end_snip = min(len(html_raw), idx_h + len(q_html) + 100)
+                    snippet_preview = re.sub(r"\s+", " ", html_raw[start_snip:end_snip]).strip()
+            if not matched_in:
+                matched_in.append("filter")
+
+        if payload.include_snippet and not snippet_preview and html_raw:
+            snippet_preview = re.sub(r"\s+", " ", html_raw[:160]).strip()
+
+        item: Dict[str, Any] = {
+            "id": screen.id,
+            "name": screen.name,
+            "canvas_id": canvas.id,
+            "canvas_name": canvas.name,
+            "project_id": canvas.project_id,
+            "width": screen.width,
+            "height": screen.height,
+            "device_type": screen.device_type,
+            "screen_kind": screen.screen_kind,
+            "is_entry": screen.is_entry,
+            "current_revision": screen.current_revision,
+            "matched_in": matched_in,
+        }
+        if payload.include_snippet:
+            item["mb_ids_sample"] = list(dict.fromkeys(screen_mb_ids))[:15]
+            item["total_mb_ids"] = len(set(screen_mb_ids))
+            item["html_snippet"] = snippet_preview
+
+        matched_items.append(item)
+
+    limit = max(1, min(int(payload.limit or 20), 100))
+    offset = max(0, int(payload.offset or 0))
+    total = len(matched_items)
+    paginated = matched_items[offset : offset + limit]
+
+    return {
+        "status": "success",
+        "total_matches": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": (offset + limit) < total,
+        "screens": paginated,
+    }
+
+
+def _build_css_tokens_export(
+    light_tokens: Dict[str, Any],
+    dark_tokens: Dict[str, Any],
+    shared_tokens: Dict[str, Any],
+) -> str:
+    """Converte dicionários de design tokens em folha de variáveis CSS (:root e [data-theme='dark'])."""
+    root_vars = {**(shared_tokens or {}), **(light_tokens or {})}
+    dark_vars = dict(dark_tokens or {})
+
+    lines = [":root, [data-theme=\"light\"] {"]
+    for k, v in sorted(root_vars.items()):
+        if isinstance(v, (dict, list)):
+            continue
+        clean_k = str(k).lstrip("-")
+        lines.append(f"  --{clean_k}: {v};")
+    lines.append("}")
+
+    if dark_vars:
+        lines.append("")
+        lines.append(".dark, [data-theme=\"dark\"] {")
+        for k, v in sorted(dark_vars.items()):
+            if isinstance(v, (dict, list)):
+                continue
+            clean_k = str(k).lstrip("-")
+            lines.append(f"  --{clean_k}: {v};")
+        lines.append("}")
+
+    return "\n".join(lines)
+
+
+@router.post("/mcp/tools/get_design_tokens")
+@router.post("/mcp/tools/export_tokens")
+async def mcp_get_design_tokens(
+    payload: Optional[MCPGetDesignTokensRequest] = None,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lê ou exporta isoladamente os Design Tokens do projeto nos formatos JSON, CSS custom properties ou W3C DTCG."""
+    if "project:read" not in auth["scopes"] and "export:read" not in auth["scopes"]:
+        raise HTTPException(
+            status_code=403, detail="Chave MCP sem escopo de leitura de projeto/tokens"
+        )
+
+    req = payload or MCPGetDesignTokensRequest()
+    proj_id = get_effective_mcp_project_id(auth, req.project_id)
+    if not proj_id:
+        raise HTTPException(status_code=400, detail="project_id é obrigatório")
+
+    validate_mcp_project_access(auth, proj_id)
+    user = auth["user"]
+    project = await authorize_project(proj_id, user, "read", db)
+
+    t_res = await db.execute(
+        select(DesignTokens).where(DesignTokens.project_id == proj_id)
+    )
+    tokens_row = t_res.scalars().first()
+
+    light = dict(tokens_row.light_tokens or {}) if tokens_row else {}
+    dark = dict(tokens_row.dark_tokens or {}) if tokens_row else {}
+    shared = dict(tokens_row.shared_tokens or {}) if tokens_row else {}
+    # Oculta chave interna 'components' se houver no shared_tokens ao listar apenas tokens puros
+    shared_clean = {k: v for k, v in shared.items() if k != "components"}
+
+    theme_filter = (req.theme or "all").lower().strip()
+    fmt = (req.format or "json").lower().strip()
+
+    tokens_out: Dict[str, Any] = {}
+    if theme_filter in ("all", "light"):
+        tokens_out["light"] = light
+    if theme_filter in ("all", "dark"):
+        tokens_out["dark"] = dark
+    if theme_filter in ("all", "shared"):
+        tokens_out["shared"] = shared_clean
+
+    result: Dict[str, Any] = {
+        "status": "success",
+        "project_id": project.id,
+        "project_name": project.name,
+        "theme": theme_filter,
+        "format": fmt,
+        "token_counts": {
+            "light": len(light),
+            "dark": len(dark),
+            "shared": len(shared_clean),
+        },
+    }
+
+    if fmt in ("json", "all"):
+        result["tokens"] = tokens_out
+    if fmt in ("css", "all"):
+        result["css_variables"] = _build_css_tokens_export(
+            light if theme_filter in ("all", "light") else {},
+            dark if theme_filter in ("all", "dark") else {},
+            shared_clean if theme_filter in ("all", "shared") else {},
+        )
+    if fmt in ("dtcg", "all"):
+        result["dtcg"] = {
+            "light": nest_tokens(light) if theme_filter in ("all", "light") else {},
+            "dark": nest_tokens(dark) if theme_filter in ("all", "dark") else {},
+            "shared": nest_tokens(shared_clean) if theme_filter in ("all", "shared") else {},
+        }
+
+    return result
+
+
+def _extract_components_from_project_screens(
+    screens: List[Screen],
+) -> List[Dict[str, Any]]:
+    """Inspeciona o HTML das telas do projeto para descobrir parciais (<!-- PARTIAL:x -->) e componentes (data-mb-component / data-mb-id recorrentes)."""
+    discovered: Dict[str, Dict[str, Any]] = {}
+
+    # 1. Parciais explícitas: <!-- PARTIAL:name --> ... <!-- /PARTIAL:name --> ou <!-- COMPONENT:name -->
+    partial_re = re.compile(
+        r"<!--\s*(?:PARTIAL|COMPONENT):([a-zA-Z0-9_\-]+)\s*-->(.*?)<!--\s*/(?:PARTIAL|COMPONENT):\1\s*-->",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    # 2. Elementos marcados com data-mb-component="name"
+    comp_attr_re = re.compile(
+        r'<([a-zA-Z0-9\-]+)([^>]*\bdata-(?:mb-)?component=["\']([^"\']+)["\'][^>]*)>',
+        re.IGNORECASE,
+    )
+
+    # 3. Blocos semânticos identificáveis por tag/data-mb-id (nav, aside, header, footer, dialog, modal, sidebar, card, form, table)
+    semantic_re = re.compile(
+        r'<([a-zA-Z0-9\-]+)([^>]*\b(?:data-mb-id|id)=["\']([a-zA-Z0-9_\-]+)["\'][^>]*)>',
+        re.IGNORECASE,
+    )
+
+    token_var_re = re.compile(r"var\((--[a-zA-Z0-9_\-]+)")
+    slot_re = re.compile(r'\b(?:data-mb-slot|data-slot|data-mb-id)=["\']([^"\']+)["\']', re.IGNORECASE)
+
+    def _extract_outer_html(html: str, start_idx: int, tag_name: str, open_end_idx: int) -> str:
+        void_tags = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+        if tag_name in void_tags or html[start_idx:open_end_idx].rstrip().endswith("/>"):
+            return html[start_idx:open_end_idx]
+        pos = open_end_idx
+        depth = 1
+        t_re = re.compile(rf"(?:<({tag_name})\b[^>]*>)|(?:</({tag_name})\s*>)", re.IGNORECASE)
+        while depth > 0:
+            m = t_re.search(html, pos)
+            if not m:
+                break
+            if m.group(1):
+                if not m.group(0).rstrip().endswith("/>"):
+                    depth += 1
+            else:
+                depth -= 1
+            pos = m.end()
+        end_idx = pos if depth == 0 else min(len(html), open_end_idx + 400)
+        return html[start_idx:end_idx]
+
+    def _infer_category(name_or_id: str, tag: str) -> str:
+        key = f"{name_or_id} {tag}".lower()
+        if any(w in key for w in ("nav", "sidebar", "header", "topbar", "menu", "breadcrumb", "tab")):
+            return "navigation"
+        if any(w in key for w in ("btn", "button", "cta", "action")):
+            return "button"
+        if any(w in key for w in ("modal", "dialog", "drawer", "popover", "sheet")):
+            return "modal"
+        if any(w in key for w in ("input", "field", "select", "search", "form", "checkbox", "toggle")):
+            return "input"
+        if any(w in key for w in ("table", "grid", "list", "row")):
+            return "table"
+        if any(w in key for w in ("badge", "pill", "tag", "chip", "status")):
+            return "badge"
+        if any(w in key for w in ("card", "panel", "widget", "stat", "metric")):
+            return "card"
+        return "partial"
+
+    for s in screens:
+        html = s.html_content or ""
+        if not html:
+            continue
+
+        # 1. Parciais por comentário
+        for pm in partial_re.finditer(html):
+            p_name = pm.group(1).strip()
+            p_body = pm.group(2).strip()
+            key = f"partial:{p_name.lower()}"
+            full_markup = f"<!-- PARTIAL:{p_name} -->\n{p_body}\n<!-- /PARTIAL:{p_name} -->"
+            slots = list(dict.fromkeys(slot_re.findall(p_body)))[:12]
+            tokens_used = list(dict.fromkeys(token_var_re.findall(p_body)))
+            if key not in discovered:
+                discovered[key] = {
+                    "id": p_name,
+                    "name": f"Partial: {p_name}",
+                    "category": _infer_category(p_name, "partial"),
+                    "source": "project_partial",
+                    "description": f"Parcial sincronizada '{p_name}' extraída das telas do projeto.",
+                    "slots": slots,
+                    "variants": {"theme": ["light", "dark"]},
+                    "tokens_used": tokens_used,
+                    "marker_syntax": f"<!-- PARTIAL:{p_name} --> ... <!-- /PARTIAL:{p_name} -->",
+                    "usage_count": 1,
+                    "used_in_screens": [{"id": s.id, "name": s.name}],
+                    "base_html": full_markup[:2500],
+                }
+            else:
+                discovered[key]["usage_count"] += 1
+                if not any(x["id"] == s.id for x in discovered[key]["used_in_screens"]):
+                    discovered[key]["used_in_screens"].append({"id": s.id, "name": s.name})
+
+        # 2. Elementos com data-mb-component
+        for cm in comp_attr_re.finditer(html):
+            tag = cm.group(1).lower()
+            c_name = cm.group(3).strip()
+            key = f"comp:{c_name.lower()}"
+            outer = _extract_outer_html(html, cm.start(), tag, cm.end())
+            slots = list(dict.fromkeys(slot_re.findall(outer)))[:12]
+            tokens_used = list(dict.fromkeys(token_var_re.findall(outer)))
+            if key not in discovered:
+                discovered[key] = {
+                    "id": c_name,
+                    "name": c_name.replace("-", " ").title(),
+                    "category": _infer_category(c_name, tag),
+                    "source": "project_component",
+                    "description": f"Componente '{c_name}' registrado com data-mb-component nas telas do projeto.",
+                    "slots": slots,
+                    "variants": {"theme": ["light", "dark"]},
+                    "tokens_used": tokens_used,
+                    "marker_syntax": f'data-mb-component="{c_name}"',
+                    "usage_count": 1,
+                    "used_in_screens": [{"id": s.id, "name": s.name}],
+                    "base_html": outer[:2500],
+                }
+            else:
+                discovered[key]["usage_count"] += 1
+                if not any(x["id"] == s.id for x in discovered[key]["used_in_screens"]):
+                    discovered[key]["used_in_screens"].append({"id": s.id, "name": s.name})
+
+        # 3. Elementos semânticos com data-mb-id (sidebar, navbar, header, modal, card, btn, input, table)
+        for sm in semantic_re.finditer(html):
+            tag = sm.group(1).lower()
+            el_id = sm.group(3).strip()
+            cat = _infer_category(el_id, tag)
+            if cat == "partial" and tag not in ("nav", "aside", "header", "footer", "dialog", "form", "table"):
+                continue
+            key = f"el:{el_id.lower()}"
+            if key in discovered:
+                discovered[key]["usage_count"] += 1
+                if not any(x["id"] == s.id for x in discovered[key]["used_in_screens"]):
+                    discovered[key]["used_in_screens"].append({"id": s.id, "name": s.name})
+                continue
+            outer = _extract_outer_html(html, sm.start(), tag, sm.end())
+            slots = [sl for sl in dict.fromkeys(slot_re.findall(outer)) if sl != el_id][:10]
+            tokens_used = list(dict.fromkeys(token_var_re.findall(outer)))
+            discovered[key] = {
+                "id": el_id,
+                "name": el_id.replace("-", " ").replace("_", " ").title(),
+                "category": cat,
+                "source": "extracted_from_screens",
+                "description": f"Bloco reutilizável '<{tag} data-mb-id=\"{el_id}\">' detectado no projeto.",
+                "slots": slots,
+                "variants": {"theme": ["light", "dark"]},
+                "tokens_used": tokens_used,
+                "marker_syntax": f'data-mb-id="{el_id}"',
+                "usage_count": 1,
+                "used_in_screens": [{"id": s.id, "name": s.name}],
+                "base_html": outer[:2000],
+            }
+
+    # Ordena priorizando parciais explícitas e componentes mais reutilizados entre telas
+    sorted_list = sorted(
+        discovered.values(),
+        key=lambda c: (
+            0 if c["source"] in ("project_partial", "project_component") else 1,
+            -int(c.get("usage_count", 1)),
+            c["id"],
+        ),
+    )
+    return sorted_list
+
+
+@router.post("/mcp/tools/get_component_library")
+@router.post("/mcp/tools/list_components")
+async def mcp_get_component_library(
+    payload: Optional[MCPGetComponentLibraryRequest] = None,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lista o catálogo de componentes e parciais reutilizáveis do projeto (extraídos das telas, registrados em tokens e presets do Design System)."""
+    if "project:read" not in auth["scopes"] and "screen:read" not in auth["scopes"]:
+        raise HTTPException(
+            status_code=403, detail="Chave MCP sem escopo de leitura de projeto/componentes"
+        )
+
+    req = payload or MCPGetComponentLibraryRequest()
+    proj_id = get_effective_mcp_project_id(auth, req.project_id)
+    user = auth["user"]
+
+    project_components: List[Dict[str, Any]] = []
+    custom_registered: List[Dict[str, Any]] = []
+    project_name = None
+
+    if proj_id:
+        validate_mcp_project_access(auth, proj_id)
+        project = await authorize_project(proj_id, user, "read", db)
+        project_name = project.name
+
+        t_res = await db.execute(
+            select(DesignTokens).where(DesignTokens.project_id == proj_id)
+        )
+        tokens_row = t_res.scalars().first()
+        if tokens_row and isinstance(tokens_row.shared_tokens, dict):
+            raw_comps = tokens_row.shared_tokens.get("components")
+            if isinstance(raw_comps, list):
+                for rc in raw_comps:
+                    if isinstance(rc, dict) and rc.get("id"):
+                        custom_registered.append({
+                            "source": "project_registered",
+                            "usage_count": rc.get("usage_count", 1),
+                            **rc,
+                        })
+            elif isinstance(raw_comps, dict):
+                for cid, rc in raw_comps.items():
+                    if isinstance(rc, dict):
+                        custom_registered.append({
+                            "id": cid,
+                            "name": rc.get("name", cid),
+                            "category": rc.get("category", "partial"),
+                            "source": "project_registered",
+                            "slots": rc.get("slots", []),
+                            "variants": rc.get("variants", {}),
+                            "base_html": rc.get("base_html") or rc.get("html", ""),
+                            **rc,
+                        })
+
+        s_res = await db.execute(
+            select(Screen)
+            .join(Canvas, Canvas.id == Screen.canvas_id)
+            .where(Canvas.project_id == proj_id)
+            .order_by(Canvas.sort_order.asc(), Screen.created_at.asc())
+        )
+        screens = s_res.scalars().all()
+        project_components = _extract_components_from_project_screens(list(screens))
+
+    all_components: List[Dict[str, Any]] = []
+    seen_ids = set()
+
+    for comp in custom_registered + project_components:
+        cid = str(comp.get("id")).lower()
+        if cid not in seen_ids:
+            seen_ids.add(cid)
+            all_components.append(dict(comp))
+
+    if req.include_presets is not False:
+        for preset in DEFAULT_DESIGN_SYSTEM_COMPONENTS:
+            cid = str(preset["id"]).lower()
+            if cid not in seen_ids:
+                seen_ids.add(cid)
+                all_components.append(dict(preset))
+
+    cat_filter = (req.category or "").strip().lower()
+    q_filter = (req.query or "").strip().lower()
+
+    filtered: List[Dict[str, Any]] = []
+    for comp in all_components:
+        if cat_filter and str(comp.get("category", "")).lower() != cat_filter:
+            continue
+        if q_filter:
+            haystack = " ".join([
+                str(comp.get("id", "")),
+                str(comp.get("name", "")),
+                str(comp.get("category", "")),
+                str(comp.get("description", "")),
+                " ".join(str(s) for s in (comp.get("slots") or [])),
+                str(comp.get("base_html", "")),
+            ]).lower()
+            if q_filter not in haystack:
+                continue
+
+        out_comp = dict(comp)
+        if req.include_html is False:
+            out_comp.pop("base_html", None)
+        filtered.append(out_comp)
+
+    categories_summary: Dict[str, int] = {}
+    for c in filtered:
+        cat = str(c.get("category") or "other")
+        categories_summary[cat] = categories_summary.get(cat, 0) + 1
+
+    return {
+        "status": "success",
+        "project_id": proj_id,
+        "project_name": project_name,
+        "total_components": len(filtered),
+        "categories": categories_summary,
+        "components": filtered,
+    }
+
+
+@router.post("/mcp/tools/compare_screens")
+async def mcp_compare_screens(
+    payload: MCPCompareScreensRequest,
+    request: Request,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Compara estruturalmente (HTML/DOM/CSS/JS) e visualmente (pixel diff via Chromium) duas telas ou duas revisões da mesma tela."""
+    if "project:read" not in auth["scopes"] and "screen:read" not in auth["scopes"]:
+        raise HTTPException(
+            status_code=403, detail="Chave MCP sem escopo de leitura de telas/projetos"
+        )
+
+    user = auth["user"]
+    id_a = payload.screen_id_a or payload.screen_id
+    if not id_a:
+        raise HTTPException(
+            status_code=400,
+            detail="Informe 'screen_id' (para comparar revisões da mesma tela) ou 'screen_id_a' e 'screen_id_b'.",
+        )
+    id_b = payload.screen_id_b or id_a
+
+    screen_a = await authorize_screen(id_a, user, "read", db)
+    canvas_a_res = await db.execute(select(Canvas).where(Canvas.id == screen_a.canvas_id))
+    canvas_a = canvas_a_res.scalars().first()
+    if not canvas_a:
+        raise HTTPException(status_code=404, detail="Canvas da tela A não encontrado")
+    validate_mcp_project_access(auth, canvas_a.project_id)
+
+    if id_b == id_a:
+        screen_b = screen_a
+        canvas_b = canvas_a
+    else:
+        screen_b = await authorize_screen(id_b, user, "read", db)
+        canvas_b_res = await db.execute(select(Canvas).where(Canvas.id == screen_b.canvas_id))
+        canvas_b = canvas_b_res.scalars().first()
+        if not canvas_b:
+            raise HTTPException(status_code=404, detail="Canvas da tela B não encontrado")
+        validate_mcp_project_access(auth, canvas_b.project_id)
+
+    rev_a_num = payload.revision_a
+    rev_b_num = payload.revision_b
+
+    # Se está comparando a mesma tela e nenhuma revisão foi especificada, compara (current_revision - 1) vs current_revision
+    if id_a == id_b and rev_a_num is None and rev_b_num is None:
+        rev_b_num = screen_b.current_revision
+        rev_a_num = max(1, screen_a.current_revision - 1)
+
+    async def _resolve_screen_version(scr: Screen, rev_num: Optional[int]) -> Dict[str, Any]:
+        if rev_num is None or rev_num == scr.current_revision:
+            return {
+                "screen_id": scr.id,
+                "screen_name": scr.name,
+                "revision": scr.current_revision,
+                "html": scr.html_content or "",
+                "css": scr.css_content or "",
+                "js": scr.js_content or "",
+            }
+        r_res = await db.execute(
+            select(ScreenRevision).where(
+                ScreenRevision.screen_id == scr.id,
+                ScreenRevision.revision_number == rev_num,
+            )
+        )
+        rev_obj = r_res.scalars().first()
+        if not rev_obj:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Revisão {rev_num} não encontrada para a tela '{scr.name}' ({scr.id})",
+            )
+        return {
+            "screen_id": scr.id,
+            "screen_name": scr.name,
+            "revision": rev_obj.revision_number,
+            "html": rev_obj.html_content or "",
+            "css": rev_obj.css_content or "",
+            "js": rev_obj.js_content or "",
+        }
+
+    ver_a = await _resolve_screen_version(screen_a, rev_a_num)
+    ver_b = await _resolve_screen_version(screen_b, rev_b_num)
+
+    async def _get_project_tokens(pid: str) -> Dict[str, Any]:
+        t_res = await db.execute(select(DesignTokens).where(DesignTokens.project_id == pid))
+        t_row = t_res.scalars().first()
+        if not t_row:
+            return {}
+        return {
+            "light": t_row.light_tokens or {},
+            "dark": t_row.dark_tokens or {},
+            "shared": t_row.shared_tokens or {},
+        }
+
+    tokens_a = await _get_project_tokens(canvas_a.project_id)
+    tokens_b = tokens_a if canvas_b.project_id == canvas_a.project_id else await _get_project_tokens(canvas_b.project_id)
+
+    cmp_res = await compare_rendered_screens(
+        html_a=ver_a["html"],
+        html_b=ver_b["html"],
+        css_a=ver_a["css"],
+        css_b=ver_b["css"],
+        js_a=ver_a["js"],
+        js_b=ver_b["js"],
+        tokens_a=tokens_a,
+        tokens_b=tokens_b,
+        viewport_name=payload.viewport or "desktop",
+        theme=payload.theme or "light",
+        full_page=bool(payload.full_page),
+        include_visual_diff=payload.include_visual_diff is not False,
+    )
+
+    diff_bytes = cmp_res.pop("diff_screenshot_bytes", None)
+    diff_url = None
+    if diff_bytes:
+        try:
+            fn = save_asset(canvas_b.project_id, diff_bytes, "image/png")
+            clean_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", screen_b.name or "screen")
+            asset_obj = Asset(
+                project_id=canvas_b.project_id,
+                filename=fn,
+                original_name=f"diff_{clean_name}_r{ver_a['revision']}_vs_r{ver_b['revision']}.png",
+                content_type="image/png",
+                size_bytes=len(diff_bytes),
+            )
+            db.add(asset_obj)
+            await db.commit()
+            await db.refresh(asset_obj)
+            sig = generate_asset_signature(asset_obj.id)
+            diff_url = build_public_url(request, f"/api/assets/{asset_obj.id}?sig={sig}")
+        except Exception as asset_err:
+            logger.warning(f"Falha ao persistir asset do diff visual: {asset_err}")
+
+    diff_b64 = None
+    if cmp_res.get("visual_diff"):
+        diff_b64 = cmp_res["visual_diff"].get("diff_image_base64")
+        cmp_res["visual_diff"]["diff_screenshot_url"] = diff_url
+
+    return {
+        "status": "success",
+        "target_a": {
+            "screen_id": ver_a["screen_id"],
+            "screen_name": ver_a["screen_name"],
+            "revision": ver_a["revision"],
+        },
+        "target_b": {
+            "screen_id": ver_b["screen_id"],
+            "screen_name": ver_b["screen_name"],
+            "revision": ver_b["revision"],
+        },
+        "viewport": cmp_res["viewport"],
+        "theme": cmp_res["theme"],
+        "structural_diff": cmp_res["structural_diff"],
+        "visual_diff": cmp_res["visual_diff"],
+        "diff_screenshot_url": diff_url,
+        "diff_image_base64": diff_b64,
+    }
+
+
+@router.post("/mcp/tools/list_screen_revisions")
+async def mcp_list_screen_revisions(
+    payload: MCPListScreenRevisionsRequest,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lista todas as revisões do histórico de uma tela."""
+    if "project:read" not in auth["scopes"] and "screen:read" not in auth["scopes"]:
+        raise HTTPException(
+            status_code=403, detail="Chave MCP sem escopo de leitura de telas/projetos"
+        )
+
+    user = auth["user"]
+    screen = await authorize_screen(payload.screen_id, user, "read", db)
+    c_res = await db.execute(select(Canvas).where(Canvas.id == screen.canvas_id))
+    canvas = c_res.scalars().first()
+    if not canvas:
+        raise HTTPException(status_code=404, detail="Canvas não encontrado")
+    validate_mcp_project_access(auth, canvas.project_id)
+
+    limit = max(1, min(int(payload.limit or 30), 200))
+    rev_res = await db.execute(
+        select(ScreenRevision)
+        .where(ScreenRevision.screen_id == screen.id)
+        .order_by(ScreenRevision.revision_number.desc())
+        .limit(limit)
+    )
+    revs = rev_res.scalars().all()
+
+    return {
+        "status": "success",
+        "screen_id": screen.id,
+        "screen_name": screen.name,
+        "current_revision": screen.current_revision,
+        "total_returned": len(revs),
+        "revisions": [
+            {
+                "revision_number": r.revision_number,
+                "actor": r.actor,
+                "change_summary": r.change_summary,
+                "html_length": len(r.html_content or ""),
+                "css_length": len(r.css_content or ""),
+                "js_length": len(r.js_content or ""),
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in revs
+        ],
+    }
+
+
+@router.post("/mcp/tools/get_canvas")
+@router.post("/mcp/tools/list_canvases")
+async def mcp_get_canvas(
+    payload: Optional[MCPGetCanvasRequest] = None,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Retorna um canvas específico ou lista os canvases do projeto com suas telas ordenadas."""
+    if "project:read" not in auth["scopes"] and "screen:read" not in auth["scopes"]:
+        raise HTTPException(
+            status_code=403, detail="Chave MCP sem escopo de leitura de projeto/canvas"
+        )
+
+    req = payload or MCPGetCanvasRequest()
+    user = auth["user"]
+
+    proj_id = get_effective_mcp_project_id(auth, req.project_id)
+    if not proj_id and req.canvas_id:
+        c_lookup = await db.execute(select(Canvas).where(Canvas.id == req.canvas_id))
+        c_found = c_lookup.scalars().first()
+        if not c_found:
+            raise HTTPException(status_code=404, detail="Canvas não encontrado")
+        proj_id = c_found.project_id
+
+    if not proj_id:
+        raise HTTPException(status_code=400, detail="project_id ou canvas_id é obrigatório")
+
+    validate_mcp_project_access(auth, proj_id)
+    project = await authorize_project(proj_id, user, "read", db)
+
+    stmt = select(Canvas).where(Canvas.project_id == proj_id).order_by(Canvas.sort_order.asc(), Canvas.created_at.asc())
+    if req.canvas_id:
+        stmt = stmt.where(Canvas.id == req.canvas_id)
+
+    canvases = (await db.execute(stmt)).scalars().all()
+    if req.canvas_name:
+        target_name = req.canvas_name.strip().lower()
+        canvases = [c for c in canvases if target_name in (c.name or "").lower()]
+
+    if (req.canvas_id or req.canvas_name) and not canvases:
+        raise HTTPException(status_code=404, detail="Canvas solicitado não encontrado no projeto")
+
+    canvases_out = []
+    for c in canvases:
+        s_res = await db.execute(
+            select(Screen).where(Screen.canvas_id == c.id).order_by(Screen.created_at.asc())
+        )
+        screens = s_res.scalars().all()
+        c_item: Dict[str, Any] = {
+            "id": c.id,
+            "name": c.name,
+            "project_id": c.project_id,
+            "sort_order": c.sort_order,
+            "entry_screen_id": c.entry_screen_id,
+            "screen_count": len(screens),
+        }
+        if req.include_screens is not False:
+            c_item["screens"] = [
+                {
+                    "id": s.id,
+                    "name": s.name,
+                    "is_entry": s.is_entry,
+                    "width": s.width,
+                    "height": s.height,
+                    "device_type": s.device_type,
+                    "screen_kind": s.screen_kind,
+                    "pos_x": s.pos_x,
+                    "pos_y": s.pos_y,
+                    "current_revision": s.current_revision,
+                }
+                for s in screens
+            ]
+        canvases_out.append(c_item)
+
+    return {
+        "status": "success",
+        "project_id": project.id,
+        "project_name": project.name,
+        "total_canvases": len(canvases_out),
+        "canvases": canvases_out,
+    }
+
+
+@router.post("/mcp/tools/upload_asset")
+async def mcp_upload_asset(
+    payload: MCPUploadAssetRequest,
+    request: Request,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Faz upload de um novo asset (PNG, JPG, SVG, WEBP, GIF) em base64 para a biblioteca do projeto."""
+    if "screen:write" not in auth["scopes"] and "project:write" not in auth["scopes"]:
+        raise HTTPException(
+            status_code=403, detail="Chave MCP sem escopo de escrita para enviar assets"
+        )
+
+    proj_id = get_effective_mcp_project_id(auth, payload.project_id)
+    if not proj_id:
+        raise HTTPException(status_code=400, detail="project_id é obrigatório")
+
+    validate_mcp_project_access(auth, proj_id)
+    user = auth["user"]
+    await authorize_project(proj_id, user, "edit", db)
+
+    raw_b64 = (payload.data_base64 or "").strip()
+    content_type = (payload.content_type or "image/png").strip().lower()
+    if raw_b64.startswith("data:") and "," in raw_b64:
+        header, raw_b64 = raw_b64.split(",", 1)
+        mime_match = re.match(r"data:([^;]+)", header, re.IGNORECASE)
+        if mime_match:
+            content_type = mime_match.group(1).strip().lower()
+
+    try:
+        raw_bytes = base64.b64decode(raw_b64)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Base64 inválido para o asset: {str(exc)}")
+
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Conteúdo do asset está vazio")
+    if len(raw_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Tamanho do asset excede o limite de 10 MB")
+
+    fn = save_asset(proj_id, raw_bytes, content_type)
+    asset_obj = Asset(
+        project_id=proj_id,
+        uploaded_by=user.id,
+        filename=fn,
+        original_name=payload.filename.strip() or fn,
+        content_type=content_type,
+        size_bytes=len(raw_bytes),
+    )
+    db.add(asset_obj)
+    await db.commit()
+    await db.refresh(asset_obj)
+
+    sig = generate_asset_signature(asset_obj.id)
+    rel_url = f"/api/assets/{asset_obj.id}?sig={sig}"
+    pub_url = build_public_url(request, rel_url)
+
+    return {
+        "status": "success",
+        "asset": {
+            "id": asset_obj.id,
+            "project_id": asset_obj.project_id,
+            "original_name": asset_obj.original_name,
+            "content_type": asset_obj.content_type,
+            "size_bytes": asset_obj.size_bytes,
+            "url": rel_url,
+            "public_url": pub_url,
+            "created_at": asset_obj.created_at.isoformat() if asset_obj.created_at else None,
+        },
+    }
+
+
+@router.post("/mcp/tools/get_screen_comments")
+async def mcp_get_screen_comments(
+    payload: MCPGetScreenCommentsRequest,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lista os comentários e pins de revisão de uma tela."""
+    if "project:read" not in auth["scopes"] and "screen:read" not in auth["scopes"]:
+        raise HTTPException(
+            status_code=403, detail="Chave MCP sem escopo de leitura de telas/projetos"
+        )
+
+    user = auth["user"]
+    screen = await authorize_screen(payload.screen_id, user, "read", db)
+    c_res = await db.execute(select(Canvas).where(Canvas.id == screen.canvas_id))
+    canvas = c_res.scalars().first()
+    if not canvas:
+        raise HTTPException(status_code=404, detail="Canvas não encontrado")
+    validate_mcp_project_access(auth, canvas.project_id)
+
+    stmt = select(Comment).where(Comment.screen_id == screen.id).order_by(Comment.created_at.asc())
+    status_filter = (payload.status or "all").lower().strip()
+    if status_filter in ("open", "resolved"):
+        stmt = stmt.where(Comment.status == status_filter)
+
+    comments = (await db.execute(stmt)).scalars().all()
+    return {
+        "status": "success",
+        "screen_id": screen.id,
+        "screen_name": screen.name,
+        "total_comments": len(comments),
+        "comments": [
+            {
+                "id": cm.id,
+                "author_name": cm.author_name,
+                "element_mb_id": cm.element_mb_id,
+                "element_snippet": cm.element_snippet,
+                "pin_x": cm.pin_x,
+                "pin_y": cm.pin_y,
+                "body": cm.body,
+                "status": cm.status,
+                "replies": cm.replies or [],
+                "created_at": cm.created_at.isoformat() if cm.created_at else None,
+                "resolved_at": cm.resolved_at.isoformat() if cm.resolved_at else None,
+            }
+            for cm in comments
+        ],
+    }
+
+
+@router.post("/mcp/tools/add_comment")
+async def mcp_add_comment(
+    payload: MCPAddCommentRequest,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Adiciona um novo comentário/anotação em uma tela ou responde e resolve um comentário existente."""
+    if "screen:write" not in auth["scopes"] and "project:write" not in auth["scopes"]:
+        raise HTTPException(
+            status_code=403, detail="Chave MCP sem escopo de escrita para adicionar comentários"
+        )
+
+    user = auth["user"]
+    screen = await authorize_screen(payload.screen_id, user, "read", db)
+    c_res = await db.execute(select(Canvas).where(Canvas.id == screen.canvas_id))
+    canvas = c_res.scalars().first()
+    if not canvas:
+        raise HTTPException(status_code=404, detail="Canvas não encontrado")
+    validate_mcp_project_access(auth, canvas.project_id)
+
+    key_name = auth["key"].name
+    author = (payload.author_name or f"{user.name} (MCP: {key_name})").strip()
+
+    if payload.resolve_comment_id:
+        cm_res = await db.execute(
+            select(Comment).where(
+                Comment.id == payload.resolve_comment_id,
+                Comment.screen_id == screen.id,
+            )
+        )
+        existing_cm = cm_res.scalars().first()
+        if not existing_cm:
+            raise HTTPException(status_code=404, detail="Comentário a resolver não encontrado nesta tela")
+        replies = list(existing_cm.replies or [])
+        replies.append({
+            "author_name": author,
+            "body": payload.body.strip(),
+            "created_at": utcnow().isoformat(),
+        })
+        existing_cm.replies = replies
+        existing_cm.status = "resolved"
+        existing_cm.resolved_at = utcnow()
+        await db.commit()
+        await db.refresh(existing_cm)
+        return {
+            "status": "success",
+            "action": "resolved",
+            "comment": {
+                "id": existing_cm.id,
+                "screen_id": existing_cm.screen_id,
+                "author_name": existing_cm.author_name,
+                "element_mb_id": existing_cm.element_mb_id,
+                "body": existing_cm.body,
+                "status": existing_cm.status,
+                "replies": existing_cm.replies,
+                "resolved_at": existing_cm.resolved_at.isoformat() if existing_cm.resolved_at else None,
+            },
+        }
+
+    new_cm = Comment(
+        screen_id=screen.id,
+        author_id=user.id,
+        author_name=author,
+        element_mb_id=(payload.element_mb_id or "").strip(),
+        element_snippet=(payload.element_snippet or "").strip(),
+        pin_x=float(payload.pin_x if payload.pin_x is not None else 50.0),
+        pin_y=float(payload.pin_y if payload.pin_y is not None else 50.0),
+        body=payload.body.strip(),
+        status="open",
+        replies=[],
+    )
+    db.add(new_cm)
+    await db.commit()
+    await db.refresh(new_cm)
+
+    return {
+        "status": "success",
+        "action": "created",
+        "comment": {
+            "id": new_cm.id,
+            "screen_id": new_cm.screen_id,
+            "author_name": new_cm.author_name,
+            "element_mb_id": new_cm.element_mb_id,
+            "pin_x": new_cm.pin_x,
+            "pin_y": new_cm.pin_y,
+            "body": new_cm.body,
+            "status": new_cm.status,
+            "created_at": new_cm.created_at.isoformat() if new_cm.created_at else None,
+        },
+    }
+
+
+# ============================================================================
 # Handler do Protocolo MCP JSON-RPC 2.0 Padrão (/mcp)
 # ============================================================================
 
@@ -2679,6 +4163,55 @@ async def mcp_jsonrpc_endpoint(
             elif tool_name == "import_project_zip":
                 req_obj = MCPImportProjectZipRequest(**arguments)
                 res = await mcp_import_project_zip(req_obj, auth, db)
+
+            elif tool_name == "search_screens":
+                req_obj = MCPSearchScreensRequest(**arguments)
+                res = await mcp_search_screens(req_obj, auth, db)
+
+            elif tool_name in ("get_design_tokens", "export_tokens"):
+                default_fmt = "all" if tool_name == "export_tokens" and "format" not in arguments else arguments.get("format", "json")
+                req_obj = MCPGetDesignTokensRequest(**{**arguments, "format": default_fmt})
+                res = await mcp_get_design_tokens(req_obj, auth, db)
+
+            elif tool_name in ("get_component_library", "list_components"):
+                req_obj = MCPGetComponentLibraryRequest(**arguments)
+                res = await mcp_get_component_library(req_obj, auth, db)
+
+            elif tool_name == "compare_screens":
+                req_obj = MCPCompareScreensRequest(**arguments)
+                res = await mcp_compare_screens(req_obj, request, auth, db)
+                img_b64 = res.pop("diff_image_base64", None)
+                if isinstance(res.get("visual_diff"), dict):
+                    res["visual_diff"].pop("diff_image_base64", None)
+                res_text = json.dumps(res, ensure_ascii=False, indent=2, default=str)
+                content = [{"type": "text", "text": res_text}]
+                if img_b64:
+                    content.append({"type": "image", "data": img_b64, "mimeType": "image/png"})
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {"content": content},
+                }
+
+            elif tool_name == "list_screen_revisions":
+                req_obj = MCPListScreenRevisionsRequest(**arguments)
+                res = await mcp_list_screen_revisions(req_obj, auth, db)
+
+            elif tool_name in ("get_canvas", "list_canvases"):
+                req_obj = MCPGetCanvasRequest(**arguments)
+                res = await mcp_get_canvas(req_obj, auth, db)
+
+            elif tool_name == "upload_asset":
+                req_obj = MCPUploadAssetRequest(**arguments)
+                res = await mcp_upload_asset(req_obj, request, auth, db)
+
+            elif tool_name == "get_screen_comments":
+                req_obj = MCPGetScreenCommentsRequest(**arguments)
+                res = await mcp_get_screen_comments(req_obj, auth, db)
+
+            elif tool_name == "add_comment":
+                req_obj = MCPAddCommentRequest(**arguments)
+                res = await mcp_add_comment(req_obj, auth, db)
 
             else:
                 return {

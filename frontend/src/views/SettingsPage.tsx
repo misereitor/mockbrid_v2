@@ -1736,11 +1736,11 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
                     Catálogo de Ferramentas MCP Nativas
                   </h3>
                   <p className="text-[11px] text-slate-400 mt-0.5">
-                    14 ferramentas prontas para agentes autônomos (Claude Desktop, Cursor, Antigravity, Windsurf).
+                    33 ferramentas prontas para agentes autônomos (Claude Desktop, Cursor, Antigravity, Windsurf).
                   </p>
                 </div>
                 <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-mockbird-cyan/10 text-mockbird-cyan border border-mockbird-cyan/20 font-bold">
-                  14 tools disponíveis
+                  33 tools disponíveis
                 </span>
               </div>
 
@@ -1768,6 +1768,26 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Retorna a árvore do projeto com todas as telas, IDs, dimensões e design tokens.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">search_screens</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">read</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Busca leve e paginada de telas por nome, canvas, data-mb-id ou trecho de HTML/CSS/JS.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">get_canvas</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">read</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Lê isoladamente um canvas específico ou lista os canvases do projeto com suas telas.
                     </div>
                   </div>
                 </div>
@@ -1858,6 +1878,36 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
                       Atualiza os tokens de cores (light/dark) e tokens compartilhados de design do projeto.
                     </div>
                   </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">get_design_tokens</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">read</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Lê e exporta isoladamente os tokens do projeto em JSON, CSS variables ou W3C DTCG.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">get_component_library</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">read</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Catálogo de componentes e parciais reutilizáveis com slots, variantes e markup base.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">list_screen_revisions</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">read</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Lista o histórico completo de revisões de uma tela com autor, resumo e tamanhos.
+                    </div>
+                  </div>
                 </div>
               </div>
 
@@ -1880,6 +1930,16 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
 
                   <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
                     <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">upload_asset</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/40">write</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Envia novos assets (PNG, JPG, SVG, WEBP) em base64 para a biblioteca do projeto.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
                       <span className="font-mono font-bold text-mockbird-cyan">list_scenarios</span>
                       <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">read</span>
                     </div>
@@ -1897,6 +1957,26 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
                       Cria ou atualiza dados mockados simulados (JSON) para cenários de teste da tela.
                     </div>
                   </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">get_screen_comments</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">read</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Lista os comentários e pins de revisão ancorados nos elementos da tela.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">add_comment</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/40">write</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Adiciona ou resolve comentários e anotações de revisão em elementos da tela.
+                    </div>
+                  </div>
                 </div>
               </div>
 
@@ -1904,9 +1984,19 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
               <div className="space-y-2">
                 <div className="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
                   <FileCode size={13} className="text-cyan-400" />
-                  <span>Qualidade & Implantação</span>
+                  <span>Qualidade, QA Visual & Implantação</span>
                 </div>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 text-xs">
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">compare_screens</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-cyan-950 text-cyan-400 border border-cyan-800/40">visual diff</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Diff estrutural (HTML/DOM) e pixel diff automatizado via Chromium entre duas telas ou revisões.
+                    </div>
+                  </div>
+
                   <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
                     <div className="flex items-center justify-between mb-1">
                       <span className="font-mono font-bold text-mockbird-cyan">validate_screen_html</span>
