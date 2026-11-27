@@ -1,5 +1,4 @@
-import pytest
-from app.agent.htmlkit import validate_and_repair, auto_heal_interactivity_and_assets
+from app.agent.htmlkit import auto_heal_interactivity_and_assets
 from app.agent.graph import locate_surgical_target
 
 
