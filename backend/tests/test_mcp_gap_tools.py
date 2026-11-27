@@ -313,3 +313,70 @@ async def test_mcp_gap_tools_suite():
         cm_list_data = json.loads(cm_list_rpc.json()["result"]["content"][0]["text"])
         assert cm_list_data["total_comments"] == 1
         assert cm_list_data["comments"][0]["element_mb_id"] == "btn-transfer"
+
+        # 6. Testar micro-gaps para 100%: rename_screen, move_screen_to_canvas e get_project_settings
+        ren_rpc = await client.post(
+            "/mcp",
+            headers=mcp_headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 21,
+                "method": "tools/call",
+                "params": {
+                    "name": "rename_screen",
+                    "arguments": {
+                        "screen_id": screen_id,
+                        "new_name": "Inbox OmniChat v2",
+                        "is_entry": True,
+                    },
+                },
+            },
+        )
+        assert ren_rpc.status_code == 200
+        ren_data = json.loads(ren_rpc.json()["result"]["content"][0]["text"])
+        assert ren_data["screen"]["name"] == "Inbox OmniChat v2"
+        assert ren_data["screen"]["is_entry"] is True
+
+        mv_rpc = await client.post(
+            "/mcp",
+            headers=mcp_headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 22,
+                "method": "tools/call",
+                "params": {
+                    "name": "move_screen_to_canvas",
+                    "arguments": {
+                        "screen_id": screen_id,
+                        "target_canvas_name": "Fluxo de Atendimento",
+                        "create_if_missing": True,
+                    },
+                },
+            },
+        )
+        assert mv_rpc.status_code == 200
+        mv_data = json.loads(mv_rpc.json()["result"]["content"][0]["text"])
+        assert mv_data["to_canvas"]["name"] == "Fluxo de Atendimento"
+        assert mv_data["to_canvas"]["created"] is True
+
+        settings_rpc = await client.post(
+            "/mcp",
+            headers=mcp_headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 23,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_project_settings",
+                    "arguments": {
+                        "project_id": project_id,
+                        "update_design_dials": {"variance": 8, "motion": 5, "density": 6},
+                    },
+                },
+            },
+        )
+        assert settings_rpc.status_code == 200
+        settings_data = json.loads(settings_rpc.json()["result"]["content"][0]["text"])
+        assert settings_data["project"]["design_dials"]["variance"] == 8
+        assert settings_data["project"]["counts"]["canvases"] >= 2
+

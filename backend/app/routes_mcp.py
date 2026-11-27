@@ -322,6 +322,35 @@ class MCPAddCommentRequest(BaseModel):
     resolve_comment_id: Optional[str] = None
 
 
+class MCPRenameScreenRequest(BaseModel):
+    screen_id: str
+    new_name: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    device_type: Optional[str] = None
+    screen_kind: Optional[str] = None
+    is_entry: Optional[bool] = None
+    pos_x: Optional[int] = None
+    pos_y: Optional[int] = None
+    transition: Optional[str] = None
+
+
+class MCPMoveScreenToCanvasRequest(BaseModel):
+    screen_id: str
+    target_canvas_id: Optional[str] = None
+    target_canvas_name: Optional[str] = None
+    create_if_missing: Optional[bool] = True
+
+
+class MCPGetProjectSettingsRequest(BaseModel):
+    project_id: Optional[str] = None
+    update_name: Optional[str] = None
+    update_description: Optional[str] = None
+    update_design_dials: Optional[Dict[str, Any]] = None
+    update_entry_screen_id: Optional[str] = None
+
+
+
 
 # ============================================================================
 # Analisador / Validador de HTML para Ferramenta MCP
@@ -1281,6 +1310,54 @@ MCP_TOOLS_SPEC = [
                 "resolve_comment_id": {"type": "string", "description": "ID de um comentário existente para anexar resposta e marcar como 'resolved' (opcional)."},
             },
             "required": ["screen_id", "body"],
+        },
+    },
+    {
+        "name": "rename_screen",
+        "description": "Renomeia uma tela e/ou atualiza seus metadados estruturais (dimensões, device_type, screen_kind, is_entry, posição pos_x/pos_y ou transição) sem precisar reenviar o HTML.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "screen_id": {"type": "string", "description": "ID da tela."},
+                "new_name": {"type": "string", "description": "Novo nome da tela."},
+                "width": {"type": "integer", "description": "Nova largura em pixels (opcional)."},
+                "height": {"type": "integer", "description": "Nova altura em pixels (opcional)."},
+                "device_type": {"type": "string", "enum": ["desktop", "tablet", "mobile", "custom"], "description": "Tipo de dispositivo/viewport (opcional)."},
+                "screen_kind": {"type": "string", "enum": ["page", "subpage", "modal_overlay"], "description": "Tipo semântico da tela (opcional)."},
+                "is_entry": {"type": "boolean", "description": "Se verdadeiro, define esta tela como tela principal de entrada do projeto (opcional)."},
+                "pos_x": {"type": "integer", "description": "Coordenada X no canvas (opcional)."},
+                "pos_y": {"type": "integer", "description": "Coordenada Y no canvas (opcional)."},
+                "transition": {"type": "string", "enum": ["none", "fade", "slide-left"], "description": "Transição de apresentação (opcional)."},
+            },
+            "required": ["screen_id"],
+        },
+    },
+    {
+        "name": "move_screen_to_canvas",
+        "description": "Move uma tela para outro canvas existente (por target_canvas_id ou target_canvas_name) ou cria automaticamente o canvas de destino no projeto.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "screen_id": {"type": "string", "description": "ID da tela a mover."},
+                "target_canvas_id": {"type": "string", "description": "ID do canvas de destino (opcional se target_canvas_name for informado)."},
+                "target_canvas_name": {"type": "string", "description": "Nome do canvas de destino (cria automaticamente se create_if_missing=true)."},
+                "create_if_missing": {"type": "boolean", "description": "Se verdadeiro, cria um novo canvas com target_canvas_name caso não exista. Default: true."},
+            },
+            "required": ["screen_id"],
+        },
+    },
+    {
+        "name": "get_project_settings",
+        "description": "Lê (e opcionalmente atualiza) as configurações gerais do projeto além dos tokens: design_dials (variance, motion, density), entry_screen_id, descrição, visibilidade, status de publicação e contadores.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "ID do projeto (opcional se a chave MCP estiver vinculada a um projeto)."},
+                "update_name": {"type": "string", "description": "Opcional: atualiza o nome do projeto."},
+                "update_description": {"type": "string", "description": "Opcional: atualiza a descrição do projeto."},
+                "update_design_dials": {"type": "object", "description": "Opcional: atualiza os dials de design (ex: {'variance': 7, 'motion': 4, 'density': 4})."},
+                "update_entry_screen_id": {"type": "string", "description": "Opcional: define o ID da tela principal de entrada do projeto."},
+            },
         },
     },
 ]
@@ -3976,6 +4053,255 @@ async def mcp_add_comment(
     }
 
 
+@router.post("/mcp/tools/rename_screen")
+async def mcp_rename_screen(
+    payload: MCPRenameScreenRequest,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Renomeia uma tela e/ou atualiza seus metadados estruturais sem tocar no HTML."""
+    if "screen:write" not in auth["scopes"] and "project:write" not in auth["scopes"]:
+        raise HTTPException(
+            status_code=403, detail="Chave MCP sem escopo 'screen:write'"
+        )
+
+    user = auth["user"]
+    screen = await authorize_screen(payload.screen_id, user, "edit", db)
+    c_res = await db.execute(select(Canvas).where(Canvas.id == screen.canvas_id))
+    canvas = c_res.scalars().first()
+    if not canvas:
+        raise HTTPException(status_code=404, detail="Canvas não encontrado")
+    validate_mcp_project_access(auth, canvas.project_id)
+
+    old_name = screen.name
+    if payload.new_name is not None and payload.new_name.strip():
+        screen.name = payload.new_name.strip()
+    if payload.width is not None and payload.width > 0:
+        screen.width = int(payload.width)
+    if payload.height is not None and payload.height > 0:
+        screen.height = int(payload.height)
+    if payload.device_type is not None:
+        screen.device_type = payload.device_type.strip().lower()
+    if payload.screen_kind is not None:
+        screen.screen_kind = payload.screen_kind.strip().lower()
+    if payload.pos_x is not None:
+        screen.pos_x = int(payload.pos_x)
+    if payload.pos_y is not None:
+        screen.pos_y = int(payload.pos_y)
+    if payload.transition is not None:
+        screen.transition = payload.transition.strip().lower()
+
+    if payload.is_entry is not None:
+        screen.is_entry = bool(payload.is_entry)
+        if screen.is_entry:
+            p_res = await db.execute(select(Project).where(Project.id == canvas.project_id))
+            proj = p_res.scalars().first()
+            if proj:
+                proj.entry_screen_id = screen.id
+
+    await db.commit()
+    await db.refresh(screen)
+
+    return {
+        "status": "success",
+        "previous_name": old_name,
+        "screen": {
+            "id": screen.id,
+            "name": screen.name,
+            "canvas_id": screen.canvas_id,
+            "project_id": canvas.project_id,
+            "width": screen.width,
+            "height": screen.height,
+            "device_type": screen.device_type,
+            "screen_kind": screen.screen_kind,
+            "is_entry": screen.is_entry,
+            "pos_x": screen.pos_x,
+            "pos_y": screen.pos_y,
+            "transition": screen.transition,
+            "current_revision": screen.current_revision,
+        },
+    }
+
+
+@router.post("/mcp/tools/move_screen_to_canvas")
+async def mcp_move_screen_to_canvas(
+    payload: MCPMoveScreenToCanvasRequest,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Move uma tela para outro canvas do mesmo projeto (criando o canvas se necessário)."""
+    if "screen:write" not in auth["scopes"] and "project:write" not in auth["scopes"]:
+        raise HTTPException(
+            status_code=403, detail="Chave MCP sem escopo 'screen:write'"
+        )
+
+    if not payload.target_canvas_id and not (payload.target_canvas_name and payload.target_canvas_name.strip()):
+        raise HTTPException(
+            status_code=400,
+            detail="Informe 'target_canvas_id' ou 'target_canvas_name' para mover a tela.",
+        )
+
+    user = auth["user"]
+    screen = await authorize_screen(payload.screen_id, user, "edit", db)
+    c_res = await db.execute(select(Canvas).where(Canvas.id == screen.canvas_id))
+    source_canvas = c_res.scalars().first()
+    if not source_canvas:
+        raise HTTPException(status_code=404, detail="Canvas de origem não encontrado")
+    project_id = source_canvas.project_id
+    validate_mcp_project_access(auth, project_id)
+
+    target_canvas: Optional[Canvas] = None
+    created_new_canvas = False
+
+    if payload.target_canvas_id:
+        tc_res = await db.execute(
+            select(Canvas).where(
+                Canvas.id == payload.target_canvas_id,
+                Canvas.project_id == project_id,
+            )
+        )
+        target_canvas = tc_res.scalars().first()
+        if not target_canvas:
+            raise HTTPException(
+                status_code=404,
+                detail="Canvas de destino não encontrado neste projeto",
+            )
+    elif payload.target_canvas_name:
+        clean_target_name = payload.target_canvas_name.strip()
+        all_c_res = await db.execute(
+            select(Canvas)
+            .where(Canvas.project_id == project_id)
+            .order_by(Canvas.sort_order.asc())
+        )
+        all_canvases = all_c_res.scalars().all()
+        target_canvas = next(
+            (c for c in all_canvases if (c.name or "").strip().lower() == clean_target_name.lower()),
+            None,
+        )
+        if not target_canvas:
+            if payload.create_if_missing is False:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Canvas '{clean_target_name}' não encontrado no projeto",
+                )
+            max_order = max((c.sort_order for c in all_canvases), default=-1)
+            target_canvas = Canvas(
+                project_id=project_id,
+                name=clean_target_name,
+                sort_order=max_order + 1,
+            )
+            db.add(target_canvas)
+            await db.flush()
+            created_new_canvas = True
+
+    old_canvas_id = screen.canvas_id
+    old_canvas_name = source_canvas.name
+    screen.canvas_id = target_canvas.id
+    await db.commit()
+    await db.refresh(screen)
+
+    return {
+        "status": "success",
+        "screen_id": screen.id,
+        "screen_name": screen.name,
+        "from_canvas": {"id": old_canvas_id, "name": old_canvas_name},
+        "to_canvas": {
+            "id": target_canvas.id,
+            "name": target_canvas.name,
+            "created": created_new_canvas,
+        },
+    }
+
+
+@router.post("/mcp/tools/get_project_settings")
+async def mcp_get_project_settings(
+    payload: Optional[MCPGetProjectSettingsRequest] = None,
+    auth: Dict[str, Any] = Depends(get_mcp_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lê e opcionalmente atualiza as configurações gerais do projeto (design_dials, entry_screen_id, descrição, visibilidade e contadores)."""
+    req = payload or MCPGetProjectSettingsRequest()
+    is_updating = any(
+        v is not None
+        for v in (
+            req.update_name,
+            req.update_description,
+            req.update_design_dials,
+            req.update_entry_screen_id,
+        )
+    )
+
+    if is_updating:
+        if "project:write" not in auth["scopes"] and "screen:write" not in auth["scopes"]:
+            raise HTTPException(
+                status_code=403, detail="Chave MCP sem escopo de escrita para atualizar configurações do projeto"
+            )
+    else:
+        if "project:read" not in auth["scopes"]:
+            raise HTTPException(
+                status_code=403, detail="Chave MCP sem escopo 'project:read'"
+            )
+
+    proj_id = get_effective_mcp_project_id(auth, req.project_id)
+    if not proj_id:
+        raise HTTPException(status_code=400, detail="project_id é obrigatório")
+
+    validate_mcp_project_access(auth, proj_id)
+    user = auth["user"]
+    project = await authorize_project(proj_id, user, "edit" if is_updating else "read", db)
+
+    if req.update_name is not None and req.update_name.strip():
+        project.name = req.update_name.strip()
+    if req.update_description is not None:
+        project.description = req.update_description.strip()
+    if req.update_design_dials is not None and isinstance(req.update_design_dials, dict):
+        dials = dict(project.design_dials or {"variance": 7, "motion": 4, "density": 4})
+        dials.update(req.update_design_dials)
+        project.design_dials = dials
+    if req.update_entry_screen_id is not None:
+        project.entry_screen_id = req.update_entry_screen_id.strip() or None
+
+    if is_updating:
+        await db.commit()
+        await db.refresh(project)
+
+    c_res = await db.execute(select(Canvas).where(Canvas.project_id == project.id))
+    canvases = c_res.scalars().all()
+    canvas_ids = [c.id for c in canvases]
+
+    screens_count = 0
+    if canvas_ids:
+        s_res = await db.execute(select(Screen.id).where(Screen.canvas_id.in_(canvas_ids)))
+        screens_count = len(s_res.all())
+
+    a_res = await db.execute(select(Asset.id).where(Asset.project_id == project.id))
+    assets_count = len(a_res.all())
+
+    return {
+        "status": "success",
+        "updated": is_updating,
+        "project": {
+            "id": project.id,
+            "workspace_id": project.workspace_id,
+            "name": project.name,
+            "slug": project.slug,
+            "description": project.description,
+            "visibility": project.visibility,
+            "design_dials": project.design_dials or {"variance": 7, "motion": 4, "density": 4},
+            "entry_screen_id": project.entry_screen_id,
+            "is_published": project.is_published,
+            "is_archived": project.is_archived,
+            "counts": {
+                "canvases": len(canvases),
+                "screens": screens_count,
+                "assets": assets_count,
+            },
+            "created_at": project.created_at.isoformat() if project.created_at else None,
+            "updated_at": project.updated_at.isoformat() if project.updated_at else None,
+        },
+    }
+
+
 # ============================================================================
 # Handler do Protocolo MCP JSON-RPC 2.0 Padrão (/mcp)
 # ============================================================================
@@ -4212,6 +4538,18 @@ async def mcp_jsonrpc_endpoint(
             elif tool_name == "add_comment":
                 req_obj = MCPAddCommentRequest(**arguments)
                 res = await mcp_add_comment(req_obj, auth, db)
+
+            elif tool_name == "rename_screen":
+                req_obj = MCPRenameScreenRequest(**arguments)
+                res = await mcp_rename_screen(req_obj, auth, db)
+
+            elif tool_name == "move_screen_to_canvas":
+                req_obj = MCPMoveScreenToCanvasRequest(**arguments)
+                res = await mcp_move_screen_to_canvas(req_obj, auth, db)
+
+            elif tool_name == "get_project_settings":
+                req_obj = MCPGetProjectSettingsRequest(**arguments)
+                res = await mcp_get_project_settings(req_obj, auth, db)
 
             else:
                 return {

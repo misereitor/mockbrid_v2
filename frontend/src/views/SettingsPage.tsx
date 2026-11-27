@@ -1736,11 +1736,11 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
                     Catálogo de Ferramentas MCP Nativas
                   </h3>
                   <p className="text-[11px] text-slate-400 mt-0.5">
-                    33 ferramentas prontas para agentes autônomos (Claude Desktop, Cursor, Antigravity, Windsurf).
+                    36 ferramentas prontas para agentes autônomos (Claude Desktop, Cursor, Antigravity, Windsurf).
                   </p>
                 </div>
                 <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-mockbird-cyan/10 text-mockbird-cyan border border-mockbird-cyan/20 font-bold">
-                  33 tools disponíveis
+                  36 tools disponíveis
                 </span>
               </div>
 
@@ -1790,6 +1790,16 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
                       Lê isoladamente um canvas específico ou lista os canvases do projeto com suas telas.
                     </div>
                   </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">get_project_settings</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">read/write</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Lê ou atualiza design_dials (variance, motion, density), entry_screen_id e metadados do projeto.
+                    </div>
+                  </div>
                 </div>
               </div>
 
@@ -1817,6 +1827,26 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ currentUser }) => {
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Cria uma nova tela em um canvas ou projeto com layout inicial configurável.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">rename_screen</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/40">write</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Renomeia uma tela ou altera dimensões, viewport, screen_kind e is_entry sem reenviar HTML.
+                    </div>
+                  </div>
+
+                  <div className="bg-mockbird-surface border border-mockbird-border p-3 rounded-lg hover:border-mockbird-border/80 transition-colors">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-mono font-bold text-mockbird-cyan">move_screen_to_canvas</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/40">write</span>
+                    </div>
+                    <div className="text-slate-400 text-[11px]">
+                      Move uma tela para outro canvas existente ou cria automaticamente o novo canvas de destino.
                     </div>
                   </div>
 
